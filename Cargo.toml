@@ -10,11 +10,14 @@ readme = "README.md"
 keywords = ["art", "radix-tree", "metadata", "storage", "embedded"]
 categories = ["database-implementations", "data-structures", "filesystem"]
 
-# v0.1 deps. Persistence + io_uring deps are Linux-gated.
+# v0.1 deps. PersistentBackend is available on every Unix; io_uring
+# is the Linux fast path (Stage 7).
 [dependencies]
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 
 [dev-dependencies]

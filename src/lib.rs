@@ -61,12 +61,9 @@ mod prelude_private {
 
 // -- Top-level re-exports -----------------------------------------
 
+pub use api::config::{Storage, TreeConfig};
 pub use api::errors::{Error, Result};
 
 pub use api::tree::Tree;
 pub use api::builder::TreeBuilder;
-pub use api::value::Value;
-pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend};
-
-#[cfg(target_os = "linux")]
-pub use store::backend::PersistentBackend;
+pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};

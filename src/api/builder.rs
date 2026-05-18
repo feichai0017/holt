@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::config::TreeConfig;
+use super::config::{Storage, TreeConfig};
 use super::tree::Tree;
 use crate::api::errors::Result;
 use crate::store::backend::Backend;
@@ -11,15 +11,16 @@ use crate::store::backend::Backend;
 /// Fluent constructor for [`Tree`].
 ///
 /// ```ignore
-/// // Linux production:
+/// // Persistent (the default):
 /// let tree = artisan::TreeBuilder::new("/var/lib/myapp")
 ///     .buffer_pool_size(128)
 ///     .wal_sync_on_commit(true)
 ///     .open()?;
 ///
-/// // Anywhere (tests / scratch):
-/// let tree = artisan::TreeBuilder::new("(in-memory)")
-///     .open_in_memory()?;
+/// // In-memory (volatile, for tests / scratch):
+/// let tree = artisan::TreeBuilder::new("scratch")
+///     .memory()
+///     .open()?;
 /// ```
 #[derive(Debug, Clone)]
 pub struct TreeBuilder {
@@ -27,10 +28,19 @@ pub struct TreeBuilder {
 }
 
 impl TreeBuilder {
-    /// Start a builder targeting `data_dir`.
+    /// Start a builder targeting `data_dir` in persistent mode
+    /// (the default).
     #[must_use]
     pub fn new<P: Into<PathBuf>>(data_dir: P) -> Self {
         Self { cfg: TreeConfig::new(data_dir) }
+    }
+
+    /// Flip the builder to **in-memory** mode. The supplied
+    /// `data_dir` becomes informational only.
+    #[must_use]
+    pub fn memory(mut self) -> Self {
+        self.cfg.storage = Storage::Memory;
+        self
     }
 
     /// Set buffer pool size (in number of 512 KB blob frames).
@@ -54,20 +64,13 @@ impl TreeBuilder {
         self
     }
 
-    /// Open with the **persistent** backend at `cfg.data_dir`
-    /// (Linux only — uses O_DIRECT + `io_uring`).
-    #[cfg(target_os = "linux")]
+    /// Open with the configured storage mode.
     pub fn open(self) -> Result<Tree> {
         Tree::open(self.cfg)
     }
 
-    /// Open with the **in-memory** backend. Available on every
-    /// platform; data is volatile.
-    pub fn open_in_memory(self) -> Result<Tree> {
-        Tree::open_with_backend(self.cfg, std::sync::Arc::new(crate::store::backend::MemoryBackend::new()))
-    }
-
-    /// Open with a caller-provided backend.
+    /// Open with a caller-supplied [`Backend`] (overrides the
+    /// builder's storage mode).
     pub fn open_with_backend(self, backend: Arc<dyn Backend>) -> Result<Tree> {
         Tree::open_with_backend(self.cfg, backend)
     }

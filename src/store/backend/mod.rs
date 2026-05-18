@@ -5,7 +5,7 @@
 //! | Backend | Purpose | Where it works |
 //! |---|---|---|
 //! | [`MemoryBackend`]     | Tests, ephemeral trees, in-memory KV | All platforms |
-//! | [`PersistentBackend`] | NVMe-backed durable storage via O_DIRECT + io_uring | Linux only |
+//! | [`PersistentBackend`] | File-backed durable storage; Linux fast path uses `O_DIRECT` + `io_uring` | All Unix |
 //!
 //! The trait surface ([`Backend`]) is blob-granular: read / write a
 //! full `PAGE_SIZE` ([`crate::layout::PAGE_SIZE`]) frame, list, delete,
@@ -19,13 +19,13 @@
 pub mod aligned;
 pub mod memory;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub mod persistent;
 
 pub use aligned::{AlignedBlobBuf, BUF_ALIGN};
 pub use memory::MemoryBackend;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub use persistent::PersistentBackend;
 
 use crate::api::errors::Result;

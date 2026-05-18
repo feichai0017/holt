@@ -1,11 +1,17 @@
-//! `PersistentBackend` — NVMe-backed durable blob store (Linux only).
+//! `PersistentBackend` — file-backed durable blob store.
+//!
+//! Available on every Unix platform. The Linux build opens the
+//! packed data file with `O_DIRECT` so the kernel does not cache
+//! pages (the buffer manager *is* the cache); other Unixes drop the
+//! flag (macOS additionally sets `F_NOCACHE` via `fcntl` for an
+//! equivalent effect).
 //!
 //! Layout on disk:
 //!
 //! ```text
 //!   <data_dir>/
 //!     blobs.dat      — single packed file, blob N lives at byte
-//!                      offset N * PAGE_SIZE; opened O_DIRECT
+//!                      offset N * PAGE_SIZE
 //!     manifest.bin   — small file mapping BlobGuid → slot number
 //!                      (full rewrite via tmp+rename on flush)
 //! ```
@@ -16,9 +22,10 @@
 //!   manager pinning thousands of blobs would otherwise need
 //!   thousands of file descriptors. One fd + slot offsets keeps the
 //!   kernel page tables and fs metadata trivial.
-//! - **O_DIRECT** bypasses the page cache: ours *is* the cache. The
-//!   buffer manager owns dirty pages and flushes through the
-//!   backend; the kernel must not silently cache anything.
+//! - **O_DIRECT / F_NOCACHE** bypasses the page cache: ours *is*
+//!   the cache. The buffer manager owns dirty pages and flushes
+//!   through the backend; the kernel must not silently cache
+//!   anything.
 //! - **4 KB-aligned I/O** (every offset is a multiple of `PAGE_SIZE`
 //!   = 512 KB, every buffer is [`AlignedBlobBuf`] = 4 KB aligned) so
 //!   `O_DIRECT` accepts every submission without `EINVAL`.
@@ -27,14 +34,16 @@
 //!
 //! Stage 1 status (this file): the trait body uses `pread64` /
 //! `pwrite64` via `std::os::unix::fs::FileExt`. Stage 7 will swap
-//! the hot path to `io_uring` with `register_buffers` for
-//! syscall-free submission and `IOPOLL` for ultra-low completion
-//! latency on NVMe.
+//! the hot path to `io_uring` (Linux only) with `register_buffers`
+//! for syscall-free submission and `IOPOLL` for ultra-low
+//! completion latency on NVMe.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+#[cfg(target_os = "macos")]
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -82,9 +91,10 @@ struct Manifest {
 impl PersistentBackend {
     /// Open or create a persistent backend at `data_dir`.
     ///
-    /// Creates the directory if missing. Opens the packed data file
-    /// with `O_DIRECT | O_CLOEXEC`. Loads the manifest if present;
-    /// otherwise starts empty.
+    /// Creates the directory if missing. On Linux opens the packed
+    /// data file with `O_DIRECT | O_CLOEXEC`; on other Unixes opens
+    /// with `O_CLOEXEC` only (macOS additionally sets `F_NOCACHE`).
+    /// Loads the manifest if present; otherwise starts empty.
     pub fn open<P: Into<PathBuf>>(data_dir: P) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir)?;
@@ -92,12 +102,30 @@ impl PersistentBackend {
         let data_path = data_dir.join(DATA_FILENAME);
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
 
+        let custom_flags = {
+            #[cfg(target_os = "linux")]
+            {
+                libc::O_DIRECT | libc::O_CLOEXEC
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                libc::O_CLOEXEC
+            }
+        };
         let data_file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .custom_flags(libc::O_DIRECT | libc::O_CLOEXEC)
+            .custom_flags(custom_flags)
             .open(&data_path)?;
+
+        // macOS doesn't have O_DIRECT; F_NOCACHE on the fd is the
+        // closest equivalent (tells the VFS not to populate the
+        // unified buffer cache for this fd's I/O).
+        #[cfg(target_os = "macos")]
+        unsafe {
+            let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
+        }
 
         let manifest = Manifest::load_or_create(&manifest_path)?;
 

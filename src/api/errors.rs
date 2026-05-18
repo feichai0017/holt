@@ -40,13 +40,6 @@ pub enum Error {
         /// Position in the journal.
         record_offset: u64,
     },
-    /// A value blob couldn't be decoded into a [`crate::Value`] —
-    /// e.g. empty bytes, unknown tag byte, or invalid UTF-8 in an
-    /// External body.
-    InvalidValueEncoding {
-        /// Where the decode failure was detected.
-        context: &'static str,
-    },
 }
 
 impl std::fmt::Display for Error {
@@ -61,9 +54,6 @@ impl std::fmt::Display for Error {
             Self::NodeCorrupt { context } => write!(f, "node corrupt at {context}"),
             Self::ReplaySanityFailed { record_offset } => {
                 write!(f, "WAL replay sanity-check failed at offset {record_offset}")
-            }
-            Self::InvalidValueEncoding { context } => {
-                write!(f, "invalid value encoding: {context}")
             }
         }
     }

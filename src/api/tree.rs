@@ -1,21 +1,20 @@
 //! Public `Tree` type — the main user-facing API.
 //!
-//! Stage 2b (current): `Tree::open*`, `Tree::get`, `Tree::put` are
-//! all wired against the walker. `Tree::delete` / `Tree::rename`
-//! arrive with Stage 2c (walker erase).
+//! Stage 2c (current): `Tree::open`, `Tree::get`, `Tree::put`,
+//! `Tree::delete` are all wired against the walker. `Tree::rename`
+//! lands once the walker has atomic-rename support.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use super::config::TreeConfig;
+use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
-use super::value::Value;
 use crate::engine::{self, LookupResult};
 use crate::layout::{BlobGuid, PAGE_SIZE};
 use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend};
 use crate::store::BlobFrame;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use crate::store::backend::PersistentBackend;
 
 /// An `artisan` tree — your handle to one metadata store.
@@ -43,7 +42,7 @@ pub struct Tree {
 impl std::fmt::Debug for Tree {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Tree")
-            .field("data_dir", &self.cfg.data_dir)
+            .field("storage", &self.cfg.storage)
             .field("root_guid", &self.root_guid)
             .finish_non_exhaustive()
     }
@@ -54,11 +53,42 @@ impl std::fmt::Debug for Tree {
 pub(crate) const ROOT_BLOB_GUID: BlobGuid = [0; 16];
 
 impl Tree {
-    /// Open a tree backed by an arbitrary [`Backend`].
+    /// Open a tree using the supplied configuration.
     ///
-    /// If the root blob doesn't yet exist, this initialises an
-    /// empty one (header + EmptyRoot sentinel) and writes it
-    /// through, flushing the backend before returning.
+    /// `TreeConfig::new("/path")` opens a persistent tree at
+    /// `"/path"` (the default). `TreeConfig::memory()` opens an
+    /// in-memory tree.
+    ///
+    /// On non-Unix platforms, persistent mode is unavailable;
+    /// passing a `Storage::Persistent` config there returns
+    /// [`Error::NotYetImplemented`] — fall back to
+    /// `TreeConfig::memory()` or supply your own [`Backend`] via
+    /// [`Tree::open_with_backend`].
+    pub fn open(cfg: TreeConfig) -> Result<Self> {
+        let backend: Arc<dyn Backend> = match &cfg.storage {
+            Storage::Memory => Arc::new(MemoryBackend::new()),
+            Storage::Persistent { dir } => {
+                #[cfg(unix)]
+                {
+                    Arc::new(PersistentBackend::open(dir)?)
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = dir;
+                    return Err(Error::NotYetImplemented(
+                        "PersistentBackend is Unix-only; use TreeConfig::memory() or supply a Backend via Tree::open_with_backend",
+                    ));
+                }
+            }
+        };
+        Self::open_with_backend(cfg, backend)
+    }
+
+    /// Open a tree with a caller-supplied [`Backend`].
+    ///
+    /// Use this when you want to plug in something other than the
+    /// built-in memory / persistent backends — e.g. a network-backed
+    /// store, an instrumented wrapper, or a fault-injection harness.
     pub fn open_with_backend(cfg: TreeConfig, backend: Arc<dyn Backend>) -> Result<Self> {
         let root_guid = ROOT_BLOB_GUID;
         if !backend.has_blob(root_guid)? {
@@ -74,26 +104,6 @@ impl Tree {
             write_lock: Arc::new(Mutex::new(())),
             next_seq: Arc::new(AtomicU64::new(1)),
         })
-    }
-
-    /// Open an ephemeral, in-memory tree.
-    ///
-    /// Convenience for tests + scratch use. Data is dropped when
-    /// the last [`Tree`] handle is dropped.
-    pub fn open_in_memory() -> Result<Self> {
-        let cfg = TreeConfig::new(std::path::PathBuf::from("(in-memory)"));
-        Self::open_with_backend(cfg, Arc::new(MemoryBackend::new()))
-    }
-
-    /// Open a tree at `cfg.data_dir` using the persistent backend
-    /// (NVMe-backed, O_DIRECT + `io_uring`).
-    ///
-    /// **Linux only.** On other platforms, build [`MemoryBackend`]
-    /// (or your own [`Backend`]) and use [`Tree::open_with_backend`].
-    #[cfg(target_os = "linux")]
-    pub fn open(cfg: TreeConfig) -> Result<Self> {
-        let backend = Arc::new(PersistentBackend::open(&cfg.data_dir)?);
-        Self::open_with_backend(cfg, backend)
     }
 
     /// Look up `key`. Returns the value bytes, or `None` if no leaf
@@ -135,60 +145,35 @@ impl Tree {
         Ok(outcome.previous)
     }
 
-    // -- Tagged-value API: inline small payloads, external refs for large ----
-    //
-    // Metadata workloads typically have a bimodal value distribution.
-    // The two convenience methods + the unified `put_value` / `get_value`
-    // pair let callers express the inline-vs-external choice in the
-    // type system rather than hand-encoding the tag byte.
+    /// Remove `key`. Returns the value that was stored at `key`, or
+    /// `None` if no leaf matched.
+    pub fn delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let _guard = self.write_lock.lock().unwrap();
 
-    /// Insert or replace `key` with an inline byte payload.
-    ///
-    /// Recommended for payloads small enough to comfortably live
-    /// inside the metadata blob (≤ a few KB). Internally wraps the
-    /// bytes as [`Value::Inline`].
-    pub fn put_inline(&self, key: &[u8], data: &[u8]) -> Result<Option<Value>> {
-        self.put_value(key, &Value::Inline(data.to_vec()))
-    }
+        let mut buf = AlignedBlobBuf::zeroed();
+        self.backend.read_blob(self.root_guid, &mut buf)?;
 
-    /// Insert or replace `key` with an external reference — an
-    /// opaque UTF-8 URL like `s3://bucket/key` or
-    /// `https://cdn.example/path`.
-    ///
-    /// The engine does not parse or validate the URL; callers
-    /// resolve it when they retrieve the value.
-    pub fn put_ref<S: AsRef<str>>(&self, key: &[u8], url: S) -> Result<Option<Value>> {
-        self.put_value(key, &Value::External(url.as_ref().to_owned()))
-    }
-
-    /// Insert or replace `key` with an arbitrary [`Value`].
-    pub fn put_value(&self, key: &[u8], value: &Value) -> Result<Option<Value>> {
-        let encoded = value.encode();
-        let prev = self.put(key, &encoded)?;
-        match prev {
-            Some(bytes) => Ok(Some(Value::decode(&bytes)?)),
-            None => Ok(None),
+        let outcome;
+        {
+            let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+            let root_slot = frame.header().root_slot;
+            outcome = engine::walker::erase(&mut frame, root_slot, key)?;
+            frame.header_mut().root_slot = outcome.new_root_slot;
         }
+
+        // Even on NotFound we still rewrite — the frame is unchanged
+        // (idempotent), so this is a 512 KB no-op write. Stage 6
+        // BufferManager will skip the write when nothing was dirtied.
+        self.backend.write_blob(self.root_guid, &buf)?;
+        Ok(outcome.previous)
     }
 
-    /// Look up `key` as a tagged [`Value`] (decoded view of the raw
-    /// bytes stored by [`Tree::put_value`] / [`Tree::put_inline`] /
-    /// [`Tree::put_ref`]).
-    pub fn get_value(&self, key: &[u8]) -> Result<Option<Value>> {
-        match self.get(key)? {
-            Some(bytes) => Ok(Some(Value::decode(&bytes)?)),
-            None => Ok(None),
-        }
-    }
-
-    /// Remove `key`. Stage 2c — not yet wired.
-    pub fn delete(&self, _key: &[u8]) -> Result<Option<Vec<u8>>> {
-        Err(Error::NotYetImplemented("Tree::delete — Stage 2c"))
-    }
-
-    /// Atomic in-tree rename. Stage 2c — not yet wired.
+    /// Atomic in-tree rename. Will land alongside the walker's
+    /// atomic-rename primitive (Stage 2c+).
     pub fn rename(&self, _src: &[u8], _dst: &[u8], _force: bool) -> Result<()> {
-        Err(Error::NotYetImplemented("Tree::rename — Stage 2c"))
+        Err(Error::NotYetImplemented(
+            "Tree::rename — needs atomic single-latch rename in walker",
+        ))
     }
 
     /// Flush every previously-returned write through the backend.
