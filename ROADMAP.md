@@ -2,17 +2,24 @@
 
 ## Where things stand
 
-After Stage 2d phase B, **the algorithm core is feature-complete
-for v0.1**. The tree walks insert / lookup / erase / rename across
-arbitrarily many 512 KB blobs, auto-splits when any blob fills, has
-SIMD-accelerated Node16 byte search, and ships a criterion bench
-that runs ~3-6× faster than RocksDB on small-metadata workloads.
+The algorithm core (Stage 2), the storage cache (Stage 6
+phase 1+2a+2b+2c), and the WAL record codec (Stage 5a) are all
+done. The tree walks insert / lookup / erase / rename across
+arbitrarily many 512 KB blobs, auto-splits when any blob fills,
+has SIMD-accelerated Node16 byte search, and ships a criterion
+bench that runs **~3.5–5× faster than RocksDB** on small-metadata
+workloads (both `memory` and `persistent` variants).
 
-The remaining v0.1 cuts are around **durability + reclamation**
-(WAL + replay, `compactBlob`, BufferManager with a real LRU), and
-**concurrency** (wire `HybridLatch` into per-blob locks). The
-sections below are the live status — see [ARCHITECTURE.md](ARCHITECTURE.md)
-for design and `git log` for what changed when.
+Concurrency model is settled: per-blob `HybridLatch` (LeanStore
+3-mode) gives wait-free optimistic reads + per-blob exclusive
+writes with **no Tree-wide writer mutex**. 145 tests + a
+4-readers × 1-writer concurrent stress test all green.
+
+The remaining v0.1 cuts are around **WAL persistence** (Stage 5b/5c
+— writer/replay/integration) and **shrink-on-erase + tombstone
+GC**. The sections below are the live status — see
+[ARCHITECTURE.md](ARCHITECTURE.md) for design and `git log` for
+what changed when.
 
 The goal is **v0.1: a usable embedded library** for path-shaped
 metadata, single-node + persistent + crash-safe. After that we

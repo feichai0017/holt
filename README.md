@@ -38,9 +38,10 @@ parallel without coordinating with each other.
 
 ## Project status
 
-**v0.1 in active development.** 113 tests pass; `cargo bench --bench main`
-runs a side-by-side comparison with RocksDB (artisan ~3-6× faster on
-small-metadata workloads — see [benches/README.md](benches/README.md)).
+**v0.1 in active development.** 145 tests pass; `cargo bench --bench main`
+runs a side-by-side comparison with RocksDB (memory + persistent
+variants, both showing artisan **~3.5–5× faster** on small-metadata
+workloads — see [benches/README.md](benches/README.md)).
 
 Done — algorithm core:
 
@@ -82,9 +83,14 @@ Done — algorithm core:
   (types / readers / writers / lookup / insert / erase /
   spillover / migrate / tests) — ten files under ~700 LOC each
   rather than one ~3400-LOC blob
+- **WAL record codec** (Stage 5a) — binary `TxnOp` format with
+  CRC32 `sanity_info`. 10 variants encode / decode round-trip;
+  4 corruption catch-cases (CRC, magic, truncation, unknown tag)
+  surface as `Error::ReplaySanityFailed`. See
+  [`src/journal/codec.rs`](src/journal/codec.rs).
 
 Queued — see [ROADMAP.md](ROADMAP.md):
-- WAL + crash recovery (Stage 5)
+- `WalWriter` + replay scanner + Tree integration (Stage 5b/5c)
 - `Tree::range` / `Tree::txn` iterators
 - io_uring submission on the persistent backend (Stage 7)
 - `mergeBlob` (child-blob → parent inverse of splitBlob)

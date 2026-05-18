@@ -14,7 +14,7 @@ pub const PAGE_SIZE: u32 = 0x80000;
 /// Header reserves the first 4096 bytes. Slot table starts at +0x1000.
 pub const HEADER_SIZE: u32 = 0x1000;
 
-/// Hard cap on slots in one blob — see `tryAllocFaNode` line 69.
+/// Hard cap on slots in one blob.
 pub const MAX_SLOTS: u32 = 0x2800;
 
 /// Slot table size = MAX_SLOTS × `sizeof(u32)` = 40 KB.

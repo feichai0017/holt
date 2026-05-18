@@ -29,8 +29,9 @@ crossing is installed in the parent that says "the walk continues
 in blob X starting at slot Y." The whole tree spans an arbitrary
 number of 512 KB units; the user sees one logical Tree.
 
-This is the "fractal" property: each sub-blob is itself an ART, and
-they compose recursively.
+This composes recursively: each sub-blob is itself a full ART
+frame, so the same walker code descends across blob boundaries
+without special-casing the crossing.
 
 ## 2. NodeType variants
 
