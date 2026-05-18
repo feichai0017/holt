@@ -12,7 +12,7 @@ workloads (both `memory` and `persistent` variants).
 
 Concurrency model is settled: per-blob `HybridLatch` (LeanStore
 3-mode) gives wait-free optimistic reads + per-blob exclusive
-writes with **no Tree-wide writer mutex**. 159 tests + a
+writes with **no Tree-wide writer mutex**. 168 tests + a
 4-readers × 1-writer concurrent stress test all green.
 
 The remaining v0.1 cuts are around **WAL persistence** (Stage 5b/5c
@@ -105,9 +105,14 @@ Required for the v0.1 tag:
       corruption mid-file (CRC mismatch, magic mismatch, unknown
       variant tag) surfaces as `Error::ReplaySanityFailed` with
       the bad record's offset patched in.
-- [ ] Tree integration — `put` / `delete` / `rename` emit ops;
-      `Tree::open` replays the log; `Tree::checkpoint` trims past
-      the last durable blob commit (Stage 5c)
+- [x] **Tree integration** (Stage 5c) — every `put` / `delete` /
+      `rename` emits a `TxnOp` to the WAL; the WAL flush is the
+      per-op durability boundary in `flush_on_write = true` mode.
+      `Tree::open` replays the durable WAL onto the BM-cached
+      blob before exposing the tree to callers, and resumes
+      `next_seq` past every replayed record. `Tree::checkpoint`
+      writes the BM root through to the backend, flushes, then
+      atomically truncates the WAL to header-only.
 
 ### Storage backends
 

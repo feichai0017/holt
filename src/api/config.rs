@@ -84,4 +84,15 @@ impl TreeConfig {
     pub fn is_memory(&self) -> bool {
         matches!(self.storage, Storage::Memory)
     }
+
+    /// Path of the WAL file for this configuration, if any.
+    /// Persistent trees keep their log next to the data file at
+    /// `<dir>/journal.wal`; memory trees have no WAL.
+    #[must_use]
+    pub fn wal_path(&self) -> Option<PathBuf> {
+        match &self.storage {
+            Storage::Persistent { dir } => Some(dir.join("journal.wal")),
+            Storage::Memory => None,
+        }
+    }
 }

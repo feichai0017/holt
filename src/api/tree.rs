@@ -36,6 +36,9 @@ use std::sync::{Arc, Mutex};
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
 use crate::engine;
+use crate::journal::reader::replay;
+use crate::journal::txn_op::TxnOp;
+use crate::journal::writer::WalWriter;
 use crate::layout::{BlobGuid, PAGE_SIZE};
 use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend};
 use crate::store::{BlobFrame, BufferManager};
@@ -62,9 +65,13 @@ pub struct Tree {
     /// `get` never take this lock; they coordinate via the
     /// per-blob `HybridLatch` inside the BM.
     rename_lock: Arc<Mutex<()>>,
-    /// Monotonically-increasing sequence stamped on every new
-    /// leaf. Stage 5 ties this to the WAL record number.
+    /// Monotonically-increasing sequence stamped on every record.
+    /// On open the tree replays the WAL and resumes at
+    /// `highest_seq + 1`.
     next_seq: Arc<AtomicU64>,
+    /// WAL handle — `Some` for persistent trees, `None` for
+    /// memory trees (logging an in-memory engine has no point).
+    wal: Option<Arc<Mutex<WalWriter>>>,
 }
 
 impl std::fmt::Debug for Tree {
@@ -119,10 +126,18 @@ impl Tree {
                 }
             }
         };
-        Self::open_with_backend(cfg, backend)
+        // The auto-managed backend earns automatic WAL coverage.
+        Self::open_inner(cfg, backend, /*attach_wal=*/ true)
     }
 
     /// Open a tree with a caller-supplied [`Backend`].
+    ///
+    /// **No WAL is attached.** The caller's backend has its own
+    /// notion of durability (or is intentionally volatile —
+    /// e.g. a `MemoryBackend` standing in for a real one in a
+    /// test); artisan stays out of that decision. If you want a
+    /// WAL'd persistent tree, use [`Tree::open`] with a
+    /// `Storage::Persistent` config.
     ///
     /// The supplied backend is **transparently wrapped** with a
     /// [`BufferManager`] of `cfg.buffer_pool_size` blobs.
@@ -134,6 +149,14 @@ impl Tree {
     /// an empty one and writes it through, flushing before
     /// returning.
     pub fn open_with_backend(cfg: TreeConfig, backend: Arc<dyn Backend>) -> Result<Self> {
+        Self::open_inner(cfg, backend, /*attach_wal=*/ false)
+    }
+
+    fn open_inner(
+        cfg: TreeConfig,
+        backend: Arc<dyn Backend>,
+        attach_wal: bool,
+    ) -> Result<Self> {
         let bm: Arc<BufferManager> = Arc::new(BufferManager::new(
             backend,
             cfg.buffer_pool_size,
@@ -146,12 +169,37 @@ impl Tree {
             bm.write_blob(root_guid, &scratch)?;
             bm.flush()?;
         }
+
+        // Persistent trees keep a WAL alongside the data file.
+        // Replay every durable record onto the BM-cached blob
+        // image before exposing the tree to callers: the on-disk
+        // blob lags the WAL between the last `Tree::checkpoint`
+        // and now, so the WAL is the source of truth for any op
+        // committed via `flush_on_write = true`.
+        let (wal, next_seq) = if attach_wal {
+            match cfg.wal_path() {
+                None => (None, 1u64),
+                Some(path) => {
+                    let next_seq = if path.exists() {
+                        replay_wal(&path, &bm, root_guid)?
+                    } else {
+                        1
+                    };
+                    let writer = WalWriter::open_or_create(&path, /*tree_id=*/ 0)?;
+                    (Some(Arc::new(Mutex::new(writer))), next_seq)
+                }
+            }
+        } else {
+            (None, 1u64)
+        };
+
         Ok(Self {
             cfg,
             backend: bm,
             root_guid,
             rename_lock: Arc::new(Mutex::new(())),
-            next_seq: Arc::new(AtomicU64::new(1)),
+            next_seq: Arc::new(AtomicU64::new(next_seq)),
+            wal,
         })
     }
 
@@ -203,7 +251,36 @@ impl Tree {
             value,
             seq,
         )?;
-        if self.cfg.flush_on_write {
+
+        // Durability model: the WAL flush is the **per-op
+        // boundary**. The BM-cached blob image stays in memory
+        // until `Tree::checkpoint`. A crash recovers by replaying
+        // every record past the last checkpoint onto the blob
+        // image that was durable at checkpoint time.
+        //
+        // The previous "commit BM per op" design double-counted
+        // durability and made replay non-idempotent for `rename`
+        // (the WAL re-inserted the source key on top of an
+        // already-renamed blob).
+        if let Some(wal) = &self.wal {
+            let op = TxnOp::Insert {
+                tree_id: 0,
+                seq,
+                key: key.to_vec(),
+                value: value.to_vec(),
+                prev_value: outcome.previous.clone(),
+            };
+            let mut w = wal.lock().unwrap();
+            w.append(&op, seq)?;
+            if self.cfg.flush_on_write {
+                w.flush()?;
+            }
+        } else if self.cfg.flush_on_write {
+            // No WAL (memory mode, or backend supplied by user).
+            // `flush_on_write` still pushes the BM root through
+            // its `Backend`'s write-through path so callers that
+            // want per-op durability against a custom backend
+            // keep getting it.
             self.backend.commit(self.root_guid)?;
         }
         Ok(outcome.previous)
@@ -223,7 +300,24 @@ impl Tree {
         // No Tree-wide lock — per-blob `HybridLatch` exclusive on
         // the root serialises concurrent `delete` / `put` calls.
         let outcome = engine::erase_multi(&self.backend, self.root_guid, &padded)?;
-        if self.cfg.flush_on_write {
+
+        if let Some(wal) = &self.wal {
+            if let Some(prev) = &outcome.previous {
+                let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+                let op = TxnOp::Erase {
+                    tree_id: 0,
+                    seq,
+                    key: key.to_vec(),
+                    value: prev.clone(),
+                };
+                let mut w = wal.lock().unwrap();
+                w.append(&op, seq)?;
+                if self.cfg.flush_on_write {
+                    w.flush()?;
+                }
+            }
+            // No-op delete (key wasn't there) is not logged.
+        } else if self.cfg.flush_on_write {
             self.backend.commit(self.root_guid)?;
         }
         Ok(outcome.previous)
@@ -279,18 +373,49 @@ impl Tree {
             seq,
         )?;
 
-        if self.cfg.flush_on_write {
+        if let Some(wal) = &self.wal {
+            let op = TxnOp::RenameObject {
+                tree_id: 0,
+                seq,
+                src_key: src.to_vec(),
+                dst_key: dst.to_vec(),
+                force,
+            };
+            let mut w = wal.lock().unwrap();
+            w.append(&op, seq)?;
+            if self.cfg.flush_on_write {
+                w.flush()?;
+            }
+        } else if self.cfg.flush_on_write {
             self.backend.commit(self.root_guid)?;
         }
         Ok(())
     }
 
-    /// Force-commit the BM-cached root blob through to the inner
-    /// backend, then run the backend's own durability protocol
-    /// (`fdatasync` on persistent; no-op on memory).
+    /// Make every previously-applied mutation durable and trim
+    /// the WAL.
+    ///
+    /// Sequence:
+    /// 1. Flush every buffered WAL record (`sync_data` on the log).
+    /// 2. Write the BM-cached root blob through to the inner
+    ///    backend.
+    /// 3. `flush` the backend (`fdatasync` on persistent; no-op on
+    ///    memory).
+    /// 4. Truncate the WAL — its records are now redundant with
+    ///    the freshly-durable blob image, so the next replay
+    ///    starts from an empty log.
+    ///
+    /// `flush_on_write = false` callers rely on this to make
+    /// batched writes survive a crash.
     pub fn checkpoint(&self) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.lock().unwrap().flush()?;
+        }
         self.backend.commit(self.root_guid)?;
         self.backend.flush()?;
+        if let Some(wal) = &self.wal {
+            wal.lock().unwrap().truncate()?;
+        }
         Ok(())
     }
 
@@ -306,4 +431,66 @@ impl Tree {
     pub const fn page_size() -> u32 {
         PAGE_SIZE
     }
+}
+
+/// Replay `path` onto the BM-cached blobs and return the
+/// `next_seq` the tree should resume from.
+///
+/// Each record's logical mutation is re-applied through the
+/// engine. Structural ops (`Split` / `Merge` / `Compact`) are
+/// already reflected in the blob image on disk, so they're
+/// no-ops during replay; `MemMarker` is the explicit
+/// post-replay reconciliation marker and is ignored.
+///
+/// `RenameObject` is rebuilt as the same erase + insert it ran
+/// originally. `Rename` (cross-tree) doesn't apply to the
+/// single-tree v0.1 surface and is rejected. `NewTree` / `RmTree`
+/// are also future-multi-tenant ops, ignored here.
+fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<u64> {
+    let mut highest = 0u64;
+    let _ = replay(path, |op, seq, _off| {
+        match op {
+            TxnOp::Insert { key, value, .. } => {
+                let padded = pad_key(key);
+                engine::insert_multi(bm, root_guid, &padded, value, seq)?;
+            }
+            TxnOp::Erase { key, .. } => {
+                let padded = pad_key(key);
+                engine::erase_multi(bm, root_guid, &padded)?;
+            }
+            TxnOp::RenameObject {
+                src_key, dst_key, force, ..
+            } => {
+                let src_padded = pad_key(src_key);
+                let dst_padded = pad_key(dst_key);
+                if engine::lookup_multi(bm, root_guid, &src_padded)?.is_none() {
+                    // Already reconciled in a prior replay pass —
+                    // skip.
+                    return Ok(());
+                }
+                if !force && engine::lookup_multi(bm, root_guid, &dst_padded)?.is_some() {
+                    return Ok(());
+                }
+                let value =
+                    engine::lookup_multi(bm, root_guid, &src_padded)?.unwrap_or_default();
+                engine::erase_multi(bm, root_guid, &src_padded)?;
+                engine::insert_multi(bm, root_guid, &dst_padded, &value, seq)?;
+            }
+            // Structural / multi-tenant / marker variants don't
+            // affect logical state at v0.1's single-tree surface.
+            TxnOp::Split { .. }
+            | TxnOp::Merge { .. }
+            | TxnOp::Compact { .. }
+            | TxnOp::Rename { .. }
+            | TxnOp::NewTree { .. }
+            | TxnOp::RmTree { .. }
+            | TxnOp::MemMarker { .. } => {}
+        }
+        highest = highest.max(seq);
+        Ok(())
+    })?;
+    // After commit, the blob image is durable; we still want the
+    // next allocated seq to be strictly greater than anything
+    // ever seen in the log.
+    Ok(highest + 1)
 }

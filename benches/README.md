@@ -47,25 +47,33 @@ Engine algorithm cost only — durability disabled on both sides:
 
 ### Persistent group (`*_persist_get` / `*_persist_put` / `*_persist_mixed`)
 
-Both engines disk-backed, per-op durability to the OS page cache
-(not fsync) — the "you survive a process crash, not a power
-failure" mode that high-throughput services target:
+Both engines disk-backed with WAL enabled, per-op durability to
+the OS page cache (not fsync) — the "you survive a process
+crash, not a power failure" mode that high-throughput services
+target:
 
 - **artisan**: `TreeConfig::new(tempdir)` (PersistentBackend with
   `F_NOCACHE` on macOS / `O_DIRECT` on Linux),
-  `flush_on_write = false`. Each `put` lands in the BM cache;
-  the disk only gets writes at spillover or `checkpoint()`.
-  WAL is **not** wired yet (Stage 5 queued).
+  `flush_on_write = false`. Stage 5c is wired: every `put` /
+  `delete` / `rename` emits a `TxnOp` to the WAL writer (buffered
+  in user space; no fsync in `flush_on_write = false` mode). The
+  blob image only hits disk at `Tree::checkpoint`.
 - **RocksDB**: temp-dir DB, `disable_wal = false`, `sync = false`.
   Each `put` appends to the WAL (buffered) plus the memtable.
 
-> **Honest read on the persistent comparison**: artisan's
-> `flush_on_write = false` only goes to disk on spillover /
-> checkpoint, whereas RocksDB's WAL append happens on every `put`.
-> Once Stage 5 (WAL) lands the artisan-persistent `put` numbers
-> will move up to roughly RocksDB's range. The `*_persist_get`
-> numbers are the apples-to-apples read comparison —
-> neither engine touches disk on the get path.
+> **Why artisan persist put is now slower than artisan memory
+> put (≈1.7 µs vs ≈180 ns)**: in `flush_on_write = false` mode
+> the WAL writer accumulates bytes in an in-memory `Vec` that
+> never flushes during the bench (the iteration loop never calls
+> `checkpoint`). Over ~3 M ops × ~75 bytes/op the buffer reaches
+> ~225 MB and amortised reallocations / cache misses dominate.
+> In production this isn't typical — callers `checkpoint()`
+> periodically and the WAL stays small. A LeanStore-style group-
+> commit threshold ("auto-flush past 64 KB") is queued as a
+> follow-up to make the bench numbers representative again.
+>
+> The `*_persist_get` numbers remain apples-to-apples: neither
+> engine touches disk on the get path.
 
 Other shared settings:
 

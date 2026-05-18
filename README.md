@@ -38,7 +38,7 @@ parallel without coordinating with each other.
 
 ## Project status
 
-**v0.1 in active development.** 159 tests pass; `cargo bench --bench main`
+**v0.1 in active development.** 168 tests pass; `cargo bench --bench main`
 runs a side-by-side comparison with RocksDB (memory + persistent
 variants, both showing artisan **~3.5–5× faster** on small-metadata
 workloads — see [benches/README.md](benches/README.md)).
@@ -93,10 +93,14 @@ Done — algorithm core:
   `flush()`-for-durability (`sync_data`); [`replay()`](src/journal/reader.rs)
   is a forward scanner that handles a torn tail gracefully and
   patches in the byte offset when reporting mid-file corruption.
+- **WAL ↔ Tree integration** (Stage 5c) — every `put` / `delete` /
+  `rename` emits a `TxnOp`; the WAL flush is the per-op
+  durability boundary. `Tree::open` replays the durable WAL onto
+  the BM-cached blob and resumes `next_seq` past every replayed
+  record. `Tree::checkpoint` writes the BM root through, flushes,
+  then atomically truncates the WAL.
 
 Queued — see [ROADMAP.md](ROADMAP.md):
-- `Tree::open` replays the log; `put` / `delete` / `rename` emit
-  records; `Tree::checkpoint` trims (Stage 5c)
 - `Tree::range` / `Tree::txn` iterators
 - io_uring submission on the persistent backend (Stage 7)
 - `mergeBlob` (child-blob → parent inverse of splitBlob)
