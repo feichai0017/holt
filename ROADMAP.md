@@ -53,8 +53,15 @@ Required for the v0.1 tag:
 - [x] `make_blob_from_node` deep-clone primitive
 - [x] `splitBlob` automatic spillover trigger (in-band on OOM)
 - [x] `free_subtree` (recursive slot reclaim post-migration)
+- [x] `compactBlob` — in-place reclaim of leaf-extent leaks via
+      clone-into-scratch + memcpy-back. Wired into the multi-blob
+      insert OOM recovery loop alongside `splitBlob` (the two run
+      back-to-back so spillover frees a subtree and compact then
+      reclaims its bump-area bytes).
+- [x] `SPILLOVER_RESERVATION` (128 B bump headroom) — walker
+      `alloc_node`/`alloc_extent` (non-Blob) leave one BlobNode's
+      worth of bump area for spillover's emergency placeholder
 - [ ] `mergeBlob` (compaction inverse — child blob → parent)
-- [ ] `compactBlob` (in-place reclaim of leaf-extent leaks)
 - [x] In-place leaf-value update when new value fits existing
       extent footprint (zero alloc, zero extent leak)
 - [x] SIMD Node16 byte search (SSE2 / NEON / scalar fallback)

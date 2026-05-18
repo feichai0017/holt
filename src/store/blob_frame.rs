@@ -16,6 +16,17 @@ use crate::layout::{
     DATA_AREA_START, HEADER_SIZE, MAX_SLOTS, PAGE_SIZE,
 };
 
+/// Bytes the bump allocator reserves for spillover's
+/// emergency `BlobNode` install. Walker `alloc_node` (non-Blob) +
+/// `alloc_extent` refuse to consume the last `SPILLOVER_RESERVATION`
+/// bytes; `alloc_node(NodeType::Blob)` is exempt and may consume
+/// them. Without this, a 99 %-full blob has no room left for the
+/// spillover code path to install its own placeholder BlobNode.
+///
+/// Equals one `BlobNode` body — the only structure spillover ever
+/// emits.
+pub const SPILLOVER_RESERVATION: u32 = 128;
+
 /// Errors from `alloc_node` / `alloc_extent`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AllocError {
@@ -274,12 +285,20 @@ impl<'a> BlobFrame<'a> {
             }
         }
 
-        // Bump-allocate.
+        // Bump-allocate. The last `SPILLOVER_RESERVATION` bytes of
+        // the data area are off-limits to every NodeType except
+        // `Blob` — they exist precisely so spillover can install
+        // its own BlobNode in a 99 %-full blob.
         let h = self.header();
         if h.num_slots >= MAX_SLOTS as u16 {
             return Err(AllocError::OutOfSlots);
         }
-        let avail = PAGE_SIZE.saturating_sub(h.space_used);
+        let raw_avail = PAGE_SIZE.saturating_sub(h.space_used);
+        let avail = if ntype == NodeType::Blob {
+            raw_avail
+        } else {
+            raw_avail.saturating_sub(SPILLOVER_RESERVATION)
+        };
         if avail < size {
             return Err(AllocError::OutOfSpace { need: size, avail });
         }
@@ -331,7 +350,13 @@ impl<'a> BlobFrame<'a> {
         }
         let aligned = (size + 7) & !7;
         let h = self.header();
-        let avail = PAGE_SIZE.saturating_sub(h.space_used);
+        // Honour the spillover reservation (see [`SPILLOVER_RESERVATION`]):
+        // leaf extents are the dominant bump-area consumer, and a 99 %-
+        // full extent area is exactly where spillover needs to install
+        // its emergency BlobNode.
+        let avail = PAGE_SIZE
+            .saturating_sub(h.space_used)
+            .saturating_sub(SPILLOVER_RESERVATION);
         if avail < aligned {
             return Err(AllocError::OutOfSpace { need: aligned, avail });
         }
@@ -456,13 +481,21 @@ mod tests {
     fn out_of_space_at_data_area_boundary() {
         let mut buf = fresh();
         let mut frame = BlobFrame::init(&mut buf, [0; 16]).unwrap();
-        // Drain the data area with one giant extent.
-        let remaining = PAGE_SIZE - frame.header().space_used;
+        // Drain the data area with one giant extent. alloc_extent
+        // respects the SPILLOVER_RESERVATION, so the last 128 bytes
+        // of the data area are off-limits.
+        let remaining = PAGE_SIZE - frame.header().space_used - SPILLOVER_RESERVATION;
         frame.alloc_extent(remaining - 8).unwrap();
         frame.alloc_extent(8).unwrap();
         assert!(matches!(
             frame.alloc_extent(8),
             Err(AllocError::OutOfSpace { .. })
         ));
+
+        // The last 128 bytes are still reachable via
+        // `alloc_node(NodeType::Blob)` — that's the spillover
+        // emergency path.
+        let bn = frame.alloc_node(NodeType::Blob).unwrap();
+        assert_eq!(bn.size, 128);
     }
 }

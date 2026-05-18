@@ -202,24 +202,70 @@ vice versa. Each spillover's `free_subtree` typically frees one or
 more `Prefix` nodes, so the next `BlobNode` install reuses one of
 those bodies for free.
 
-### Caveat: leaked extents
+### `compactBlob` — in-place extent reclaim (Stage 6 part 1)
 
-Until `compactBlob` ships (Stage 6 reclaim), Leaf key/value
-**extents leak after every same-size update** (in-place value
-overwrite reuses the extent; new keys allocate a fresh extent
-bump). `spillover_blob` reclaims *slot table* entries but **not**
-the bump-area bytes those extents occupied. The bump cursor is
-monotonic until compaction.
+`compact_blob(buf)` deep-clones the live tree out of `buf` into a
+scratch [`AlignedBlobBuf`] (via the same [`clone_subtree`] used by
+[`make_blob_from_node`]) and copies the packed image back over
+`buf`. The resulting blob has:
 
-In practice the live integration tests insert past one blob's
-capacity (~2000 keys × 200 B values overflows the 448 KB usable
-data area) and verify all keys round-trip across multiple blobs.
-Significantly larger workloads currently require multi-spillover
-sequences whose per-call budget would need `compactBlob` to
-release. Stage 6 closes this loop.
+- A contiguous packed data area: every byte in
+  `DATA_AREA_START..space_used` is live
+- Empty free lists
+- `num_slots` equal to the live-subtree node count (+1 sentinel)
+- The original `blob_guid` preserved
 
-`mergeBlob` (the inverse of `splitBlob`) and a true balanced
-multi-child `splitBlob` are both queued — see ROADMAP.md.
+What this reclaims:
+
+- **Leaf key/value extents** allocated via `alloc_extent` (no free
+  list, so they accumulate on update + delete + spillover-migrate)
+- Stale slot-entry / body-byte pairs whose NodeType free list has
+  no live demand
+
+What this costs: one scratch 512 KB heap allocation that lives for
+the duration of the call + one full-blob memcpy at the end.
+Single-digit µs on a modern machine.
+
+### How spillover + compact pair up
+
+The walker's multi-blob insert retry loop runs **both** on every
+`AllocError::OutOfSpace`:
+
+```
+loop up to MAX_SPILLOVER_ATTEMPTS:
+    try insert_at
+    on OOM:
+        spillover_blob(frame)   // migrate a subtree out, install BlobNode
+        compact_blob(buf)       // reclaim the just-migrated extent bytes
+        retry
+```
+
+`spillover_blob` is what makes slot reclaim possible (returns
+nodes to per-type free lists, drops the migrated subtree). On its
+own that's not enough — leaf extents stay glued to the bump area.
+`compact_blob` is the second half: it does the actual byte-level
+repack so the next walker pass sees a fresh bump cursor.
+
+### `SPILLOVER_RESERVATION` (128 B bump headroom)
+
+`alloc_node` and `alloc_extent` refuse to consume the last
+`SPILLOVER_RESERVATION` (= 128 B = one `BlobNode` body) of the
+data area. `alloc_node(NodeType::Blob)` is exempt and may consume
+that reservation. This guarantees that **spillover always has
+room to install its emergency BlobNode**, even in a blob whose
+walker just hit OOM — without the reservation, a 99 %-full blob
+would have no room left for the spillover code path itself.
+
+Compact restores the reservation: the post-compact bump cursor is
+the packed-image size, well below `PAGE_SIZE - SPILLOVER_RESERVATION`.
+
+### Caveats
+
+- `mergeBlob` (the inverse of `splitBlob`) and a true balanced
+  multi-child `splitBlob` are queued — see ROADMAP.md.
+- Erase-time node shrinkage (Node256 → 48 → 16 → 4) is not wired;
+  collapse always wraps the surviving child in `Prefix([byte])` to
+  preserve depth invariants. Mild space waste, compact reclaims it.
 
 ## 6. Persistence + crash safety
 

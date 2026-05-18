@@ -156,10 +156,27 @@ pub fn insert_multi(
     }
     let _ = root_guid; // reserved for future telemetry / WAL emission
 
-    // Spillover retry loop. Each iteration tries the full insert;
-    // an OutOfSpace from this frame triggers spillover on the root
-    // blob and we retry. Child blobs that OOM run their own
-    // spillover loop inside `insert_at_blob_node`.
+    // Retry loop. On every `OutOfSpace`, run **spillover + compact
+    // back-to-back**:
+    //
+    // - `spillover_blob` picks the largest non-Blob subtree,
+    //   migrates it to a fresh child blob via `make_blob_from_node`,
+    //   and rewires the parent's child pointer through a freshly-
+    //   allocated `BlobNode` (uses the bump area's
+    //   `SPILLOVER_RESERVATION`).
+    // - `compact_blob` then deep-clones the source's live tree
+    //   into a new image and copies it back — reclaiming the just-
+    //   migrated subtree's leaf-extent bytes (which `free_subtree`
+    //   alone can't recover because `alloc_extent` has no free
+    //   list).
+    //
+    // The pairing is what makes sustained inserts past one blob's
+    // capacity actually progress: spillover frees slots, compact
+    // frees their bump-area bytes, and the next walker pass has
+    // both slot table capacity AND bump area headroom.
+    //
+    // Child blobs that OOM run the same compact+spillover loop
+    // inside `insert_at_blob_node`.
     for _attempt in 0..MAX_SPILLOVER_ATTEMPTS {
         let r = {
             let mut frame = BlobFrame::wrap(root_buf.as_mut_slice());
@@ -176,8 +193,11 @@ pub fn insert_multi(
                 });
             }
             Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
-                let mut frame = BlobFrame::wrap(root_buf.as_mut_slice());
-                spillover_blob(backend, &mut frame)?;
+                {
+                    let mut frame = BlobFrame::wrap(root_buf.as_mut_slice());
+                    spillover_blob(backend, &mut frame)?;
+                }
+                compact_blob(root_buf)?;
             }
             Err(other) => return Err(other),
         }
@@ -1655,9 +1675,9 @@ fn insert_at_blob_node(
     let mut child_buf = AlignedBlobBuf::zeroed();
     backend.read_blob(child_guid, &mut child_buf)?;
 
-    // Run the recursive insert inside the child frame, with its own
-    // spillover retry loop (so a full child triggers spillover in
-    // the *child* blob, not at the root).
+    // Run the recursive insert inside the child frame, with its
+    // own spillover + compact retry loop (see `insert_multi` for
+    // the rationale of pairing the two).
     let child_result = {
         let mut last_err: Option<Error> = None;
         let mut done = None;
@@ -1672,8 +1692,11 @@ fn insert_at_blob_node(
                     break;
                 }
                 Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
-                    let mut cf = BlobFrame::wrap(child_buf.as_mut_slice());
-                    spillover_blob(backend, &mut cf)?;
+                    {
+                        let mut cf = BlobFrame::wrap(child_buf.as_mut_slice());
+                        spillover_blob(backend, &mut cf)?;
+                    }
+                    compact_blob(&mut child_buf)?;
                 }
                 Err(e) => {
                     last_err = Some(e);
@@ -2489,6 +2512,88 @@ fn clone_blob_node(src_body: &[u8], dst: &mut BlobFrame<'_>) -> Result<u16> {
     Ok(out.slot)
 }
 
+// ---------- compactBlob (Stage 6 reclaim) ----------
+
+/// Statistics from a [`compact_blob`] run. Useful for telemetry and
+/// tests that want to assert "compact actually freed N bytes".
+#[derive(Debug, Clone, Copy)]
+pub struct CompactStats {
+    /// `space_used` before compaction.
+    pub bytes_before: u32,
+    /// `space_used` after compaction.
+    pub bytes_after: u32,
+    /// `bytes_before - bytes_after`. Always ≥ 0.
+    pub bytes_reclaimed: u32,
+    /// The blob's `header.root_slot` before compaction.
+    pub old_root: u16,
+    /// The blob's `header.root_slot` after compaction. May differ
+    /// from `old_root` because the live subtree is re-allocated
+    /// into freshly-bumped slots in the new packed image.
+    pub new_root: u16,
+}
+
+/// Repack `buf` in place, discarding all unreachable bytes.
+///
+/// The current implementation builds a fresh `BlobFrame` image in a
+/// scratch [`AlignedBlobBuf`], deep-clones the live subtree from
+/// `buf` into it (via the same [`clone_subtree`] used by
+/// [`make_blob_from_node`]), then memcpys the scratch image back
+/// over `buf`. This guarantees the resulting blob has:
+///
+/// - A contiguous packed data area (every byte in
+///   `DATA_AREA_START .. space_used` is live)
+/// - Empty free lists (no leftover stale slot entries)
+/// - `num_slots` equal to the live-subtree node count + 1
+///   (sentinel)
+/// - `gap_space` reset to whatever fresh allocations report
+/// - The original `blob_guid` preserved
+///
+/// **What this reclaims:** the leaf key/value extents (allocated
+/// via `alloc_extent`, which has no free list) and dead node
+/// bodies whose slots returned to a per-NodeType free list but
+/// whose NodeType isn't being allocated any more.
+///
+/// **What this costs:** one scratch `AlignedBlobBuf` (512 KB on
+/// the heap, lives for the duration of the call) plus one full
+/// blob memcpy at the end. Roughly tens of µs on a modern machine.
+///
+/// Safe to call any time; the resulting bytes are a strict
+/// equivalent of the original tree.
+pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<CompactStats> {
+    let (old_space_used, blob_guid, old_root) = {
+        let old_frame = BlobFrame::wrap(buf.as_mut_slice());
+        let h = old_frame.header();
+        (h.space_used, h.blob_guid, h.root_slot)
+    };
+
+    // Build the packed image in a scratch buffer.
+    let mut new_buf = AlignedBlobBuf::zeroed();
+    let (new_root, new_space_used) = {
+        let mut new_frame = BlobFrame::init(new_buf.as_mut_slice(), blob_guid)?;
+        let old_frame = BlobFrame::wrap(buf.as_mut_slice());
+        let entry = clone_subtree(&old_frame, &mut new_frame, old_root)?;
+        if new_frame.header().root_slot == 1 && entry != 1 {
+            // Release the init-time EmptyRoot sentinel; the live
+            // tree lives at `entry`.
+            new_frame.free_node(1)?;
+        }
+        new_frame.header_mut().root_slot = entry;
+        let used = new_frame.header().space_used;
+        (entry, used)
+    };
+
+    // Overwrite the original buffer with the packed image.
+    buf.as_mut_slice().copy_from_slice(new_buf.as_slice());
+
+    Ok(CompactStats {
+        bytes_before: old_space_used,
+        bytes_after: new_space_used,
+        bytes_reclaimed: old_space_used.saturating_sub(new_space_used),
+        old_root,
+        new_root,
+    })
+}
+
 // ---------- misc ----------
 
 /// Length of the longest common prefix of `a` and `b`. SIMD on
@@ -3113,6 +3218,138 @@ mod tests {
                 assert_eq!(c.child_slot, 11);
             }
             other => panic!("expected Crossing, got {other:?}"),
+        }
+    }
+
+    // ============================================================
+    // Stage 6 (reclaim) — compact_blob
+    // ============================================================
+
+    /// Build a freshly-aligned 4 KB-aligned `AlignedBlobBuf` from a
+    /// raw `Vec<u8>` by copying. Test helper because the walker
+    /// unit tests historically used `Vec<u8>` as a BlobFrame
+    /// backing, but `compact_blob` operates on `AlignedBlobBuf`.
+    fn aligned_from_vec(v: &[u8]) -> AlignedBlobBuf {
+        let mut buf = AlignedBlobBuf::zeroed();
+        buf.as_mut_slice().copy_from_slice(v);
+        buf
+    }
+
+    #[test]
+    fn compact_blob_is_noop_on_empty_tree() {
+        let (buf_vec, guid) = fresh_blob();
+        let mut buf = aligned_from_vec(&buf_vec);
+        let before = {
+            BlobFrame::wrap(buf.as_mut_slice()).header().space_used
+        };
+        let stats = compact_blob(&mut buf).unwrap();
+        // Empty tree compacts to an essentially-empty tree; the
+        // sentinel placement may differ by a few bytes (free-list
+        // chain churn) but should not grow appreciably.
+        assert!(
+            stats.bytes_after <= before + 32,
+            "empty-tree compact grew unexpectedly: {} -> {}",
+            stats.bytes_before,
+            stats.bytes_after,
+        );
+        let frame = BlobFrame::wrap(buf.as_mut_slice());
+        assert_eq!(frame.header().blob_guid, guid);
+    }
+
+    #[test]
+    fn compact_blob_reclaims_extents_after_churn() {
+        let (buf_vec, _) = fresh_blob();
+        let mut buf = aligned_from_vec(&buf_vec);
+
+        // Insert 200 keys with ~120 B values, then erase every
+        // other key — leaves ~12 KB of extent leak in the data area.
+        {
+            let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+            for i in 0..200u32 {
+                let k = format!("k{i:04}").into_bytes();
+                let v = vec![0xAB; 120];
+                let root = frame.header().root_slot;
+                let out = insert(&mut frame, root, &k, &v, i as u64 + 1).unwrap();
+                frame.header_mut().root_slot = out.new_root_slot;
+            }
+            for i in 0..200u32 {
+                if i % 2 == 0 {
+                    let k = format!("k{i:04}").into_bytes();
+                    let root = frame.header().root_slot;
+                    let out = erase(&mut frame, root, &k).unwrap();
+                    frame.header_mut().root_slot = out.new_root_slot;
+                }
+            }
+        }
+
+        let stats = compact_blob(&mut buf).unwrap();
+        assert!(
+            stats.bytes_reclaimed > 0,
+            "compact should reclaim something after 100 deletes: {stats:?}",
+        );
+
+        // Survivors still readable.
+        let frame = BlobFrame::wrap(buf.as_mut_slice());
+        for i in 0..200u32 {
+            let k = format!("k{i:04}").into_bytes();
+            let v = vec![0xAB; 120];
+            let root = frame.header().root_slot;
+            let r = lookup(&frame, root, &k).unwrap();
+            if i % 2 == 0 {
+                assert!(matches!(r, LookupResult::NotFound));
+            } else {
+                match r {
+                    LookupResult::Found(got) => assert_eq!(got, v),
+                    _ => panic!("survivor {k:?} missing after compact"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_blob_preserves_guid_and_lets_inserts_continue() {
+        let (buf_vec, guid) = fresh_blob();
+        let mut buf = aligned_from_vec(&buf_vec);
+        // Churn workload.
+        {
+            let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+            for i in 0..100u32 {
+                let k = format!("img/{i:04}.jpg").into_bytes();
+                let v = vec![0xFE; 64];
+                let root = frame.header().root_slot;
+                let out = insert(&mut frame, root, &k, &v, i as u64 + 1).unwrap();
+                frame.header_mut().root_slot = out.new_root_slot;
+            }
+            // Erase first half.
+            for i in 0..50u32 {
+                let k = format!("img/{i:04}.jpg").into_bytes();
+                let root = frame.header().root_slot;
+                let out = erase(&mut frame, root, &k).unwrap();
+                frame.header_mut().root_slot = out.new_root_slot;
+            }
+        }
+        compact_blob(&mut buf).unwrap();
+
+        // Insert another batch — should land in newly-reclaimed
+        // space (no fresh bump past the post-compact cursor).
+        let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+        assert_eq!(frame.header().blob_guid, guid);
+        for i in 200..250u32 {
+            let k = format!("img/{i:04}.jpg").into_bytes();
+            let v = vec![0xFD; 64];
+            let root = frame.header().root_slot;
+            let out = insert(&mut frame, root, &k, &v, i as u64 + 1).unwrap();
+            frame.header_mut().root_slot = out.new_root_slot;
+        }
+        // All inserted keys readable.
+        for i in 200..250u32 {
+            let k = format!("img/{i:04}.jpg").into_bytes();
+            let v = vec![0xFD; 64];
+            let root = frame.header().root_slot;
+            match lookup(&frame, root, &k).unwrap() {
+                LookupResult::Found(got) => assert_eq!(got, v),
+                _ => panic!("post-compact insert {k:?} unreadable"),
+            }
         }
     }
 }

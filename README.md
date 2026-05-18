@@ -50,6 +50,11 @@ Done — algorithm core:
 - SIMD Node16 byte search + longest-common-prefix (SSE2 / NEON /
   scalar)
 - `splitBlob` auto-spillover via `make_blob_from_node`
+- `compactBlob` — in-place extent reclaim, paired with splitBlob
+  on every OOM so churn workloads (insert + delete + reinsert)
+  stay in fewer blobs
+- 128-byte bump-area reservation so spillover always has room to
+  install its emergency BlobNode
 - Child-blob auto-reclaim when an erase empties it
 - Strict-prefix support (terminator byte)
 - In-place leaf-value update on same-size writes
@@ -58,8 +63,7 @@ Done — algorithm core:
 
 Queued — see [ROADMAP.md](ROADMAP.md):
 
-- `compactBlob` — reclaim leaked leaf extents (Stage 6)
-- `BufferManager` + per-blob `HybridLatch` wiring (Stage 6)
+- `BufferManager` + per-blob `HybridLatch` wiring (Stage 6 part 2)
 - WAL + crash recovery (Stage 5)
 - `Tree::range` / `Tree::txn` iterators
 - io_uring submission on the persistent backend (Stage 7)

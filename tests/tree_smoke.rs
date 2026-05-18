@@ -348,6 +348,45 @@ fn auto_spillover_creates_child_blob_when_root_blob_fills() {
 }
 
 #[test]
+fn compact_then_insert_reclaims_extent_leak() {
+    // Pure-mutation workload: insert N keys, delete half, insert
+    // another N. Without compact reclaiming the deleted-leaf
+    // extents, the bump cursor would push past blob capacity and
+    // force spillover much sooner. With compact wired into the
+    // OOM recovery path, the extent leak is recoverable and the
+    // workload stays in many fewer blobs (often the single root).
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let tree = TreeBuilder::new("ignored")
+        .open_with_backend(backend.clone())
+        .unwrap();
+
+    let val = vec![0x42; 200];
+
+    for i in 0..1500u32 {
+        tree.put(format!("k{i:08}").as_bytes(), &val).unwrap();
+    }
+    // Delete the lower half — leaves ~750 keys live + ~750
+    // leaked extents.
+    for i in 0..750u32 {
+        let prev = tree.delete(format!("k{i:08}").as_bytes()).unwrap();
+        assert_eq!(prev.as_deref(), Some(&val[..]));
+    }
+    // Now insert another 1500 — would not fit without compact
+    // reclaiming the deleted extents.
+    for i in 1500..3000u32 {
+        tree.put(format!("k{i:08}").as_bytes(), &val).unwrap();
+    }
+
+    // Spot-check a few keys per cohort.
+    assert!(tree.get(b"k00000000").unwrap().is_none()); // deleted
+    assert!(tree.get(b"k00000749").unwrap().is_none()); // deleted
+    assert_eq!(tree.get(b"k00000750").unwrap().as_deref(), Some(&val[..])); // kept
+    assert_eq!(tree.get(b"k00001499").unwrap().as_deref(), Some(&val[..])); // kept
+    assert_eq!(tree.get(b"k00001500").unwrap().as_deref(), Some(&val[..])); // new
+    assert_eq!(tree.get(b"k00002999").unwrap().as_deref(), Some(&val[..])); // new
+}
+
+#[test]
 fn multi_blob_delete_round_trip() {
     // Insert past one-blob capacity → auto-spillover creates
     // child blobs. Delete a key that lives in a child blob;
