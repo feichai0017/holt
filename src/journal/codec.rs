@@ -152,23 +152,42 @@ const REASON_OUT_OF_BLOB_FRAME: u8 = 2;
 
 // ---------- CRC32 (IEEE 802.3) ----------
 
-/// CRC32 — IEEE 802.3 polynomial `0xEDB8_8320`. Used as the
-/// record-level `sanity_info`. Bit-reversed reflected, identical
-/// to the variant `gzip` / `PNG` / RocksDB block-checksum use.
+/// 256-entry CRC32 lookup table for the IEEE 802.3 reflected
+/// polynomial `0xEDB8_8320`. Built once at compile time via
+/// [`build_crc32_table`]; ships zero runtime initialisation cost.
+const CRC32_TABLE: [u32; 256] = build_crc32_table();
+
+const fn build_crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+/// CRC32 — IEEE 802.3 polynomial `0xEDB8_8320`, reflected
+/// (i.e. the variant `gzip` / `PNG` / RocksDB block-checksum
+/// use). Used as the record-level `sanity_info`.
 ///
-/// Implementation note: this is the bitwise reference impl,
-/// roughly 600 MB/s on a modern core. WAL records are small
-/// (typically <200 B) so the per-op cost is well under 100 ns.
-/// Switching to a table-driven or SIMD impl is a drop-in
-/// improvement when it stops being negligible.
+/// Table-driven byte-at-a-time impl: ≈1.5 GB/s on a modern core.
+/// For a typical 175-byte WAL record that's ~110 ns of per-record
+/// overhead; SIMD-accelerated variants (PCLMULQDQ on x86,
+/// CRC32 intrinsic on AArch64) would push that under 30 ns but
+/// are out of scope for v0.1.
 pub fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        let idx = ((crc ^ u32::from(b)) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[idx];
     }
     !crc
 }
@@ -180,26 +199,98 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 /// On return, `out` has grown by exactly
 /// `RECORD_HEADER_SIZE + body_len + RECORD_FOOTER_SIZE` bytes.
 /// `body_len` is variant-dependent — see `encode_body`.
+///
+/// Hot mutation paths in `Tree` use the per-variant
+/// [`encode_insert_record`] / [`encode_erase_record`] /
+/// [`encode_rename_object_record`] entry points instead — those
+/// skip the `TxnOp` enum construction and the three `Vec` clones
+/// it forces on the caller.
 pub fn encode_record(op: &TxnOp, seq: u64, out: &mut Vec<u8>) -> Result<()> {
-    let start = out.len();
+    write_record(out, seq, variant_tag(op), |buf| encode_body(op, buf));
+    Ok(())
+}
 
+/// Internal: lay down the fixed record header, run the
+/// variant-specific body writer, backpatch the body length, and
+/// append the CRC32 footer.
+fn write_record<F>(out: &mut Vec<u8>, seq: u64, ty: u8, write_body: F)
+where
+    F: FnOnce(&mut Vec<u8>),
+{
+    let start = out.len();
     out.extend_from_slice(&RECORD_MAGIC.to_le_bytes());
-    // Body-length placeholder; backpatched once the body is laid down.
     let len_pos = out.len();
     out.extend_from_slice(&[0u8; 4]);
     out.extend_from_slice(&seq.to_le_bytes());
-    out.push(variant_tag(op));
+    out.push(ty);
 
     let body_start = out.len();
-    encode_body(op, out);
+    write_body(out);
     let body_end = out.len();
     let body_len = u32::try_from(body_end - body_start).expect("body fits in u32");
     out[len_pos..len_pos + 4].copy_from_slice(&body_len.to_le_bytes());
 
     let crc = crc32(&out[start..body_end]);
     out.extend_from_slice(&crc.to_le_bytes());
+}
 
-    Ok(())
+// ---------- per-variant fast-path encoders ----------
+//
+// These mirror the variants `Tree::put` / `delete` / `rename`
+// hit on the hot path. They take borrowed bytes rather than
+// constructing a `TxnOp` enum, so callers don't pay for the
+// three `Vec` clones (key + value + prev_value) that enum
+// construction forces.
+
+/// Encode an `Insert` record directly from refs. Equivalent to
+/// `encode_record(&TxnOp::Insert { ... }, seq, out)` but without
+/// the intermediate enum.
+pub fn encode_insert_record(
+    out: &mut Vec<u8>,
+    seq: u64,
+    tree_id: u64,
+    key: &[u8],
+    value: &[u8],
+    prev_value: Option<&[u8]>,
+) {
+    write_record(out, seq, TY_INSERT, |buf| {
+        buf.extend_from_slice(&tree_id.to_le_bytes());
+        write_bytes(buf, key);
+        write_bytes(buf, value);
+        write_optional_bytes(buf, prev_value);
+    });
+}
+
+/// Encode an `Erase` record directly from refs.
+pub fn encode_erase_record(
+    out: &mut Vec<u8>,
+    seq: u64,
+    tree_id: u64,
+    key: &[u8],
+    value: &[u8],
+) {
+    write_record(out, seq, TY_ERASE, |buf| {
+        buf.extend_from_slice(&tree_id.to_le_bytes());
+        write_bytes(buf, key);
+        write_bytes(buf, value);
+    });
+}
+
+/// Encode a `RenameObject` record directly from refs.
+pub fn encode_rename_object_record(
+    out: &mut Vec<u8>,
+    seq: u64,
+    tree_id: u64,
+    src_key: &[u8],
+    dst_key: &[u8],
+    force: bool,
+) {
+    write_record(out, seq, TY_RENAME_OBJECT, |buf| {
+        buf.extend_from_slice(&tree_id.to_le_bytes());
+        write_bytes(buf, src_key);
+        write_bytes(buf, dst_key);
+        buf.push(u8::from(force));
+    });
 }
 
 fn variant_tag(op: &TxnOp) -> u8 {

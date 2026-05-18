@@ -126,6 +126,13 @@ Required for the v0.1 tag:
       Bounds the in-memory buffer regardless of how long the
       caller waits between `checkpoint()` calls; `flush()` is
       still the durability boundary for `sync_data`.
+- [x] **WAL encode fast path** (Stage 5e) — 256-entry
+      compile-time CRC32 table (≈3× faster than the bitwise
+      reference impl) + reference-based
+      `WalWriter::append_insert / append_erase /
+      append_rename_object` methods that skip the `TxnOp` enum's
+      three `Vec` clones. Persistent put latency:
+      ≈1.74 µs → ≈735 ns (kv) on the bench microcase.
 
 ### Storage backends
 
@@ -227,9 +234,9 @@ Required for the v0.1 tag:
 
 - Async checkpointer (3 background threads: checkpoint / io / eviction)
 - io_uring backend (Linux, behind feature flag)
-- Faster WAL CRC32 (256-entry table or PCLMULQDQ / AArch64 CRC32
-  intrinsic) and a reference-based `append_*` fast path that
-  skips the `TxnOp` enum's clones
+- SIMD-accelerated CRC32 (PCLMULQDQ on x86_64, CRC32 intrinsic
+  on AArch64) — the 256-entry table from v0.1 gets us to
+  ≈1.5 GB/s; the SIMD variants push past 8 GB/s
 - Buffer-pool tuning + adaptive eviction
 - Metrics export (Prometheus + OpenTelemetry traces)
 

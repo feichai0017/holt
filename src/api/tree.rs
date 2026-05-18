@@ -263,15 +263,11 @@ impl Tree {
         // (the WAL re-inserted the source key on top of an
         // already-renamed blob).
         if let Some(wal) = &self.wal {
-            let op = TxnOp::Insert {
-                tree_id: 0,
-                seq,
-                key: key.to_vec(),
-                value: value.to_vec(),
-                prev_value: outcome.previous.clone(),
-            };
             let mut w = wal.lock().unwrap();
-            w.append(&op, seq)?;
+            // Fast-path: append the Insert record directly from
+            // borrowed refs — skips the `TxnOp::Insert` enum's
+            // three `Vec` clones (key, value, prev_value).
+            w.append_insert(seq, 0, key, value, outcome.previous.as_deref())?;
             if self.cfg.wal_sync_on_commit {
                 w.flush()?;
             }
@@ -304,14 +300,10 @@ impl Tree {
         if let Some(wal) = &self.wal {
             if let Some(prev) = &outcome.previous {
                 let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-                let op = TxnOp::Erase {
-                    tree_id: 0,
-                    seq,
-                    key: key.to_vec(),
-                    value: prev.clone(),
-                };
                 let mut w = wal.lock().unwrap();
-                w.append(&op, seq)?;
+                // Fast-path: skips the `TxnOp::Erase` enum's
+                // two `Vec` clones (key, value).
+                w.append_erase(seq, 0, key, prev)?;
                 if self.cfg.wal_sync_on_commit {
                     w.flush()?;
                 }
@@ -374,15 +366,10 @@ impl Tree {
         )?;
 
         if let Some(wal) = &self.wal {
-            let op = TxnOp::RenameObject {
-                tree_id: 0,
-                seq,
-                src_key: src.to_vec(),
-                dst_key: dst.to_vec(),
-                force,
-            };
             let mut w = wal.lock().unwrap();
-            w.append(&op, seq)?;
+            // Fast-path: skips the `TxnOp::RenameObject` enum's
+            // two `Vec` clones (src_key, dst_key).
+            w.append_rename_object(seq, 0, src, dst, force)?;
             if self.cfg.wal_sync_on_commit {
                 w.flush()?;
             }

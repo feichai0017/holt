@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 use crate::api::errors::{Error, Result};
 
 use super::codec::{
-    decode_file_header, encode_file_header, encode_record, FileHeader, FILE_HEADER_SIZE,
+    decode_file_header, encode_erase_record, encode_file_header, encode_insert_record,
+    encode_record, encode_rename_object_record, FileHeader, FILE_HEADER_SIZE,
 };
 use super::txn_op::TxnOp;
 
@@ -149,8 +150,69 @@ impl WalWriter {
     /// transparently drains it to the OS via `write_all` (no
     /// `sync_data`) — bounded user-space buffering, but per-op
     /// cost stays at an in-memory copy.
+    ///
+    /// Hot mutation paths (`Tree::put` / `delete` / `rename`)
+    /// use the per-variant [`Self::append_insert`] /
+    /// [`Self::append_erase`] / [`Self::append_rename_object`]
+    /// entry points instead. Those skip the `TxnOp` enum's three
+    /// `Vec` clones (key + value + prev_value) — measurable
+    /// against the bench's hot path. `append` stays the generic
+    /// entry for structural variants (Split / Merge / Compact /
+    /// MemMarker / NewTree / RmTree) where the cost doesn't
+    /// matter.
     pub fn append(&mut self, op: &TxnOp, seq: u64) -> Result<()> {
         encode_record(op, seq, &mut self.pending)?;
+        self.maybe_drain()
+    }
+
+    /// Fast-path: append an `Insert` record directly from refs.
+    /// Skips the `TxnOp::Insert` enum + 3 `Vec::to_vec` clones.
+    pub fn append_insert(
+        &mut self,
+        seq: u64,
+        tree_id: u64,
+        key: &[u8],
+        value: &[u8],
+        prev_value: Option<&[u8]>,
+    ) -> Result<()> {
+        encode_insert_record(&mut self.pending, seq, tree_id, key, value, prev_value);
+        self.maybe_drain()
+    }
+
+    /// Fast-path: append an `Erase` record directly from refs.
+    pub fn append_erase(
+        &mut self,
+        seq: u64,
+        tree_id: u64,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        encode_erase_record(&mut self.pending, seq, tree_id, key, value);
+        self.maybe_drain()
+    }
+
+    /// Fast-path: append a `RenameObject` record directly from
+    /// refs.
+    pub fn append_rename_object(
+        &mut self,
+        seq: u64,
+        tree_id: u64,
+        src_key: &[u8],
+        dst_key: &[u8],
+        force: bool,
+    ) -> Result<()> {
+        encode_rename_object_record(
+            &mut self.pending,
+            seq,
+            tree_id,
+            src_key,
+            dst_key,
+            force,
+        );
+        self.maybe_drain()
+    }
+
+    fn maybe_drain(&mut self) -> Result<()> {
         if self.pending.len() >= AUTO_FLUSH_THRESHOLD {
             self.drain_to_os()?;
         }

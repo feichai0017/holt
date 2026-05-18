@@ -62,26 +62,29 @@ target:
 - **RocksDB**: temp-dir DB, `disable_wal = false`, `sync = false`.
   Each `put` appends to the WAL (buffered) plus the memtable.
 
-> **Why artisan persist put is slower than artisan memory put
-> (≈1.7 µs vs ≈180 ns)**: the extra ≈1.5 µs is pure WAL emit
-> cost. Approximate breakdown per record:
+> **artisan persist put ≈ 735 ns (kv) vs memory put ≈ 185 ns.**
+> The ~550 ns gap is the WAL emit cost. Approximate breakdown
+> per record after the v0.1 perf round:
 >
-> - 3 `Vec::to_vec` clones (key + value + prev_value) for the
->   `TxnOp` enum: ≈240 ns
-> - CRC32 (bitwise IEEE 802.3) over ~175 record bytes: ≈300 ns
+> - Table-driven CRC32 over ~175 record bytes: ≈110 ns
 > - `Vec::extend_from_slice` writes + length backpatch: ≈100 ns
 > - `Mutex<WalWriter>` lock + the auto-flush threshold check:
 >   ≈40 ns
 > - Amortised syscall for the auto-flush write_all (one per
 >   ~800 records at the 64 KB threshold): ≈10 ns
+> - Remaining: per-record allocator headroom +
+>   `Tree`-level `pad_key` allocation
 >
-> Group-commit auto-flush (Stage 5d) keeps the user-space buffer
-> bounded to 64 KB, so this cost is constant per record across
-> long-running processes; without it the buffer would balloon
-> unboundedly between `checkpoint()` calls. Queued perf wins:
-> a 256-entry CRC table (≈2.5× CRC speedup) and a
-> reference-based `append_insert(&[u8], &[u8], …)` fast path
-> that skips the `TxnOp` enum's clones.
+> The two big v0.1 perf wins that got us here:
+>
+> - **CRC32 table-driven** (Stage 5e): 256-entry compile-time
+>   table replaces the bitwise loop; ≈3× faster CRC.
+> - **Reference-based `append_*` fast path** (Stage 5e):
+>   `WalWriter::append_insert(&[u8], &[u8], Option<&[u8]>)`
+>   encodes directly from refs, skipping the `TxnOp` enum's three
+>   `Vec` clones. `append(&TxnOp, seq)` is kept for the
+>   structural variants (Split / Merge / Compact / NewTree /
+>   RmTree / MemMarker) where the cost doesn't matter.
 >
 > The `*_persist_get` numbers remain apples-to-apples: neither
 > engine touches disk on the get path.
@@ -118,22 +121,21 @@ post-`Stage 6 phase 2b` (HybridLatch / optimistic reads):
 
 | Scenario | Op | artisan | RocksDB | artisan / RocksDB |
 |---|---|---|---|---|
-| `kv` | get | **9.56 Melem/s** | 1.98 Melem/s | **4.8×** |
-| `kv` | put | **4.71 Melem/s** | 0.39 Melem/s | **12.0×** |
-| `kv` | mixed | **6.79 Melem/s** | 0.54 Melem/s | **12.5×** |
-| `objstore` | get | **6.85 Melem/s** | 1.90 Melem/s | **3.6×** |
-| `objstore` | put | **3.56 Melem/s** | 0.41 Melem/s | **8.7×** |
-| `objstore` | mixed | **4.45 Melem/s** | 0.63 Melem/s | **7.1×** |
-| `fs` | get | **6.75 Melem/s** | 1.91 Melem/s | **3.5×** |
-| `fs` | put | **3.23 Melem/s** | 0.40 Melem/s | **8.2×** |
-| `fs` | mixed | **4.38 Melem/s** | 0.59 Melem/s | **7.4×** |
+| `kv` | get | **10.0 Melem/s** | 2.09 Melem/s | **4.8×** |
+| `kv` | put | **1.36 Melem/s** | 0.29 Melem/s | **4.7×** |
+| `kv` | mixed | **2.35 Melem/s** | 0.54 Melem/s | **4.3×** |
+| `objstore` | get | **7.04 Melem/s** | 1.94 Melem/s | **3.6×** |
+| `objstore` | put | **1.35 Melem/s** | 0.38 Melem/s | **3.5×** |
+| `objstore` | mixed | **2.15 Melem/s** | 0.58 Melem/s | **3.7×** |
+| `fs` | get | **6.90 Melem/s** | 1.90 Melem/s | **3.6×** |
+| `fs` | put | **1.49 Melem/s** | 0.37 Melem/s | **4.0×** |
+| `fs` | mixed | **2.35 Melem/s** | 0.55 Melem/s | **4.3×** |
 
-Per-op latency, memory mode: artisan get ≈ 105–145 ns, put ≈
-190–300 ns. Per-op latency, persistent mode: artisan get
-≈ 105–148 ns (unchanged — BM cache hit), put ≈ 212–309 ns
-(slightly higher than memory due to extra atomic-counter increment
-on spillover-attempt path; RocksDB persistent put ≈ 2.4–2.5 µs
-dominated by the WAL buffered write).
+Per-op latency, memory mode: artisan get ≈ 100–145 ns, put ≈
+185–300 ns. Per-op latency, persistent mode: artisan get
+≈ 100–145 ns (unchanged — BM cache hit), put ≈ 670–745 ns,
+mixed ≈ 425–465 ns. RocksDB persistent put ≈ 2.5–3.5 µs dominated
+by the WAL buffered write.
 
 ### Why artisan wins on this shape
 
