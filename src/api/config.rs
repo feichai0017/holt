@@ -35,20 +35,40 @@ pub struct TreeConfig {
     /// How many 512 KB blob frames to keep pinned in the buffer
     /// pool (Stage 6). Default 64 (= 32 MB resident).
     pub buffer_pool_size: usize,
-    /// `true` = fsync the WAL on every commit (durable + slow).
-    /// `false` = batched (faster, may lose the last few ops on a
-    /// crash). Stage 5 wires this up.
+    /// Controls the WAL durability boundary on every `put` /
+    /// `delete` / `rename`:
+    ///
+    /// - `true` → call `sync_data` on the WAL file. Per-op
+    ///   durable past a power failure; **slow** (one fsync per
+    ///   op, ~ms on consumer SSDs).
+    /// - `false` (the default) → leave the record in the WAL
+    ///   writer's pending buffer / OS page cache. Survives a
+    ///   process crash (the auto-flush drains to the page cache
+    ///   at 64 KB); does **not** survive a power loss until
+    ///   `Tree::checkpoint` runs.
+    ///
+    /// Matches `disable_wal=false, sync=false` in RocksDB's
+    /// default. Production deployments that need power-safe
+    /// per-op durability flip this to `true`.
     pub wal_sync_on_commit: bool,
     /// Bytes appended to the WAL before triggering an automatic
-    /// checkpoint. Stage 5 wires this up. Default 16 MB.
+    /// checkpoint. Reserved — Stage 5d's auto-flush bounds the
+    /// in-memory buffer; the user is still responsible for
+    /// calling `Tree::checkpoint` to truncate the on-disk log.
+    /// Default 16 MB.
     pub checkpoint_byte_interval: u64,
-    /// If `true` (the default), every `Tree::put` / `delete` /
-    /// `rename` synchronously writes the mutated root blob through
-    /// the backend. Set to `false` to keep mutations in the
-    /// in-memory cache only — the caller must then invoke
-    /// [`crate::Tree::checkpoint`] to make changes durable. Used by
-    /// benchmarks (matches the "no-WAL, batched flush" mode of
-    /// other embedded engines).
+    /// Memory-backend BM-commit toggle.
+    ///
+    /// For **memory** trees: `true` (the default) writes the
+    /// BM-cached root blob through the (memory-backed) `Backend`
+    /// after every `put` / `delete` / `rename`. Useful with
+    /// custom backends that want to mirror state out per op;
+    /// benchmarks set this to `false` to skip the redundant
+    /// memcpy.
+    ///
+    /// For **persistent** trees this flag has no effect — the
+    /// WAL is the per-op durability path and the blob image only
+    /// flushes at `Tree::checkpoint`. See [`Self::wal_sync_on_commit`].
     pub flush_on_write: bool,
 }
 

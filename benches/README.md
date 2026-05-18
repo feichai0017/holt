@@ -53,11 +53,12 @@ crash, not a power failure" mode that high-throughput services
 target:
 
 - **artisan**: `TreeConfig::new(tempdir)` (PersistentBackend with
-  `F_NOCACHE` on macOS / `O_DIRECT` on Linux),
-  `flush_on_write = false`. Stage 5c is wired: every `put` /
-  `delete` / `rename` emits a `TxnOp` to the WAL writer (buffered
-  in user space; no fsync in `flush_on_write = false` mode). The
-  blob image only hits disk at `Tree::checkpoint`.
+  `F_NOCACHE` on macOS / `O_DIRECT` on Linux). Every `put` /
+  `delete` / `rename` emits a `TxnOp` to the WAL writer.
+  `wal_sync_on_commit` stays at its default `false`, so the
+  records sit in the writer's pending buffer / OS page cache (no
+  per-op fsync). The blob image only hits disk at
+  `Tree::checkpoint`.
 - **RocksDB**: temp-dir DB, `disable_wal = false`, `sync = false`.
   Each `put` appends to the WAL (buffered) plus the memtable.
 

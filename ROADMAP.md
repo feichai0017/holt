@@ -12,7 +12,7 @@ workloads (both `memory` and `persistent` variants).
 
 Concurrency model is settled: per-blob `HybridLatch` (LeanStore
 3-mode) gives wait-free optimistic reads + per-blob exclusive
-writes with **no Tree-wide writer mutex**. 169 tests + a
+writes with **no Tree-wide writer mutex**. 170 tests + a
 4-readers × 1-writer concurrent stress test all green.
 
 The remaining v0.1 cuts are around **WAL persistence** (Stage 5b/5c
@@ -106,13 +106,15 @@ Required for the v0.1 tag:
       variant tag) surfaces as `Error::ReplaySanityFailed` with
       the bad record's offset patched in.
 - [x] **Tree integration** (Stage 5c) — every `put` / `delete` /
-      `rename` emits a `TxnOp` to the WAL; the WAL flush is the
-      per-op durability boundary in `flush_on_write = true` mode.
-      `Tree::open` replays the durable WAL onto the BM-cached
-      blob before exposing the tree to callers, and resumes
-      `next_seq` past every replayed record. `Tree::checkpoint`
-      writes the BM root through to the backend, flushes, then
-      atomically truncates the WAL to header-only.
+      `rename` emits a `TxnOp` to the WAL. Per-op `sync_data`
+      is opt-in via `TreeConfig::wal_sync_on_commit` (default
+      `false`, matching RocksDB's `sync=false` default — high
+      throughput, durable past a process crash but not a power
+      loss until `Tree::checkpoint`). `Tree::open` replays the
+      durable WAL onto the BM-cached blob and resumes `next_seq`
+      past every replayed record. `Tree::checkpoint` writes the
+      BM root through to the backend, flushes, then atomically
+      truncates the WAL to header-only.
 - [x] **Group-commit auto-flush** (Stage 5d) — once the
       `WalWriter`'s pending buffer crosses 64 KB the bytes
       drain to the OS page cache via `write_all` (no `sync_data`).
@@ -220,8 +222,9 @@ Required for the v0.1 tag:
 
 - Async checkpointer (3 background threads: checkpoint / io / eviction)
 - io_uring backend (Linux, behind feature flag)
-- SIMD-accelerated Node16 keys[] scan (vpcmpeqb)
-- Lock-free reader fast path (validated optimistic snapshot)
+- Faster WAL CRC32 (256-entry table or PCLMULQDQ / AArch64 CRC32
+  intrinsic) and a reference-based `append_*` fast path that
+  skips the `TxnOp` enum's clones
 - Buffer-pool tuning + adaptive eviction
 - Metrics export (Prometheus + OpenTelemetry traces)
 

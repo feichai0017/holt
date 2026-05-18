@@ -1,15 +1,14 @@
 //! Stage 5c integration tests — `Tree` <-> WAL hookup.
 //!
 //! Cover:
-//! - Persistent put/delete/rename round-trip through reopen
-//!   (verifies WAL replay reconstructs the logical state).
-//! - "Crash before checkpoint" — drop the tree without calling
-//!   `checkpoint()` and confirm reopen recovers via WAL replay
-//!   when `flush_on_write = true`.
-//! - "Batched mode loses unflushed" — `flush_on_write = false`
-//!   + no checkpoint = nothing durable. Reopen sees the
-//!   pre-mutation state.
-//! - `checkpoint()` truncates the WAL.
+//! - Persistent put/delete/rename round-trip through reopen with
+//!   `wal_sync_on_commit = true` (verifies WAL replay reconstructs
+//!   the logical state on a crash-without-checkpoint).
+//! - "Default mode without checkpoint loses unflushed" — under
+//!   the default config (no per-op fsync) a drop without
+//!   `checkpoint()` leaves the disk WAL empty and reopen sees
+//!   the pre-mutation state.
+//! - `checkpoint()` flushes everything and truncates the WAL.
 
 use std::fs;
 use std::path::PathBuf;
@@ -22,13 +21,23 @@ fn wal_path(dir: &PathBuf) -> PathBuf {
     dir.join("journal.wal")
 }
 
+/// `TreeConfig::new(dir)` plus `wal_sync_on_commit = true` —
+/// tests that simulate a crash without checkpoint need every
+/// record on disk before the drop.
+fn durable_cfg(dir: &std::path::Path) -> TreeConfig {
+    let mut cfg = TreeConfig::new(dir);
+    cfg.wal_sync_on_commit = true;
+    cfg
+}
+
 #[test]
 fn persistent_put_then_reopen_via_wal_replay() {
     let dir = tempdir().unwrap();
-    let cfg = TreeConfig::new(dir.path());
+    let cfg = durable_cfg(dir.path());
 
-    // Round 1: open, put, drop without checkpoint. flush_on_write
-    // is on by default, so every WAL record was fsync'd.
+    // Round 1: open, put, drop without checkpoint. Per-op WAL
+    // fsync is on (`wal_sync_on_commit = true`), so every record
+    // is on disk before the drop.
     {
         let tree = Tree::open(cfg.clone()).unwrap();
         for i in 0..50u32 {
@@ -62,7 +71,9 @@ fn persistent_put_then_reopen_via_wal_replay() {
 #[test]
 fn checkpoint_truncates_wal_and_keys_survive_reopen() {
     let dir = tempdir().unwrap();
-    let cfg = TreeConfig::new(dir.path());
+    // Need per-op fsync so the WAL has bytes on disk before
+    // the pre-checkpoint size assertion can trip.
+    let cfg = durable_cfg(dir.path());
 
     {
         let tree = Tree::open(cfg.clone()).unwrap();
@@ -105,7 +116,7 @@ fn checkpoint_truncates_wal_and_keys_survive_reopen() {
 #[test]
 fn delete_through_wal_replays_correctly() {
     let dir = tempdir().unwrap();
-    let cfg = TreeConfig::new(dir.path());
+    let cfg = durable_cfg(dir.path());
 
     {
         let tree = Tree::open(cfg.clone()).unwrap();
@@ -139,7 +150,7 @@ fn delete_through_wal_replays_correctly() {
 #[test]
 fn rename_through_wal_replays_correctly() {
     let dir = tempdir().unwrap();
-    let cfg = TreeConfig::new(dir.path());
+    let cfg = durable_cfg(dir.path());
 
     {
         let tree = Tree::open(cfg.clone()).unwrap();
@@ -152,6 +163,44 @@ fn rename_through_wal_replays_correctly() {
     assert_eq!(tree.get(b"a").unwrap(), None);
     assert_eq!(tree.get(b"a2").unwrap().as_deref(), Some(&b"v-a"[..]));
     assert_eq!(tree.get(b"b").unwrap().as_deref(), Some(&b"v-b"[..]));
+}
+
+#[test]
+fn default_mode_loses_writes_without_checkpoint_or_fsync() {
+    // Under the default config (`wal_sync_on_commit = false`),
+    // the WAL writer keeps records in its in-memory `Vec` /
+    // auto-flushes them only when the buffer crosses 64 KB.
+    // A short workload + drop-without-checkpoint = nothing
+    // durable — exactly the high-throughput trade-off.
+    let dir = tempdir().unwrap();
+    let cfg = TreeConfig::new(dir.path());
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        for i in 0..50u32 {
+            tree.put(
+                format!("transient{i}").as_bytes(),
+                format!("v{i}").as_bytes(),
+            )
+            .unwrap();
+        }
+        // Drop without `checkpoint()`. 50 records × ~80 B is
+        // well below the 64 KB auto-flush threshold, so the WAL
+        // file on disk is still header-only.
+    }
+    let wal_size = fs::metadata(wal_path(&dir.path().to_path_buf()))
+        .unwrap()
+        .len();
+    assert_eq!(wal_size, 32);
+
+    let tree = Tree::open(cfg).unwrap();
+    for i in 0..50u32 {
+        assert_eq!(
+            tree.get(format!("transient{i}").as_bytes()).unwrap(),
+            None,
+            "transient{i} should have been lost",
+        );
+    }
 }
 
 #[test]
@@ -219,7 +268,7 @@ fn batched_mode_with_checkpoint_persists_everything() {
 #[test]
 fn next_seq_resumes_past_replayed_records() {
     let dir = tempdir().unwrap();
-    let cfg = TreeConfig::new(dir.path());
+    let cfg = durable_cfg(dir.path());
 
     // Round 1: write 5 keys; each consumes one seq.
     {
@@ -272,7 +321,9 @@ fn open_with_backend_attaches_no_wal() {
 #[test]
 fn many_round_trips_through_checkpoint_boundaries() {
     let dir = tempdir().unwrap();
-    let cfg = TreeConfig::new(dir.path());
+    // The final batch isn't followed by a checkpoint — it relies
+    // on per-op WAL fsync to survive the drop + reopen.
+    let cfg = durable_cfg(dir.path());
 
     // Three rounds, each with a checkpoint mid-stream. Verifies
     // that records past a checkpoint are also durable (the WAL

@@ -272,7 +272,7 @@ impl Tree {
             };
             let mut w = wal.lock().unwrap();
             w.append(&op, seq)?;
-            if self.cfg.flush_on_write {
+            if self.cfg.wal_sync_on_commit {
                 w.flush()?;
             }
         } else if self.cfg.flush_on_write {
@@ -312,7 +312,7 @@ impl Tree {
                 };
                 let mut w = wal.lock().unwrap();
                 w.append(&op, seq)?;
-                if self.cfg.flush_on_write {
+                if self.cfg.wal_sync_on_commit {
                     w.flush()?;
                 }
             }
@@ -383,7 +383,7 @@ impl Tree {
             };
             let mut w = wal.lock().unwrap();
             w.append(&op, seq)?;
-            if self.cfg.flush_on_write {
+            if self.cfg.wal_sync_on_commit {
                 w.flush()?;
             }
         } else if self.cfg.flush_on_write {
