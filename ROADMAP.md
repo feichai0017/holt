@@ -79,11 +79,21 @@ Required for the v0.1 tag:
 
 ### Persistence + crash safety
 
-- [ ] Physiological WAL with 13+ TxnOp variants
-- [ ] WAL replay on startup
-- [ ] Snapshot to disk + reload
-- [ ] sanity_info validation on replay
-- [ ] Synchronous checkpoint (caller invokes `tree.checkpoint()`)
+- [x] 10 `TxnOp` variants enumerated (`Insert`, `Erase`, `Split`,
+      `Merge`, `Compact`, `RenameObject`, `Rename`, `NewTree`,
+      `RmTree`, `MemMarker`)
+- [x] **Binary record codec** (Stage 5a) — fixed header
+      (`MAGIC | LEN | SEQ | TY`) + variant body + CRC32 footer.
+      All variants round-trip; corruption (CRC, magic, truncation,
+      unknown tag) surfaces as `Error::ReplaySanityFailed`. See
+      [`journal::codec`](src/journal/codec.rs).
+- [ ] `WalWriter` — append-only file with buffered I/O and
+      `fdatasync`-on-flush (Stage 5b)
+- [ ] `WalReader` / replay scanner that resyncs after a torn
+      tail (Stage 5b)
+- [ ] Tree integration — `put` / `delete` / `rename` emit ops;
+      `Tree::open` replays the log; `Tree::checkpoint` trims past
+      the last durable blob commit (Stage 5c)
 
 ### Storage backends
 

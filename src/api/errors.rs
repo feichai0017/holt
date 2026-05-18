@@ -35,9 +35,15 @@ pub enum Error {
         context: &'static str,
     },
     /// WAL replay encountered a TxnOp whose `sanity_info`
-    /// validation failed.
+    /// validation failed — record magic mismatch, CRC32 mismatch,
+    /// unknown variant tag, truncated body, etc.
     ReplaySanityFailed {
-        /// Position in the journal.
+        /// What went wrong (decoder-supplied static string).
+        context: &'static str,
+        /// Position in the journal file where the bad record
+        /// starts. `0` when the codec is invoked on a raw
+        /// in-memory buffer and the caller hasn't supplied an
+        /// offset.
         record_offset: u64,
     },
     /// `Tree::rename` (or similar) called with a `src` that has no
@@ -59,8 +65,11 @@ impl std::fmt::Display for Error {
             Self::ValueTooLong { len } => write!(f, "value too long ({len} bytes; max {})", u16::MAX),
             Self::NotYetImplemented(where_) => write!(f, "not yet implemented: {where_}"),
             Self::NodeCorrupt { context } => write!(f, "node corrupt at {context}"),
-            Self::ReplaySanityFailed { record_offset } => {
-                write!(f, "WAL replay sanity-check failed at offset {record_offset}")
+            Self::ReplaySanityFailed { context, record_offset } => {
+                write!(
+                    f,
+                    "WAL replay sanity-check failed at offset {record_offset}: {context}"
+                )
             }
             Self::NotFound => write!(f, "key not found"),
             Self::DstExists => write!(f, "destination key already exists (use force=true to overwrite)"),
