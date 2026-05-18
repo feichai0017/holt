@@ -1,6 +1,6 @@
 //! Public API surface — `Tree`, `Iter`, `Txn`, `TreeBuilder`.
 //!
-//! This module is what users will write `use artisan::{...}` for.
+//! This module is what users will write `use holt::{...}` for.
 
 pub mod builder;
 pub mod config;

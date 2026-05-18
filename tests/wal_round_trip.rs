@@ -6,13 +6,13 @@ use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use artisan::Error;
+use holt::Error;
 use tempfile::tempdir;
 
-use artisan::journal::codec::{FILE_HEADER_SIZE, FORMAT_VERSION};
-use artisan::journal::reader::replay;
-use artisan::journal::txn_op::TxnOp;
-use artisan::journal::writer::{WalWriter, AUTO_FLUSH_THRESHOLD};
+use holt::journal::codec::{FILE_HEADER_SIZE, FORMAT_VERSION};
+use holt::journal::reader::replay;
+use holt::journal::txn_op::TxnOp;
+use holt::journal::writer::{WalWriter, AUTO_FLUSH_THRESHOLD};
 
 fn wal_path(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join("test.wal")
@@ -343,7 +343,7 @@ fn rejected_file_with_unsupported_version() {
     let path = wal_path(&dir);
 
     let mut bogus = vec![0u8; FILE_HEADER_SIZE];
-    bogus[0..4].copy_from_slice(&artisan::journal::codec::FILE_MAGIC.to_le_bytes());
+    bogus[0..4].copy_from_slice(&holt::journal::codec::FILE_MAGIC.to_le_bytes());
     bogus[4..8].copy_from_slice(&999u32.to_le_bytes());
     fs::write(&path, &bogus).unwrap();
 

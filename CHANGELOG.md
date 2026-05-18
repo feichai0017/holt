@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to **artisan** are documented in this file. Format
+All notable changes to **holt** are documented in this file. Format
 adapted from [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 versioning will follow [Semantic Versioning](https://semver.org/) once
 v0.1.0 ships.

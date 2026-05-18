@@ -1,11 +1,11 @@
 [package]
-name = "artisan"
+name = "holt"
 version = "0.1.0-dev"
 edition = "2021"
 rust-version = "1.82"
 description = "An adaptive-radix-tree metadata storage engine for path-shaped keys, with per-blob concurrency and crash-safe persistence."
 license = "MIT"
-authors = ["the artisan contributors"]
+authors = ["the holt contributors"]
 readme = "README.md"
 keywords = ["art", "radix-tree", "metadata", "storage", "embedded"]
 categories = ["database-implementations", "data-structures", "filesystem"]

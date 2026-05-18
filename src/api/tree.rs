@@ -46,7 +46,7 @@ use crate::store::{BlobFrame, BufferManager};
 #[cfg(unix)]
 use crate::store::backend::PersistentBackend;
 
-/// An `artisan` tree — your handle to one metadata store.
+/// An `holt` tree — your handle to one metadata store.
 ///
 /// Clone the handle to share the same backing store: the
 /// `BufferManager` is held via `Arc`. Reads run lock-free against
@@ -135,7 +135,7 @@ impl Tree {
     /// **No WAL is attached.** The caller's backend has its own
     /// notion of durability (or is intentionally volatile —
     /// e.g. a `MemoryBackend` standing in for a real one in a
-    /// test); artisan stays out of that decision. If you want a
+    /// test); holt stays out of that decision. If you want a
     /// WAL'd persistent tree, use [`Tree::open`] with a
     /// `Storage::Persistent` config.
     ///

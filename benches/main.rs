@@ -1,4 +1,4 @@
-//! Criterion benchmarks comparing artisan against RocksDB across
+//! Criterion benchmarks comparing holt against RocksDB across
 //! three realistic shapes of metadata workload.
 //!
 //! ## Scenarios
@@ -8,7 +8,7 @@
 //! 2. **Object storage metadata** — path-like keys
 //!    (`bucket-NN/path/sub/file-NNNN.bin`) and small JSON-ish
 //!    values carrying size / etag / storage class. Models the S3
-//!    metadata tier (an artisan/NSS-target workload).
+//!    metadata tier (an holt/NSS-target workload).
 //! 3. **Filesystem metadata** — `/usr/local/share/...` paths +
 //!    32-byte packed inode bodies (size + mtime + mode + uid + gid).
 //!    Models a POSIX metadata server.
@@ -21,16 +21,16 @@
 //! ## Fairness
 //!
 //! Both engines run in their "no-WAL, batched flush" mode:
-//! - artisan: `TreeConfig::memory()` with `flush_on_write = false`.
+//! - holt: `TreeConfig::memory()` with `flush_on_write = false`.
 //!   Mutations stay in the in-memory cached root blob; `checkpoint()`
 //!   flushes through the backend.
 //! - RocksDB: temp-dir database, `disable_wal=true`, `sync=false`,
 //!   64 MB memtable, compression disabled. Equivalent to "memtable-
 //!   only writes during the bench window."
 //!
-//! ## Caveat: artisan single-blob cap
+//! ## Caveat: holt single-blob cap
 //!
-//! As of Stage 2d phase A, artisan auto-spillover (multi-blob
+//! As of Stage 2d phase A, holt auto-spillover (multi-blob
 //! insertion) is not yet wired — the working set must fit in a
 //! single 512 KB blob. N=2000 keys with the sizes above
 //! comfortably fits (~200-250 KB). Phase B unlocks larger workloads.
@@ -47,7 +47,7 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughpu
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use tempfile::TempDir;
 
-use artisan::{Tree, TreeConfig};
+use holt::{Tree, TreeConfig};
 use rocksdb::{Options, WriteOptions, DB};
 
 // ---------------------------------------------------------------
@@ -128,22 +128,22 @@ fn gen_fs_dataset() -> Vec<(Vec<u8>, Vec<u8>)> {
 // Engine setup
 // ---------------------------------------------------------------
 
-fn make_artisan() -> Tree {
+fn make_holt() -> Tree {
     let mut cfg = TreeConfig::memory();
     cfg.flush_on_write = false; // batched flushes; matches RocksDB no-WAL mode
-    Tree::open(cfg).expect("artisan open")
+    Tree::open(cfg).expect("holt open")
 }
 
-/// Persistent artisan on a temp dir. `flush_on_write = false` so
+/// Persistent holt on a temp dir. `flush_on_write = false` so
 /// each `put` lands in the BufferManager cache; the persistent
 /// backend only gets a `pwrite` at spillover or `checkpoint()`.
 /// Matches RocksDB's `WAL=on, sync=false` (per-op durable to OS
 /// page cache, not fsync'd).
-fn make_artisan_persistent() -> (Tree, TempDir) {
+fn make_holt_persistent() -> (Tree, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let mut cfg = TreeConfig::new(dir.path());
     cfg.flush_on_write = false;
-    let tree = Tree::open(cfg).expect("artisan persistent open");
+    let tree = Tree::open(cfg).expect("holt persistent open");
     (tree, dir)
 }
 
@@ -166,7 +166,7 @@ fn rocksdb_write_opts() -> WriteOptions {
 }
 
 /// Same as `rocksdb_write_opts` but with the WAL enabled — the
-/// per-op durability profile we compare artisan's persistent
+/// per-op durability profile we compare holt's persistent
 /// backend against (`WAL=on, sync=false`).
 fn rocksdb_write_opts_persistent() -> WriteOptions {
     let mut wo = WriteOptions::default();
@@ -175,9 +175,9 @@ fn rocksdb_write_opts_persistent() -> WriteOptions {
     wo
 }
 
-fn preload_artisan(tree: &Tree, pairs: &[(Vec<u8>, Vec<u8>)]) {
+fn preload_holt(tree: &Tree, pairs: &[(Vec<u8>, Vec<u8>)]) {
     for (k, v) in pairs {
-        tree.put(k, v).expect("artisan put");
+        tree.put(k, v).expect("holt put");
     }
 }
 
@@ -200,14 +200,14 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
         let mut group = c.benchmark_group(format!("{name}_get"));
         group.throughput(Throughput::Elements(1));
 
-        let artisan = make_artisan();
-        preload_artisan(&artisan, pairs);
+        let holt = make_holt();
+        preload_holt(&holt, pairs);
         let mut rng = StdRng::seed_from_u64(SEED + 1);
-        group.bench_function("artisan", |b| {
+        group.bench_function("holt", |b| {
             b.iter(|| {
                 let idx = (rng.next_u32() as usize) % key_count;
                 let (k, _) = &pairs[idx];
-                black_box(artisan.get(black_box(k)).unwrap());
+                black_box(holt.get(black_box(k)).unwrap());
             });
         });
 
@@ -230,14 +230,14 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
         let mut group = c.benchmark_group(format!("{name}_put"));
         group.throughput(Throughput::Elements(1));
 
-        let artisan = make_artisan();
-        preload_artisan(&artisan, pairs);
+        let holt = make_holt();
+        preload_holt(&holt, pairs);
         let mut rng = StdRng::seed_from_u64(SEED + 2);
-        group.bench_function("artisan", |b| {
+        group.bench_function("holt", |b| {
             b.iter(|| {
                 let idx = (rng.next_u32() as usize) % key_count;
                 let (k, v) = &pairs[idx];
-                black_box(artisan.put(black_box(k), black_box(v)).unwrap());
+                black_box(holt.put(black_box(k), black_box(v)).unwrap());
             });
         });
 
@@ -262,18 +262,18 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
         let mut group = c.benchmark_group(format!("{name}_mixed"));
         group.throughput(Throughput::Elements(1));
 
-        let artisan = make_artisan();
-        preload_artisan(&artisan, pairs);
+        let holt = make_holt();
+        preload_holt(&holt, pairs);
         let mut rng = StdRng::seed_from_u64(SEED + 3);
-        group.bench_function("artisan", |b| {
+        group.bench_function("holt", |b| {
             b.iter(|| {
                 let r = rng.next_u32();
                 let idx = (r as usize) % key_count;
                 let (k, v) = &pairs[idx];
                 if r & 1 == 0 {
-                    black_box(artisan.get(black_box(k)).unwrap());
+                    black_box(holt.get(black_box(k)).unwrap());
                 } else {
-                    black_box(artisan.put(black_box(k), black_box(v)).unwrap());
+                    black_box(holt.put(black_box(k), black_box(v)).unwrap());
                 }
             });
         });
@@ -301,7 +301,7 @@ fn bench_scenario(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
 }
 
 // Persistent variant: both engines on disk with WAL/durability on
-// (RocksDB: WAL enabled, fsync off; artisan: PersistentBackend,
+// (RocksDB: WAL enabled, fsync off; holt: PersistentBackend,
 // flush_on_write = false — each `put` stays in the BM cache,
 // only spillover + `checkpoint()` hit disk).
 fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, Vec<u8>)]) {
@@ -312,14 +312,14 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
         let mut group = c.benchmark_group(format!("{name}_persist_get"));
         group.throughput(Throughput::Elements(1));
 
-        let (artisan, _dir) = make_artisan_persistent();
-        preload_artisan(&artisan, pairs);
+        let (holt, _dir) = make_holt_persistent();
+        preload_holt(&holt, pairs);
         let mut rng = StdRng::seed_from_u64(SEED + 11);
-        group.bench_function("artisan", |b| {
+        group.bench_function("holt", |b| {
             b.iter(|| {
                 let idx = (rng.next_u32() as usize) % key_count;
                 let (k, _) = &pairs[idx];
-                black_box(artisan.get(black_box(k)).unwrap());
+                black_box(holt.get(black_box(k)).unwrap());
             });
         });
 
@@ -345,14 +345,14 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
         let mut group = c.benchmark_group(format!("{name}_persist_put"));
         group.throughput(Throughput::Elements(1));
 
-        let (artisan, _dir) = make_artisan_persistent();
-        preload_artisan(&artisan, pairs);
+        let (holt, _dir) = make_holt_persistent();
+        preload_holt(&holt, pairs);
         let mut rng = StdRng::seed_from_u64(SEED + 12);
-        group.bench_function("artisan", |b| {
+        group.bench_function("holt", |b| {
             b.iter(|| {
                 let idx = (rng.next_u32() as usize) % key_count;
                 let (k, v) = &pairs[idx];
-                black_box(artisan.put(black_box(k), black_box(v)).unwrap());
+                black_box(holt.put(black_box(k), black_box(v)).unwrap());
             });
         });
 
@@ -379,18 +379,18 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
         let mut group = c.benchmark_group(format!("{name}_persist_mixed"));
         group.throughput(Throughput::Elements(1));
 
-        let (artisan, _dir) = make_artisan_persistent();
-        preload_artisan(&artisan, pairs);
+        let (holt, _dir) = make_holt_persistent();
+        preload_holt(&holt, pairs);
         let mut rng = StdRng::seed_from_u64(SEED + 13);
-        group.bench_function("artisan", |b| {
+        group.bench_function("holt", |b| {
             b.iter(|| {
                 let r = rng.next_u32();
                 let idx = (r as usize) % key_count;
                 let (k, v) = &pairs[idx];
                 if r & 1 == 0 {
-                    black_box(artisan.get(black_box(k)).unwrap());
+                    black_box(holt.get(black_box(k)).unwrap());
                 } else {
-                    black_box(artisan.put(black_box(k), black_box(v)).unwrap());
+                    black_box(holt.put(black_box(k), black_box(v)).unwrap());
                 }
             });
         });

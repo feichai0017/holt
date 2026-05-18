@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use tempfile::tempdir;
 
-use artisan::{Tree, TreeConfig};
+use holt::{Tree, TreeConfig};
 
 fn wal_path(dir: &Path) -> PathBuf {
     dir.join("journal.wal")
@@ -288,7 +288,7 @@ fn next_seq_resumes_past_replayed_records() {
 
 #[test]
 fn open_with_backend_attaches_no_wal() {
-    use artisan::{Backend, MemoryBackend, TreeBuilder};
+    use holt::{Backend, MemoryBackend, TreeBuilder};
     use std::sync::Arc;
 
     let dir = tempdir().unwrap();

@@ -1,6 +1,6 @@
 //! `AlignedBlobBuf` — heap-allocated, 4 KB-aligned 512 KB buffer.
 //!
-//! All blob I/O in artisan flows through this type so that:
+//! All blob I/O in holt flows through this type so that:
 //!
 //! 1. Buffers can be handed directly to `O_DIRECT` files without a
 //!    bounce copy — the kernel rejects unaligned submissions.

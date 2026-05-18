@@ -1,8 +1,8 @@
-# artisan
+# holt
 
 > A carefully crafted **adaptive radix tree** for path-shaped metadata.
 
-`artisan` is an embedded Rust library for storing **hierarchical
+`holt` is an embedded Rust library for storing **hierarchical
 keys** — file paths, S3 object names, multi-tenant namespaces,
 time-bucketed identifiers — with sub-microsecond lookups, per-blob
 concurrency, and crash-safe persistence.
@@ -18,10 +18,10 @@ where:
   single-writer locks.
 
 If you need full-text search or vector similarity, use a different
-tool. If you need exactly this shape, artisan should beat
+tool. If you need exactly this shape, holt should beat
 LMDB / RocksDB / SQLite on its target workload.
 
-## When to reach for artisan
+## When to reach for holt
 
 | Engine          | Data structure | Persistence       | Concurrency        | Notes                                                       |
 |-----------------|----------------|-------------------|--------------------|-------------------------------------------------------------|
@@ -29,7 +29,7 @@ LMDB / RocksDB / SQLite on its target workload.
 | RocksDB         | LSM            | SST + WAL         | MVCC               | Compaction stalls; large hot dataset is RAM-heavy.          |
 | SQLite          | B-tree         | File              | Single writer      | Convenient, but writer is the bottleneck under load.        |
 | Sled            | Hybrid LSM     | Log-structured    | Lock-free          | Rust-native, but largely unmaintained.                      |
-| **artisan**     | **Adaptive Radix Tree** | **512 KB blobs** | **Per-blob 3-mode latch** | **Path compression + lookup is O(key.len)**     |
+| **holt**     | **Adaptive Radix Tree** | **512 KB blobs** | **Per-blob 3-mode latch** | **Path compression + lookup is O(key.len)**     |
 
 ART's lookup cost is `O(key.len)`, not `O(log N)`. For short hot keys
 (say, < 64 bytes), that's faster than any tree-based competitor. The
@@ -42,7 +42,7 @@ parallel without coordinating with each other.
 crash-and-replay) and CI is green on ubuntu + macOS;
 `cargo bench --bench main`
 runs a side-by-side comparison with RocksDB (memory + persistent
-variants, both showing artisan **~3.5–5× faster** on small-metadata
+variants, both showing holt **~3.5–5× faster** on small-metadata
 workloads — see [benches/README.md](benches/README.md)).
 
 Done — algorithm core:
@@ -117,10 +117,10 @@ Queued — see [ROADMAP.md](ROADMAP.md):
 ## Quick taste
 
 ```rust
-use artisan::{Tree, TreeBuilder, TreeConfig};
+use holt::{Tree, TreeBuilder, TreeConfig};
 
 // Persistent (default).
-let tree = TreeBuilder::new("/var/lib/myapp/meta.artisan")
+let tree = TreeBuilder::new("/var/lib/myapp/meta.holt")
     .buffer_pool_size(128)
     .open()?;
 
@@ -198,11 +198,11 @@ To avoid surprise:
 - **Not a network server.** This is a library you embed; bring your
   own RPC.
 
-For these, combine artisan with a domain-appropriate engine:
+For these, combine holt with a domain-appropriate engine:
 
-- artisan + FAISS / Qdrant / pgvector → AI workspace metadata + vectors
-- artisan + Tantivy → FS metadata + full-text
-- artisan + custom Raft → distributed deployments
+- holt + FAISS / Qdrant / pgvector → AI workspace metadata + vectors
+- holt + Tantivy → FS metadata + full-text
+- holt + custom Raft → distributed deployments
 
 ## License
 

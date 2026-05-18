@@ -1,6 +1,6 @@
-//! # artisan — adaptive radix tree metadata storage engine
+//! # holt — adaptive radix tree metadata storage engine
 //!
-//! `artisan` is an embedded Rust library that stores **path-shaped
+//! `holt` is an embedded Rust library that stores **path-shaped
 //! metadata** with sub-microsecond lookups, per-blob concurrency,
 //! and crash-safe persistence. It is built around an Adaptive
 //! Radix Tree that spans multiple 512 KB blob frames.
@@ -18,15 +18,15 @@
 //! ## Quick taste (when v0.1 ships)
 //!
 //! ```ignore
-//! use artisan::TreeBuilder;
+//! use holt::TreeBuilder;
 //!
-//! let tree = TreeBuilder::new("/var/lib/myapp/meta.artisan").open()?;
+//! let tree = TreeBuilder::new("/var/lib/myapp/meta.holt").open()?;
 //! tree.put(b"img/01.jpg", b"rgb_data")?;
 //! let v = tree.get(b"img/01.jpg")?.unwrap();
 //! for entry in tree.range(b"img/").take(10) {
 //!     println!("{} -> {}", entry.key_str(), entry.value_str());
 //! }
-//! # Ok::<(), artisan::Error>(())
+//! # Ok::<(), holt::Error>(())
 //! ```
 //!
 //! ## Module map

@@ -30,19 +30,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "artisan"
-version = "0.1.0-dev"
-dependencies = [
- "criterion",
- "io-uring",
- "libc",
- "proptest",
- "rand 0.8.6",
- "rocksdb",
- "tempfile",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -399,6 +386,19 @@ name = "hermit-abi"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
+
+[[package]]
+name = "holt"
+version = "0.1.0-dev"
+dependencies = [
+ "criterion",
+ "io-uring",
+ "libc",
+ "proptest",
+ "rand 0.8.6",
+ "rocksdb",
+ "tempfile",
+]
 
 [[package]]
 name = "id-arena"

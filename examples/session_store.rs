@@ -6,7 +6,7 @@
 //! the key space — exactly the shape ART path-compression
 //! optimises for.
 
-use artisan::TreeBuilder;
+use holt::TreeBuilder;
 
 /// Compose the on-disk key for a session record.
 fn session_key(user_id: u64, session_id: &str) -> Vec<u8> {
@@ -20,7 +20,7 @@ fn session_key(user_id: u64, session_id: &str) -> Vec<u8> {
 }
 
 fn main() {
-    println!("=== artisan session_store example ===\n");
+    println!("=== holt session_store example ===\n");
 
     let tree = TreeBuilder::new("scratch").memory().open().expect("open");
 

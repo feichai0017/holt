@@ -1,4 +1,4 @@
-//! `s3_metadata` — artisan as an S3-compatible object metadata
+//! `s3_metadata` — holt as an S3-compatible object metadata
 //! backend.
 //!
 //! Keys are `bucket/object/path`; values are the small JSON-ish
@@ -7,10 +7,10 @@
 //! this — the access pattern is point lookup + occasional
 //! atomic move (rename for "copy + delete").
 
-use artisan::TreeBuilder;
+use holt::TreeBuilder;
 
 fn main() {
-    println!("=== artisan s3_metadata example ===\n");
+    println!("=== holt s3_metadata example ===\n");
 
     let tree = TreeBuilder::new("scratch").memory().open().expect("open");
 

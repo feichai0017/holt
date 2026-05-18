@@ -5,7 +5,7 @@
 //! tests double-check from the public API surface so any
 //! external observer can verify the contract.
 
-use artisan::layout::{
+use holt::layout::{
     leaf_extent_size, size_of_node, BlobHeader, BlobNode, Leaf, Node16, Node256, Node4, Node48,
     NodeType, Prefix, BLOB_MAX_INLINE, DATA_AREA_START, HEADER_SIZE, MAX_SLOTS, PAGE_SIZE,
     PREFIX_MAX_INLINE,

@@ -1,4 +1,4 @@
-# artisan — architecture
+# holt — architecture
 
 ## 1. The shape of the data
 
@@ -494,7 +494,7 @@ To avoid surprise:
 - **Not a network server.** This is a library you embed; bring your
   own RPC if you want to expose it remotely.
 
-For these, combine artisan with a domain-appropriate engine:
-- artisan + FAISS / Qdrant / pgvector → AI workspace metadata + vectors
-- artisan + Tantivy → FS metadata + full-text
-- artisan + custom Raft → distributed artisan
+For these, combine holt with a domain-appropriate engine:
+- holt + FAISS / Qdrant / pgvector → AI workspace metadata + vectors
+- holt + Tantivy → FS metadata + full-text
+- holt + custom Raft → distributed holt

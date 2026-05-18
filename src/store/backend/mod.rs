@@ -1,6 +1,6 @@
 //! Storage backend layer.
 //!
-//! Only two backends exist in artisan and only two ever will:
+//! Only two backends exist in holt and only two ever will:
 //!
 //! | Backend | Purpose | Where it works |
 //! |---|---|---|

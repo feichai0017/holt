@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use proptest::collection::vec;
 use proptest::prelude::*;
 
-use artisan::{Tree, TreeConfig};
+use holt::{Tree, TreeConfig};
 
 /// A single op in the random sequence.
 #[derive(Debug, Clone)]
@@ -93,10 +93,10 @@ fn apply(tree: &Tree, ops: &[Op]) -> HashMap<Vec<u8>, Vec<u8>> {
                             oracle.insert(d.clone(), v);
                         }
                     }
-                    Err(artisan::Error::NotFound) => {
+                    Err(holt::Error::NotFound) => {
                         assert!(!src_present);
                     }
-                    Err(artisan::Error::DstExists) => {
+                    Err(holt::Error::DstExists) => {
                         assert!(src_present && dst_present && !force && s != d);
                     }
                     Err(e) => panic!("unexpected rename error: {e:?}"),

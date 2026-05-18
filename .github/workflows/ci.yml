@@ -13,7 +13,7 @@ env:
 jobs:
   # --------------------------------------------------------------
   # Build + test the library + examples + integration tests on
-  # the two Tier-1 Unix targets artisan supports today.
+  # the two Tier-1 Unix targets holt supports today.
   # --------------------------------------------------------------
   test:
     name: test (${{ matrix.os }})

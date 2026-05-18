@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use artisan::{AlignedBlobBuf, Backend, MemoryBackend, Tree, TreeBuilder, TreeConfig};
+use holt::{AlignedBlobBuf, Backend, MemoryBackend, Tree, TreeBuilder, TreeConfig};
 
 #[test]
 fn open_memory_get_on_empty_tree_returns_none() {
@@ -250,7 +250,7 @@ fn rename_moves_value_to_new_key() {
 fn rename_missing_src_errors_not_found() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     let r = tree.rename(b"nope", b"new", false);
-    assert!(matches!(r, Err(artisan::Error::NotFound)));
+    assert!(matches!(r, Err(holt::Error::NotFound)));
 }
 
 #[test]
@@ -259,7 +259,7 @@ fn rename_to_existing_dst_without_force_errors_dst_exists() {
     tree.put(b"a", b"v_a").unwrap();
     tree.put(b"b", b"v_b").unwrap();
     let r = tree.rename(b"a", b"b", false);
-    assert!(matches!(r, Err(artisan::Error::DstExists)));
+    assert!(matches!(r, Err(holt::Error::DstExists)));
     // Both keys still present, values unchanged.
     assert_eq!(tree.get(b"a").unwrap().as_deref(), Some(&b"v_a"[..]));
     assert_eq!(tree.get(b"b").unwrap().as_deref(), Some(&b"v_b"[..]));
@@ -560,7 +560,7 @@ fn multi_blob_rename_round_trip() {
     let occupied_dst = format!("k{:08}", 101).into_bytes();
     let r = tree.rename(&live_src, &occupied_dst, /*force=*/ false);
     assert!(
-        matches!(r, Err(artisan::Error::DstExists)),
+        matches!(r, Err(holt::Error::DstExists)),
         "force=false to occupied dst must be DstExists",
     );
 
@@ -602,9 +602,9 @@ fn auto_spillover_preserves_data_across_reopen() {
 
 #[test]
 fn tree_get_follows_blob_node_crossing_across_two_blobs() {
-    use artisan::engine::make_blob_from_node;
-    use artisan::layout::{BlobNode, NodeType};
-    use artisan::store::BlobFrame;
+    use holt::engine::make_blob_from_node;
+    use holt::layout::{BlobNode, NodeType};
+    use holt::store::BlobFrame;
 
     // Step 1: build a normal tree with some keys.
     let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());

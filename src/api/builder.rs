@@ -12,13 +12,13 @@ use crate::store::backend::Backend;
 ///
 /// ```ignore
 /// // Persistent (the default):
-/// let tree = artisan::TreeBuilder::new("/var/lib/myapp")
+/// let tree = holt::TreeBuilder::new("/var/lib/myapp")
 ///     .buffer_pool_size(128)
 ///     .wal_sync_on_commit(true)
 ///     .open()?;
 ///
 /// // In-memory (volatile, for tests / scratch):
-/// let tree = artisan::TreeBuilder::new("scratch")
+/// let tree = holt::TreeBuilder::new("scratch")
 ///     .memory()
 ///     .open()?;
 /// ```

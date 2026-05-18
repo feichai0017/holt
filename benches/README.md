@@ -1,6 +1,6 @@
 # Benchmarks
 
-Criterion-based microbenchmarks comparing **artisan** against
+Criterion-based microbenchmarks comparing **holt** against
 **RocksDB** across three realistic shapes of metadata workload.
 
 ## Scenarios
@@ -40,7 +40,7 @@ Two parallel comparisons, each in a fair-rules subgroup:
 
 Engine algorithm cost only — durability disabled on both sides:
 
-- **artisan**: `TreeConfig::memory()` with `flush_on_write = false`.
+- **holt**: `TreeConfig::memory()` with `flush_on_write = false`.
   Mutations stay in the BufferManager-pinned root blob.
 - **RocksDB**: temp-dir DB, `disable_wal = true`, `sync = false`,
   64 MB memtable, compression disabled.
@@ -52,7 +52,7 @@ the OS page cache (not fsync) — the "you survive a process
 crash, not a power failure" mode that high-throughput services
 target:
 
-- **artisan**: `TreeConfig::new(tempdir)` (PersistentBackend with
+- **holt**: `TreeConfig::new(tempdir)` (PersistentBackend with
   `F_NOCACHE` on macOS / `O_DIRECT` on Linux). Every `put` /
   `delete` / `rename` emits a `TxnOp` to the WAL writer.
   `wal_sync_on_commit` stays at its default `false`, so the
@@ -62,7 +62,7 @@ target:
 - **RocksDB**: temp-dir DB, `disable_wal = false`, `sync = false`.
   Each `put` appends to the WAL (buffered) plus the memtable.
 
-> **artisan persist put ≈ 735 ns (kv) vs memory put ≈ 185 ns.**
+> **holt persist put ≈ 735 ns (kv) vs memory put ≈ 185 ns.**
 > The ~550 ns gap is the WAL emit cost. Approximate breakdown
 > per record after the v0.1 perf round:
 >
@@ -105,7 +105,7 @@ post-`Stage 6 phase 2b` (HybridLatch / optimistic reads):
 
 ### Memory / no-WAL
 
-| Scenario | Op | artisan | RocksDB | artisan / RocksDB |
+| Scenario | Op | holt | RocksDB | holt / RocksDB |
 |---|---|---|---|---|
 | `kv` | get | **9.45 Melem/s** | 1.89 Melem/s | **5.0×** |
 | `kv` | put | **5.26 Melem/s** | 1.29 Melem/s | **4.1×** |
@@ -119,7 +119,7 @@ post-`Stage 6 phase 2b` (HybridLatch / optimistic reads):
 
 ### Persistent
 
-| Scenario | Op | artisan | RocksDB | artisan / RocksDB |
+| Scenario | Op | holt | RocksDB | holt / RocksDB |
 |---|---|---|---|---|
 | `kv` | get | **10.0 Melem/s** | 2.09 Melem/s | **4.8×** |
 | `kv` | put | **1.36 Melem/s** | 0.29 Melem/s | **4.7×** |
@@ -131,13 +131,13 @@ post-`Stage 6 phase 2b` (HybridLatch / optimistic reads):
 | `fs` | put | **1.49 Melem/s** | 0.37 Melem/s | **4.0×** |
 | `fs` | mixed | **2.35 Melem/s** | 0.55 Melem/s | **4.3×** |
 
-Per-op latency, memory mode: artisan get ≈ 100–145 ns, put ≈
-185–300 ns. Per-op latency, persistent mode: artisan get
+Per-op latency, memory mode: holt get ≈ 100–145 ns, put ≈
+185–300 ns. Per-op latency, persistent mode: holt get
 ≈ 100–145 ns (unchanged — BM cache hit), put ≈ 670–745 ns,
 mixed ≈ 425–465 ns. RocksDB persistent put ≈ 2.5–3.5 µs dominated
 by the WAL buffered write.
 
-### Why artisan wins on this shape
+### Why holt wins on this shape
 
 - **The whole tree fits in L2.** 200–250 KB of leaves + internal
   nodes for 2000 keys; the cached root blob is a single 512 KB
@@ -148,17 +148,17 @@ by the WAL buffered write.
 - **In-place update on same-size values.** When the new value fits
   inside the existing leaf extent (very common — `objstore` /
   `fs` workloads pin value length, `kv` uses 64 B everywhere),
-  artisan rewrites the bytes in place. Zero allocator activity,
+  holt rewrites the bytes in place. Zero allocator activity,
   zero extent leak.
 
 ## Caveats — honest read
 
-artisan's current implementation has constraints that matter once
+holt's current implementation has constraints that matter once
 you go bigger:
 
-1. **No WAL yet.** The `*_persist_put` numbers favour artisan
+1. **No WAL yet.** The `*_persist_put` numbers favour holt
    because it has no write-ahead log; RocksDB has its WAL turned
-   on. Once Stage 5 (WAL) lands artisan's persistent `put`
+   on. Once Stage 5 (WAL) lands holt's persistent `put`
    numbers will close the gap. The `*_persist_get` numbers are
    the apples-to-apples read comparison.
 2. **No fsync.** Both persistent benches set `sync = false` —
@@ -167,7 +167,7 @@ you go bigger:
    on consumer SSD) and overwhelms both engines' algorithm costs.
 3. **Small dataset (2000 keys).** Intentionally inside L2 so the
    benchmark isolates engine throughput from cache misses. The
-   metadata-engine workloads artisan targets (directory listings,
+   metadata-engine workloads holt targets (directory listings,
    S3 metadata, AI artefact catalogs) routinely fit this profile;
    100M-key analytics datastore workloads are RocksDB's home turf.
 4. **Single-threaded.** Stage 6 phase 2b's HybridLatch makes

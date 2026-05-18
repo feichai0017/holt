@@ -1,12 +1,12 @@
-//! `filesystem_meta` — artisan as the inode table of a toy POSIX
+//! `filesystem_meta` — holt as the inode table of a toy POSIX
 //! filesystem. Keys are absolute paths; values are 32-byte packed
 //! inodes (size + mtime + mode + uid + gid + nlink).
 //!
-//! Demonstrates the workload artisan was built for: short
+//! Demonstrates the workload holt was built for: short
 //! hierarchical keys, fixed-size values, dense per-prefix
 //! density, point-lookup + atomic rename.
 
-use artisan::TreeBuilder;
+use holt::TreeBuilder;
 
 /// 32 bytes — the shape the criterion `fs` bench also models.
 #[repr(C, packed)]
@@ -38,7 +38,7 @@ impl Inode {
 }
 
 fn main() {
-    println!("=== artisan filesystem_meta example ===\n");
+    println!("=== holt filesystem_meta example ===\n");
 
     // In-memory for the example so it doesn't litter cwd.
     let tree = TreeBuilder::new("scratch").memory().open().expect("open");

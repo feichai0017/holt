@@ -1,6 +1,6 @@
 # Benchmarks
 
-artisan ships a Criterion suite that pits it against RocksDB across
+holt ships a Criterion suite that pits it against RocksDB across
 three realistic shapes of metadata workload. This page is the
 project-level rollup of *what we measure*, *what we don't*, and *what
 the headline numbers mean*. For the runnable scripts and per-bench
@@ -10,7 +10,7 @@ methodology see [`benches/README.md`](../benches/README.md).
 
 The bench targets **path-shaped metadata engines**: short
 hierarchical keys, fixed-size values, dense per-prefix density, point
-lookup + atomic move. That's the workload artisan was built for —
+lookup + atomic move. That's the workload holt was built for —
 filesystem inodes, S3 object metadata, multi-tenant session tables,
 AI artefact catalogues.
 
@@ -19,7 +19,7 @@ It is **not** the right comparison for:
 - High-volume analytics tables (millions of cold keys, sequential
   scans). RocksDB's block cache + bloom filters + compression sit
   outside this comparison.
-- Vector search, full-text search, SQL workloads. artisan exposes
+- Vector search, full-text search, SQL workloads. holt exposes
   a bytes-in / bytes-out interface; the higher-level engine is up
   to the application.
 
@@ -40,10 +40,10 @@ Each group runs three ops:
 And two storage modes:
 
 - **Memory** — both engines volatile, WAL disabled (RocksDB
-  `disable_wal=true, sync=false`; artisan `TreeConfig::memory()`).
+  `disable_wal=true, sync=false`; holt `TreeConfig::memory()`).
   Isolates the *algorithm* cost.
 - **Persistent** — both engines disk-backed, WAL enabled, per-op
-  fsync disabled (RocksDB `disable_wal=false, sync=false`; artisan
+  fsync disabled (RocksDB `disable_wal=false, sync=false`; holt
   `TreeConfig::new(dir)` with default `wal_sync_on_commit = false`).
   Survives a process crash, not a power loss until checkpoint.
 
@@ -56,7 +56,7 @@ v0.1-dev as of 2026-05:
 
 ### Memory
 
-| Scenario   | Op    | artisan       | RocksDB       | artisan / RocksDB |
+| Scenario   | Op    | holt       | RocksDB       | holt / RocksDB |
 |------------|-------|---------------|---------------|-------------------|
 | `kv`       | get   | 9.45 Melem/s  | 1.89 Melem/s  | **5.0×**          |
 | `kv`       | put   | 5.26 Melem/s  | 1.29 Melem/s  | **4.1×**          |
@@ -70,7 +70,7 @@ v0.1-dev as of 2026-05:
 
 ### Persistent
 
-| Scenario   | Op    | artisan       | RocksDB       | artisan / RocksDB |
+| Scenario   | Op    | holt       | RocksDB       | holt / RocksDB |
 |------------|-------|---------------|---------------|-------------------|
 | `kv`       | get   | 10.0 Melem/s  | 2.09 Melem/s  | **4.8×**          |
 | `kv`       | put   | 1.36 Melem/s  | 0.29 Melem/s  | **4.7×**          |
@@ -84,7 +84,7 @@ v0.1-dev as of 2026-05:
 
 ## What the gap is made of
 
-### artisan reads (100–145 ns)
+### holt reads (100–145 ns)
 
 - Walk depth = `O(key.len)`, not `O(log N)`. For < 64 B keys this is
   3-5 SIMD `pcmpeqb` (Node16) / single-byte indexed loads (Node48 /
@@ -95,7 +95,7 @@ v0.1-dev as of 2026-05:
 - Path compression via the `Prefix` node folds long shared paths
   into a single hop.
 
-### artisan persistent writes (670–745 ns)
+### holt persistent writes (670–745 ns)
 
 Breakdown for a 64 B-value `put`:
 
@@ -128,7 +128,7 @@ persistent put cost in half — from ≈1.74 µs in Stage 5c down to
    "durable to OS page cache" only. A real `fsync`-per-op workload
    (banking-grade durability) is fsync-bound (~1-3 ms on consumer
    SSDs) and overwhelms both engines' algorithm costs. To benchmark
-   that profile in artisan, set `TreeConfig::wal_sync_on_commit =
+   that profile in holt, set `TreeConfig::wal_sync_on_commit =
    true`.
 2. **Small dataset (2000 keys).** Intentionally inside L2 so the
    benchmark isolates engine throughput from cache misses. Metadata-

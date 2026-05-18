@@ -1,4 +1,4 @@
-# Contributing to artisan
+# Contributing to holt
 
 Thanks for your interest. This document spells out the build / test /
 review loop so you can land a change with confidence.
@@ -7,8 +7,8 @@ review loop so you can land a change with confidence.
 
 ```bash
 # clone
-git clone https://github.com/feichai0017/artisan.git
-cd artisan
+git clone https://github.com/feichai0017/holt.git
+cd holt
 
 # everything CI runs:
 cargo build  --workspace --all-targets
@@ -117,6 +117,6 @@ direction conversations beat surprise patches.
 
 ## Licence
 
-artisan is **MIT** licensed. By contributing, you agree your
+holt is **MIT** licensed. By contributing, you agree your
 contribution is licensed under the MIT licence. See
 [`LICENSE`](LICENSE) for the legal text.

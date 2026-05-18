@@ -1,9 +1,9 @@
 //! `basic_kv` — smallest possible end-to-end demo of the public API.
 
-use artisan::{TreeBuilder, TreeConfig};
+use holt::{TreeBuilder, TreeConfig};
 
 fn main() {
-    println!("=== artisan basic_kv example ===\n");
+    println!("=== holt basic_kv example ===\n");
 
     // Default is persistent. Add `.memory()` to flip to in-memory.
     // (We use memory here so the example doesn't litter the cwd.)

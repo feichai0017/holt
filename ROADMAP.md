@@ -1,4 +1,4 @@
-# artisan — roadmap
+# holt — roadmap
 
 ## Where things stand
 
@@ -217,10 +217,10 @@ Required for the v0.1 tag:
 ### Docs + examples
 
 - [x] `examples/basic_kv.rs` — minimal "open, put, get, close"
-- [x] `examples/filesystem_meta.rs` — artisan as the metadata layer
+- [x] `examples/filesystem_meta.rs` — holt as the metadata layer
       for a toy POSIX filesystem
 - [x] `examples/session_store.rs` — multi-tenant chat session storage
-- [x] `examples/s3_metadata.rs` — artisan as an S3-compatible object
+- [x] `examples/s3_metadata.rs` — holt as an S3-compatible object
       metadata backend
 - [x] `cargo doc` renders with zero warnings under `-D warnings`
 - [x] `docs/benchmarks.md` — project-level rollup of the criterion
