@@ -218,9 +218,19 @@ impl<'a> BlobFrame<'a> {
 
     /// Allocate a node of the given NodeType.
     ///
-    /// Tries the per-NodeType free list first, then bump-allocates
+    /// Tries the per-NodeType free list first; for size-128
+    /// NodeTypes (`Prefix` ↔ `Blob`) also tries the sibling
+    /// 128-byte free list before falling back to bump-allocation
     /// from `space_used`. Returns `(slot, body_offset, size)` —
     /// caller writes the body via `body_of_slot_mut(slot)`.
+    ///
+    /// **Why the cross-type fallback?** Stage 2d spillover allocates
+    /// a `BlobNode` (128 B) at the exact moment the blob is full
+    /// — bump-allocation can't satisfy it. But the same spillover
+    /// just freed a victim subtree, which typically contains
+    /// several `Prefix` nodes (also 128 B). Letting `alloc(Blob)`
+    /// reuse those slot bodies makes spillover succeed without
+    /// extending the bump cursor.
     pub fn alloc_node(&mut self, ntype: NodeType) -> Result<AllocOutcome, AllocError> {
         if ntype == NodeType::Invalid {
             return Err(AllocError::InvalidRequest);
@@ -228,21 +238,40 @@ impl<'a> BlobFrame<'a> {
         let size = size_of_node(ntype);
         let ntype_idx = (ntype.as_u8() - 1) as usize;
 
-        // Try free list first.
+        // Try same-type free list first.
         let free_head = self.header().free_list_head[ntype_idx];
         if free_head != 0 {
-            // Pop. The slot entry's high bits hold the next-free
-            // slot index; the low bits already hold the freed
-            // body's byte offset.
             let e = self.slot_entry(free_head).ok_or(AllocError::InvalidRequest)?;
             let next_free = e.next_free();
             self.header_mut().free_list_head[ntype_idx] = next_free;
 
-            // Re-tag as live with the same offset.
             let off = e.byte_offset();
             self.write_slot_entry(free_head, SlotEntry::live(ntype, off));
             self.header_mut().gap_space = self.header().gap_space.wrapping_add(size);
             return Ok(AllocOutcome { slot: free_head, byte_offset: off, size });
+        }
+
+        // Same-size cross-type fallback for the 128-byte pair
+        // (`Prefix` and `Blob`). The slot body has the right size;
+        // we just re-tag the slot entry with the requested ntype.
+        let sibling_idx_opt = match ntype {
+            NodeType::Blob => Some((NodeType::Prefix.as_u8() - 1) as usize),
+            NodeType::Prefix => Some((NodeType::Blob.as_u8() - 1) as usize),
+            _ => None,
+        };
+        if let Some(sibling_idx) = sibling_idx_opt {
+            let sibling_head = self.header().free_list_head[sibling_idx];
+            if sibling_head != 0 {
+                let e = self
+                    .slot_entry(sibling_head)
+                    .ok_or(AllocError::InvalidRequest)?;
+                let next_free = e.next_free();
+                self.header_mut().free_list_head[sibling_idx] = next_free;
+                let off = e.byte_offset();
+                self.write_slot_entry(sibling_head, SlotEntry::live(ntype, off));
+                self.header_mut().gap_space = self.header().gap_space.wrapping_add(size);
+                return Ok(AllocOutcome { slot: sibling_head, byte_offset: off, size });
+            }
         }
 
         // Bump-allocate.

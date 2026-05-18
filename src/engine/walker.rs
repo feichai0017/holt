@@ -18,7 +18,7 @@ use crate::layout::{
     leaf_extent_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType,
     Prefix, BLOB_MAX_INLINE, PREFIX_MAX_INLINE,
 };
-use crate::store::backend::AlignedBlobBuf;
+use crate::store::backend::{AlignedBlobBuf, Backend};
 use crate::store::BlobFrame;
 
 // ---------- public API ----------
@@ -95,13 +95,14 @@ pub fn lookup_at<'a>(
     descend(frame, start_slot, key, depth)
 }
 
-/// Insert or replace `(key, value)` in the tree rooted at
-/// `root_slot`. `seq` is the journal sequence number to stamp on
-/// the new leaf (callers should pass a monotonically-increasing
-/// value).
+/// Single-blob insert. Surfaces [`Error::NotYetImplemented`] if
+/// the descent reaches a [`NodeType::Blob`] crossing — Stage 2d
+/// callers wanting cross-blob support should use [`insert_multi`].
 ///
-/// Returns the new root slot (caller updates `header.root_slot`)
-/// and the prior value if the key already existed.
+/// `seq` is the journal sequence number to stamp on the new leaf
+/// (callers should pass a monotonically-increasing value). Returns
+/// the new root slot (caller updates `header.root_slot`) and the
+/// prior value if the key already existed.
 pub fn insert(
     frame: &mut BlobFrame<'_>,
     root_slot: u16,
@@ -115,12 +116,93 @@ pub fn insert(
     if value.len() > u16::MAX as usize {
         return Err(Error::ValueTooLong { len: value.len() });
     }
-    let r = insert_at(frame, root_slot, key, value, 0, seq)?;
+    let r = insert_at(None, frame, root_slot, key, value, 0, seq)?;
     Ok(InsertOutcome {
         new_root_slot: r.slot_after,
         previous: r.previous,
     })
 }
+
+/// Multi-blob insert. Walks across [`NodeType::Blob`] crossings via
+/// `backend`, automatically triggering `splitBlob` spillover when
+/// any blob hits [`crate::store::AllocError::OutOfSpace`].
+///
+/// Inputs:
+/// - `backend`: where to load / write child blobs (and any blobs
+///   created by spillover).
+/// - `root_guid` + `root_buf`: the root blob's GUID and its
+///   in-memory image. `root_buf` is mutated in place; on return,
+///   `root_buf.header.root_slot` reflects the new entry slot. The
+///   caller is responsible for writing `root_buf` back to the
+///   backend (typically `Tree::put` does so via `flush_on_write`).
+///
+/// Child blobs encountered during descent are loaded from `backend`
+/// at the start of the recursion and written back at the end. The
+/// `header.root_slot` of each child blob is also updated if the
+/// recursion changed its entry slot.
+pub fn insert_multi(
+    backend: &dyn Backend,
+    root_guid: BlobGuid,
+    root_buf: &mut AlignedBlobBuf,
+    key: &[u8],
+    value: &[u8],
+    seq: u64,
+) -> Result<InsertOutcome> {
+    if key.len() > u16::MAX as usize {
+        return Err(Error::KeyTooLong { len: key.len() });
+    }
+    if value.len() > u16::MAX as usize {
+        return Err(Error::ValueTooLong { len: value.len() });
+    }
+    let _ = root_guid; // reserved for future telemetry / WAL emission
+
+    // Spillover retry loop. Each iteration tries the full insert;
+    // an OutOfSpace from this frame triggers spillover on the root
+    // blob and we retry. Child blobs that OOM run their own
+    // spillover loop inside `insert_at_blob_node`.
+    for _attempt in 0..MAX_SPILLOVER_ATTEMPTS {
+        let r = {
+            let mut frame = BlobFrame::wrap(root_buf.as_mut_slice());
+            let root_slot = frame.header().root_slot;
+            insert_at(Some(backend), &mut frame, root_slot, key, value, 0, seq)
+        };
+        match r {
+            Ok(out) => {
+                let mut frame = BlobFrame::wrap(root_buf.as_mut_slice());
+                frame.header_mut().root_slot = out.slot_after;
+                return Ok(InsertOutcome {
+                    new_root_slot: out.slot_after,
+                    previous: out.previous,
+                });
+            }
+            Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
+                let mut frame = BlobFrame::wrap(root_buf.as_mut_slice());
+                spillover_blob(backend, &mut frame)?;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    Err(Error::NotYetImplemented(
+        "insert_multi: spillover retry loop exhausted",
+    ))
+}
+
+/// Number of spillover attempts before giving up. Each spillover
+/// migrates the *largest non-Blob* subtree out of the current blob.
+///
+/// With the current heuristic (pick-largest, skip BlobNodes, cross-
+/// type Prefix↔Blob free-list fallback) one spillover frees roughly
+/// `(largest-child-subtree-size)` worth of slot entries. Until
+/// Stage 6's `compactBlob` is in, leaf extents leak — so bump-area
+/// pressure dominates: we may need many spillovers per insert to
+/// push enough data into child blobs that the next walker descent
+/// follows a BlobNode rather than alloc-ing locally.
+///
+/// 64 covers a 2-3× workload-vs-blob-capacity ratio for the
+/// uniform-key regimes the benchmark + integration tests exercise.
+/// Workloads much larger than that need compactBlob (Stage 6) +
+/// a balanced split heuristic — both queued.
+const MAX_SPILLOVER_ATTEMPTS: u32 = 64;
 
 /// Erase `key` from the tree rooted at `root_slot`.
 ///
@@ -361,6 +443,7 @@ fn node256_descend<'a>(
 // ---------- insert dispatch ----------
 
 fn insert_at(
+    backend: Option<&dyn Backend>,
     frame: &mut BlobFrame<'_>,
     slot: u16,
     key: &[u8],
@@ -375,13 +458,16 @@ fn insert_at(
         }),
         NodeType::EmptyRoot => insert_into_empty_root(frame, slot, key, value, seq),
         NodeType::Leaf => insert_into_leaf(frame, slot, key, value, depth, seq),
-        NodeType::Prefix => insert_into_prefix(frame, slot, key, value, depth, seq),
+        NodeType::Prefix => insert_into_prefix(backend, frame, slot, key, value, depth, seq),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            insert_into_inner(frame, slot, ntype, key, value, depth, seq)
+            insert_into_inner(backend, frame, slot, ntype, key, value, depth, seq)
         }
-        NodeType::Blob => Err(Error::NotYetImplemented(
-            "walker::insert_at: BlobNode crossing — Stage 2d",
-        )),
+        NodeType::Blob => match backend {
+            Some(b) => insert_at_blob_node(b, frame, slot, key, value, depth, seq),
+            None => Err(Error::NotYetImplemented(
+                "walker::insert_at: BlobNode crossing requires Backend — use insert_multi",
+            )),
+        },
     }
 }
 
@@ -497,6 +583,7 @@ fn insert_into_leaf(
 }
 
 fn insert_into_prefix(
+    backend: Option<&dyn Backend>,
     frame: &mut BlobFrame<'_>,
     pfx_slot: u16,
     key: &[u8],
@@ -515,7 +602,7 @@ fn insert_into_prefix(
     if common == plen {
         // Full match — descend into the existing child, then patch
         // the prefix's child pointer if it was rewritten.
-        let r = insert_at(frame, child_slot, key, value, depth + plen, seq)?;
+        let r = insert_at(backend, frame, child_slot, key, value, depth + plen, seq)?;
         if r.slot_after != child_slot {
             set_prefix_child(frame, pfx_slot, u32::from(r.slot_after))?;
         }
@@ -566,6 +653,7 @@ fn insert_into_prefix(
 }
 
 fn insert_into_inner(
+    backend: Option<&dyn Backend>,
     frame: &mut BlobFrame<'_>,
     inner_slot: u16,
     ntype: NodeType,
@@ -582,7 +670,7 @@ fn insert_into_inner(
     let byte = key[depth];
 
     if let Some(child_slot) = inner_find_child(frame, inner_slot, ntype, byte)? {
-        let r = insert_at(frame, child_slot, key, value, depth + 1, seq)?;
+        let r = insert_at(backend, frame, child_slot, key, value, depth + 1, seq)?;
         if r.slot_after != child_slot {
             inner_update_child(frame, inner_slot, ntype, byte, u32::from(r.slot_after))?;
         }
@@ -1404,6 +1492,549 @@ fn finish_inner_with_sorted<T>(
     }
     write_struct_to_slot(frame, slot, body)?;
     Ok(EraseSignal::Unchanged)
+}
+
+// ---------- multi-blob insert (Stage 2d phase B) ----------
+
+/// Insert across a [`NodeType::Blob`] crossing.
+///
+/// Reads the BlobNode body at `bn_slot` of the parent frame,
+/// validates that the inline prefix matches `key[depth..]`, then
+/// loads the child blob via `backend` and recursively runs
+/// [`insert_at`] (with `Some(backend)`) inside the child frame.
+/// Catches `OutOfSpace` from the child frame and runs spillover
+/// against the child blob, retrying up to
+/// [`MAX_SPILLOVER_ATTEMPTS`] times.
+///
+/// When the child's entry slot changes, patches the parent's
+/// BlobNode `child_entry_ptr` (and bumps the child blob's
+/// `header.root_slot`). Always writes the child blob back to the
+/// backend on return.
+///
+/// Stage 2d phase B' limitation: if the BlobNode's inline prefix
+/// doesn't match the key, this returns
+/// [`Error::NotYetImplemented`]. A real engine would split the
+/// BlobNode into Prefix+Node4{old_bn, new_subtree}, similar to
+/// `insert_into_prefix`'s diverged path. Common-case workloads
+/// rarely hit this since spillover always installs a BlobNode
+/// with an empty inline prefix.
+fn insert_at_blob_node(
+    backend: &dyn Backend,
+    parent_frame: &mut BlobFrame<'_>,
+    bn_slot: u16,
+    key: &[u8],
+    value: &[u8],
+    depth: usize,
+    seq: u64,
+) -> Result<InsertReturn> {
+    let bn = {
+        let body = parent_frame
+            .body_of_slot(bn_slot)
+            .ok_or(Error::NodeCorrupt {
+                context: "insert_at_blob_node: body resolution failed",
+            })?;
+        *cast::<BlobNode>(body)
+    };
+    let plen = bn.prefix_len as usize;
+    if plen > BLOB_MAX_INLINE {
+        return Err(Error::NodeCorrupt {
+            context: "insert_at_blob_node: prefix_len exceeds inline buffer",
+        });
+    }
+    if depth + plen > key.len() || key[depth..depth + plen] != bn.bytes[..plen] {
+        return Err(Error::NotYetImplemented(
+            "insert_at_blob_node: BlobNode inline-prefix split — Stage 2d phase B'",
+        ));
+    }
+
+    let child_guid = bn.child_blob_guid;
+    let child_entry = bn.child_entry_ptr as u16;
+    let child_depth = depth + plen;
+
+    // Load child blob.
+    let mut child_buf = AlignedBlobBuf::zeroed();
+    backend.read_blob(child_guid, &mut child_buf)?;
+
+    // Run the recursive insert inside the child frame, with its own
+    // spillover retry loop (so a full child triggers spillover in
+    // the *child* blob, not at the root).
+    let child_result = {
+        let mut last_err: Option<Error> = None;
+        let mut done = None;
+        for _attempt in 0..MAX_SPILLOVER_ATTEMPTS {
+            let r = {
+                let mut cf = BlobFrame::wrap(child_buf.as_mut_slice());
+                insert_at(Some(backend), &mut cf, child_entry, key, value, child_depth, seq)
+            };
+            match r {
+                Ok(out) => {
+                    done = Some(out);
+                    break;
+                }
+                Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
+                    let mut cf = BlobFrame::wrap(child_buf.as_mut_slice());
+                    spillover_blob(backend, &mut cf)?;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
+            }
+        }
+        match (done, last_err) {
+            (Some(r), _) => r,
+            (None, Some(e)) => return Err(e),
+            (None, None) => {
+                return Err(Error::NotYetImplemented(
+                    "insert_at_blob_node: child spillover retry loop exhausted",
+                ));
+            }
+        }
+    };
+
+    // Update child blob's header.root_slot if the entry slot
+    // changed. Keeps the child blob self-describing for any
+    // future `make_blob_from_node` migrating *out* of it.
+    {
+        let mut cf = BlobFrame::wrap(child_buf.as_mut_slice());
+        cf.header_mut().root_slot = child_result.slot_after;
+    }
+
+    // Patch parent's BlobNode if the child's entry slot changed.
+    if u32::from(child_result.slot_after) != bn.child_entry_ptr {
+        let mut new_bn = bn;
+        new_bn.child_entry_ptr = u32::from(child_result.slot_after);
+        write_struct_to_slot(parent_frame, bn_slot, &new_bn)?;
+    }
+
+    // Write the child blob back to the backend.
+    backend.write_blob(child_guid, &child_buf)?;
+
+    Ok(InsertReturn {
+        slot_after: bn_slot,
+        previous: child_result.previous,
+    })
+}
+
+// ---------- spillover primitives ----------
+
+/// Trigger spillover on `frame`: migrate a subtree out to a fresh
+/// child blob (via [`make_blob_from_node`]), free the migrated
+/// slots, and install a [`BlobNode`] placeholder at the migrated
+/// location.
+///
+/// Heuristic: pick the **first child** of the root's first
+/// branching node (i.e. lexicographically smallest sibling along
+/// the root path). This keeps the migration off the descent path
+/// for most keys; the caller's retry insert succeeds in the
+/// emptied source blob with high probability.
+///
+/// Returns the BlobNode slot installed in `frame` so callers /
+/// tests can verify. The new blob is **already written to the
+/// backend** at the time of return.
+fn spillover_blob(
+    backend: &dyn Backend,
+    frame: &mut BlobFrame<'_>,
+) -> Result<u16> {
+    let root_slot = frame.header().root_slot;
+    let victim = pick_victim_subtree(frame, root_slot)?;
+
+    let new_guid = fresh_blob_guid();
+    let outcome = make_blob_from_node(frame, victim.victim_slot, new_guid)?;
+
+    // Persist the new blob BEFORE installing the BlobNode in the
+    // source. If we crash between these two writes, the new blob
+    // sits orphaned (recoverable via a future GC pass); we never
+    // end up with a parent BlobNode pointing at a non-existent
+    // child blob.
+    backend.write_blob(new_guid, &outcome.buf)?;
+    backend.flush()?;
+
+    // Free the migrated subtree's slots in the source blob.
+    free_subtree(frame, victim.victim_slot)?;
+
+    // Allocate a BlobNode pointing at (new_guid, entry_slot).
+    let bn_alloc = frame.alloc_node(NodeType::Blob)?;
+    let bn = BlobNode::new(&[], new_guid, u32::from(outcome.entry_slot));
+    write_struct_to_slot(frame, bn_alloc.slot, &bn)?;
+
+    // Wire the parent of the migrated subtree to point at the new
+    // BlobNode instead of the now-freed victim slot.
+    if victim.parent_slot == root_slot && victim.via_header_root {
+        // Special case: root_slot was the victim itself; we point
+        // header.root_slot at the new BlobNode.
+        frame.header_mut().root_slot = bn_alloc.slot;
+    } else {
+        match victim.kind {
+            VictimEdgeKind::Prefix => {
+                set_prefix_child(frame, victim.parent_slot, u32::from(bn_alloc.slot))?;
+            }
+            VictimEdgeKind::Inner(parent_ntype) => {
+                inner_update_child(
+                    frame,
+                    victim.parent_slot,
+                    parent_ntype,
+                    victim.byte,
+                    u32::from(bn_alloc.slot),
+                )?;
+            }
+        }
+    }
+
+    Ok(bn_alloc.slot)
+}
+
+/// What kind of edge the parent of a victim subtree has.
+#[derive(Debug, Clone, Copy)]
+enum VictimEdgeKind {
+    Prefix,
+    Inner(NodeType),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Victim {
+    /// Slot of the parent node that points at the victim.
+    parent_slot: u16,
+    /// What kind of edge it is.
+    kind: VictimEdgeKind,
+    /// The byte routing to the victim in the parent (irrelevant
+    /// for `Prefix` edges).
+    byte: u8,
+    /// Slot of the victim subtree's root.
+    victim_slot: u16,
+    /// `true` iff the victim is reached via `header.root_slot`
+    /// rather than via a regular parent node — used to dispatch
+    /// the parent rewrite path.
+    via_header_root: bool,
+}
+
+/// Count the total number of node slots reachable from `root`
+/// in `frame`. Bounded by `MAX_SLOTS` (= 10240). Used by the
+/// spillover heuristic to pick the largest migration candidate.
+fn count_subtree_nodes(frame: &BlobFrame<'_>, root: u16) -> Result<u32> {
+    let ntype = ntype_of(frame, root)?;
+    let body = frame.body_of_slot(root).ok_or(Error::NodeCorrupt {
+        context: "count_subtree_nodes: body resolution failed",
+    })?;
+    let mut count: u32 = 1;
+    match ntype {
+        NodeType::Invalid => {
+            return Err(Error::NodeCorrupt {
+                context: "count_subtree_nodes: Invalid",
+            });
+        }
+        // Terminal — no descendants traversed (BlobNode's child
+        // blob is OFF-frame; not migrating with this primitive).
+        NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
+        NodeType::Prefix => {
+            let p = cast::<Prefix>(body);
+            count = count.saturating_add(count_subtree_nodes(frame, p.child as u16)?);
+        }
+        NodeType::Node4 => {
+            let n = cast::<Node4>(body);
+            for i in 0..(n.count as usize).min(4) {
+                count = count.saturating_add(count_subtree_nodes(frame, n.children[i] as u16)?);
+            }
+        }
+        NodeType::Node16 => {
+            let n = cast::<Node16>(body);
+            for i in 0..(n.count as usize).min(16) {
+                count = count.saturating_add(count_subtree_nodes(frame, n.children[i] as u16)?);
+            }
+        }
+        NodeType::Node48 => {
+            let n = cast::<Node48>(body);
+            for c in n.children.iter() {
+                if *c != 0 {
+                    count = count.saturating_add(count_subtree_nodes(frame, *c as u16)?);
+                }
+            }
+        }
+        NodeType::Node256 => {
+            let n = cast::<Node256>(body);
+            for c in n.children.iter() {
+                if *c != 0 {
+                    count = count.saturating_add(count_subtree_nodes(frame, *c as u16)?);
+                }
+            }
+        }
+    }
+    Ok(count)
+}
+
+/// Pick the largest non-`BlobNode` subtree at the root's first
+/// branching node. Walks through chained `Prefix` nodes to reach
+/// the first `Node4/16/48/256`.
+///
+/// **Heuristic rationale:**
+/// - Skipping `Blob` children avoids spillover-stutter: previously-
+///   migrated children would otherwise get re-migrated into wrapper
+///   blobs without freeing any actual data.
+/// - Picking the *largest* child (by node count) maximises space
+///   freed per spillover iteration — critical given that each
+///   `make_blob_from_node` migration leaks the source's leaf
+///   extents until `compactBlob` (Stage 6 reclaim) is in.
+///
+/// Returns [`Error::NotYetImplemented`] when the tree is too
+/// degenerate to spillover (Leaf/EmptyRoot/Blob root) — these
+/// cases shouldn't OOM anyway.
+fn pick_victim_subtree(
+    frame: &BlobFrame<'_>,
+    start_slot: u16,
+) -> Result<Victim> {
+    let mut current = start_slot;
+    loop {
+        let ntype = ntype_of(frame, current)?;
+        match ntype {
+            NodeType::Node4 => {
+                let n = read_node4(frame, current)?;
+                return pick_largest_non_blob(
+                    frame,
+                    current,
+                    NodeType::Node4,
+                    (n.count as usize).min(4),
+                    &n.keys[..],
+                    &n.children[..],
+                    false,
+                );
+            }
+            NodeType::Node16 => {
+                let n = read_node16(frame, current)?;
+                return pick_largest_non_blob(
+                    frame,
+                    current,
+                    NodeType::Node16,
+                    (n.count as usize).min(16),
+                    &n.keys[..],
+                    &n.children[..],
+                    false,
+                );
+            }
+            NodeType::Node48 => {
+                let n = read_node48(frame, current)?;
+                let mut best: Option<Victim> = None;
+                let mut best_size: u32 = 0;
+                for b in 0..256usize {
+                    let idx = n.index[b];
+                    if idx == 0 {
+                        continue;
+                    }
+                    let child_slot = n.children[idx as usize - 1] as u16;
+                    if ntype_of(frame, child_slot)? == NodeType::Blob {
+                        continue;
+                    }
+                    let size = count_subtree_nodes(frame, child_slot)?;
+                    if size > best_size {
+                        best_size = size;
+                        best = Some(Victim {
+                            parent_slot: current,
+                            kind: VictimEdgeKind::Inner(NodeType::Node48),
+                            byte: b as u8,
+                            victim_slot: child_slot,
+                            via_header_root: false,
+                        });
+                    }
+                }
+                return best.ok_or(Error::NotYetImplemented(
+                    "spillover: no non-Blob children to migrate (Node48)",
+                ));
+            }
+            NodeType::Node256 => {
+                let n = read_node256(frame, current)?;
+                let mut best: Option<Victim> = None;
+                let mut best_size: u32 = 0;
+                for (i, c) in n.children.iter().enumerate() {
+                    if *c == 0 {
+                        continue;
+                    }
+                    let child_slot = *c as u16;
+                    if ntype_of(frame, child_slot)? == NodeType::Blob {
+                        continue;
+                    }
+                    let size = count_subtree_nodes(frame, child_slot)?;
+                    if size > best_size {
+                        best_size = size;
+                        best = Some(Victim {
+                            parent_slot: current,
+                            kind: VictimEdgeKind::Inner(NodeType::Node256),
+                            byte: i as u8,
+                            victim_slot: child_slot,
+                            via_header_root: false,
+                        });
+                    }
+                }
+                return best.ok_or(Error::NotYetImplemented(
+                    "spillover: no non-Blob children to migrate (Node256)",
+                ));
+            }
+            NodeType::Prefix => {
+                // Walk through the prefix to reach its child. If
+                // that child is itself a Node4/16/48/256, recurse
+                // (we want a branching node so we can leave the
+                // prefix intact and migrate one of its grand-
+                // children). If the child is a Leaf, we'd have to
+                // migrate the leaf — degenerate, skip.
+                let p = read_prefix(frame, current)?;
+                let child_slot = p.child as u16;
+                let child_ntype = ntype_of(frame, child_slot)?;
+                match child_ntype {
+                    NodeType::Node4
+                    | NodeType::Node16
+                    | NodeType::Node48
+                    | NodeType::Node256
+                    | NodeType::Prefix => {
+                        current = child_slot;
+                        continue;
+                    }
+                    NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {
+                        // Migrate the prefix's single child directly.
+                        return Ok(Victim {
+                            parent_slot: current,
+                            kind: VictimEdgeKind::Prefix,
+                            byte: 0,
+                            victim_slot: child_slot,
+                            via_header_root: false,
+                        });
+                    }
+                    NodeType::Invalid => {
+                        return Err(Error::NodeCorrupt {
+                            context: "pick_victim_subtree: Prefix child Invalid",
+                        });
+                    }
+                }
+            }
+            NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {
+                return Err(Error::NotYetImplemented(
+                    "spillover: tree too degenerate to migrate (root is Leaf/Empty/Blob)",
+                ));
+            }
+            NodeType::Invalid => {
+                return Err(Error::NodeCorrupt {
+                    context: "pick_victim_subtree: Invalid",
+                });
+            }
+        }
+    }
+}
+
+/// Helper: scan a Node4/Node16's `keys[]`+`children[]` parallel
+/// arrays for the largest non-`BlobNode` child.
+fn pick_largest_non_blob(
+    frame: &BlobFrame<'_>,
+    parent_slot: u16,
+    parent_ntype: NodeType,
+    count: usize,
+    keys: &[u8],
+    children: &[u32],
+    via_header_root: bool,
+) -> Result<Victim> {
+    let mut best: Option<Victim> = None;
+    let mut best_size: u32 = 0;
+    for i in 0..count {
+        let child_slot = children[i] as u16;
+        if ntype_of(frame, child_slot)? == NodeType::Blob {
+            continue;
+        }
+        let size = count_subtree_nodes(frame, child_slot)?;
+        if size > best_size {
+            best_size = size;
+            best = Some(Victim {
+                parent_slot,
+                kind: VictimEdgeKind::Inner(parent_ntype),
+                byte: keys[i],
+                victim_slot: child_slot,
+                via_header_root,
+            });
+        }
+    }
+    best.ok_or(Error::NotYetImplemented(
+        "spillover: no non-Blob children to migrate",
+    ))
+}
+
+/// Recursively free every slot of the subtree rooted at `root` in
+/// `frame`. Used by spillover to reclaim source-side slot entries
+/// after `make_blob_from_node` has copied them out. Leaf extents
+/// (key/value bytes) leak until `compactBlob` (Stage 6 reclaim) —
+/// that's a separate space-reclamation concern from slot reuse.
+fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
+    let ntype = ntype_of(frame, root)?;
+    // Snapshot the body bytes before mutating the slot table so the
+    // following `frame.free_node` calls can't invalidate them.
+    let body_copy = frame
+        .body_of_slot(root)
+        .ok_or(Error::NodeCorrupt {
+            context: "free_subtree: body resolution failed",
+        })?
+        .to_vec();
+
+    match ntype {
+        NodeType::Invalid => {
+            return Err(Error::NodeCorrupt {
+                context: "free_subtree: Invalid in source",
+            });
+        }
+        NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {
+            // Terminal — nothing to recurse into. (BlobNode's
+            // child blob is left orphaned in the backend; a future
+            // GC pass collects it.)
+        }
+        NodeType::Prefix => {
+            let p = cast::<Prefix>(&body_copy);
+            free_subtree(frame, p.child as u16)?;
+        }
+        NodeType::Node4 => {
+            let n = cast::<Node4>(&body_copy);
+            for i in 0..(n.count as usize).min(4) {
+                free_subtree(frame, n.children[i] as u16)?;
+            }
+        }
+        NodeType::Node16 => {
+            let n = cast::<Node16>(&body_copy);
+            for i in 0..(n.count as usize).min(16) {
+                free_subtree(frame, n.children[i] as u16)?;
+            }
+        }
+        NodeType::Node48 => {
+            let n = cast::<Node48>(&body_copy);
+            for c in n.children.iter() {
+                if *c != 0 {
+                    free_subtree(frame, *c as u16)?;
+                }
+            }
+        }
+        NodeType::Node256 => {
+            let n = cast::<Node256>(&body_copy);
+            for c in n.children.iter() {
+                if *c != 0 {
+                    free_subtree(frame, *c as u16)?;
+                }
+            }
+        }
+    }
+
+    frame.free_node(root)?;
+    Ok(())
+}
+
+/// Produce a fresh blob GUID. Cheap process-local uniqueness for
+/// Stage 2d MVP: monotonic counter + process ID + magic suffix.
+/// Stage 6 (BufferManager) will swap in a proper UUID v4 generator.
+fn fresh_blob_guid() -> BlobGuid {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let c = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let pid = std::process::id() as u64;
+    let mut g = [0u8; 16];
+    g[0..8].copy_from_slice(&c.to_le_bytes());
+    g[8..12].copy_from_slice(&(pid as u32).to_le_bytes());
+    // Tag the high bytes so a fresh GUID never collides with
+    // `ROOT_BLOB_GUID = [0; 16]`.
+    g[12] = 0xA1;
+    g[13] = 0xB2;
+    g[14] = 0xC3;
+    g[15] = 0xD4;
+    g
 }
 
 // ---------- make_blob_from_node (Stage 2d phase A) ----------

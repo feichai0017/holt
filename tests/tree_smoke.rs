@@ -291,6 +291,92 @@ fn rename_through_shared_prefix() {
 // `BlobNode`, then verify `Tree::get` follows the crossing.
 // ----------------------------------------------------------------
 
+// ----------------------------------------------------------------
+// Stage 2d phase B — automatic multi-blob spillover
+// ----------------------------------------------------------------
+
+#[test]
+fn auto_spillover_creates_child_blob_when_root_blob_fills() {
+    // Insert enough data to overflow the root blob (~448 KB usable
+    // data area). Walker `insert_multi` auto-triggers `splitBlob`
+    // when any alloc hits `OutOfSpace`, migrating the largest non-
+    // BlobNode subtree of the current frame to a fresh child blob,
+    // then retries.
+    //
+    // **Workload note:** until Stage 6's `compactBlob` lands, leaf
+    // extents leak after every same-size update; the bump cursor
+    // is monotonic. So spillover only buys "slot table" room, not
+    // bump-area room — once the root blob has many subtrees
+    // migrated out, *every* subsequent insert routes through a
+    // BlobNode into a child blob and the root blob stays at its
+    // high-water-mark bump cursor.
+    //
+    // We pick a workload size that triggers at least one spillover
+    // but doesn't push past the `MAX_SPILLOVER_ATTEMPTS` per-call
+    // budget. ~2000 keys × ~250 B per leaf = ~500 KB → ~50 KB has
+    // to spill out via splitBlob.
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    let tree = TreeBuilder::new("ignored")
+        .open_with_backend(backend.clone())
+        .unwrap();
+
+    const N: u32 = 2000;
+    let value = vec![0xAB; 200];
+    for i in 0..N {
+        let k = format!("k{i:08}").into_bytes();
+        tree.put(&k, &value).unwrap();
+    }
+
+    // All keys readable through the multi-blob tree.
+    for i in 0..N {
+        let k = format!("k{i:08}").into_bytes();
+        assert_eq!(
+            tree.get(&k).unwrap().as_deref(),
+            Some(&value[..]),
+            "post-spillover lookup failed at key {k:?}; backend has {} blob(s)",
+            backend.list_blobs().unwrap().len(),
+        );
+    }
+
+    // Spillover should have created at least one child blob.
+    let blobs = backend.list_blobs().unwrap();
+    assert!(
+        blobs.len() >= 2,
+        "expected auto-spillover to allocate at least 1 child blob, got {} total blob(s)",
+        blobs.len(),
+    );
+}
+
+#[test]
+fn auto_spillover_preserves_data_across_reopen() {
+    // After auto-spillover the tree is multi-blob. Closing and
+    // reopening the same backend must surface the same key/value
+    // mapping (root blob + all spilled child blobs are persisted).
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    {
+        let tree = TreeBuilder::new("ignored")
+            .open_with_backend(backend.clone())
+            .unwrap();
+        for i in 0..2000u32 {
+            tree.put(format!("k{i:08}").as_bytes(), &vec![0xCD; 192]).unwrap();
+        }
+        tree.checkpoint().unwrap();
+    }
+
+    let tree = TreeBuilder::new("ignored")
+        .open_with_backend(backend.clone())
+        .unwrap();
+    for i in 0..2000u32 {
+        let k = format!("k{i:08}").into_bytes();
+        let v = tree.get(&k).unwrap();
+        assert!(
+            v.is_some(),
+            "post-reopen lookup failed at key {k:?}; backend has {} blob(s)",
+            backend.list_blobs().unwrap().len(),
+        );
+    }
+}
+
 #[test]
 fn tree_get_follows_blob_node_crossing_across_two_blobs() {
     use artisan::engine::make_blob_from_node;

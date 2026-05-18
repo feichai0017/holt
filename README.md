@@ -38,41 +38,54 @@ parallel without coordinating with each other.
 
 ## Project status
 
-**Early development.** v0.1 is being built out. See
-[ROADMAP.md](ROADMAP.md) for the feature timeline. The layout layer
-(extern-struct types + slot encoding + 4 KB blob header) is in
-place and `cargo test` passes (28 tests, no external dependencies).
-The walker, persistence, journal, and backend layers are being
-filled in.
+**v0.1 in active development.** 113 tests pass; `cargo bench --bench main`
+runs a side-by-side comparison with RocksDB (artisan ~3-6× faster on
+small-metadata workloads — see [benches/README.md](benches/README.md)).
 
-## Quick taste (when v0.1 ships)
+Done — algorithm core:
+
+- Layout (9 NodeTypes, 4 KB BlobHeader, bit-packed slot table)
+- Walker insert / lookup / erase / rename (single-blob + cross-blob
+  lookup; cross-blob auto-spillover insert)
+- SIMD Node16 byte search + longest-common-prefix (SSE2 / NEON /
+  scalar)
+- `splitBlob` auto-spillover via `make_blob_from_node`
+- Strict-prefix support (terminator byte)
+- In-place leaf-value update on same-size writes
+- `MemoryBackend` + cross-platform `PersistentBackend`
+  (Linux `O_DIRECT`, macOS `F_NOCACHE`)
+
+Queued — see [ROADMAP.md](ROADMAP.md):
+
+- `compactBlob` — reclaim leaked leaf extents (Stage 6)
+- `BufferManager` + per-blob `HybridLatch` wiring (Stage 6)
+- WAL + crash recovery (Stage 5)
+- `Tree::range` / `Tree::txn` iterators
+- io_uring submission on the persistent backend (Stage 7)
+- `mergeBlob` (child-blob → parent inverse of splitBlob)
+- BlobNode arm for `erase` + cross-blob `rename`
+
+## Quick taste
 
 ```rust
-use artisan::TreeBuilder;
+use artisan::{Tree, TreeBuilder, TreeConfig};
 
+// Persistent (default).
 let tree = TreeBuilder::new("/var/lib/myapp/meta.artisan")
     .buffer_pool_size(128)
     .open()?;
 
-// Single-key put / get / delete.
+// Or in-memory:
+let tree = Tree::open(TreeConfig::memory())?;
+
 tree.put(b"img/01.jpg", b"rgb_data_blob_id_abc")?;
 let value = tree.get(b"img/01.jpg")?.unwrap();
 tree.delete(b"img/01.jpg")?;
 
-// Path-prefix range scan with S3-style delimiter (folder rollup).
-for entry in tree.range(b"img/").delimiter(b'/').take(100) {
-    println!("{} -> {}", entry.key_str(), entry.value_str());
-}
+// Atomic rename (force=true overwrites dst).
+tree.rename(b"old/path", b"new/path", false)?;
 
-// Atomic rename — single per-blob latch hold.
-tree.rename(b"old/path", b"new/path", /*force=*/false)?;
-
-// Batch / transaction (groups multiple ops under one WAL record).
-tree.txn(|t| {
-    t.put(b"users/alice/email", b"alice@example.com")?;
-    t.put(b"users/alice/created_at", b"2026-05-19T08:00:00Z")?;
-    Ok(())
-})?;
+tree.checkpoint()?;   // flush root blob + manifest
 ```
 
 ## Architecture at a glance

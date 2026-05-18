@@ -107,23 +107,88 @@ child in its grandparent's slot. Prefix nodes whose child
 disappeared are freed. The tree contracts back to the EmptyRoot
 sentinel when fully drained.
 
-## 5. Compaction
+## 5. Compaction + multi-blob spillover
 
-Three reasons trigger compaction:
+Three reasons trigger compaction or migration:
 
 - `SplitTombstone` — too many tombstone leaves accumulated; rebuild
-  the blob dropping them.
+  the blob dropping them. _Not yet wired._
 - `SplitGapSpace` — bump-allocator wasted space (dead bytes from
   earlier orphans) exceeds a threshold; compact in place.
+  _Not yet wired_ — see "leaked extents" caveat below.
 - `OutOfBlobFrame` — alloc failed in current blob; spill a subtree
-  to a new blob.
+  to a new blob. **Implemented (Stage 2d phase B).**
 
-`make_blob_from_node` is the primitive: take a subtree, materialize
-it into a fresh blob (recursive copy), return a Blob-node crossing
-the caller installs in the parent. `split_blob` is the named
-operation that wraps it; `compact_blob` rebuilds a blob in place
-(materialize live nodes → drain → replay back); `merge_blob` is the
-inverse — pulls a small child blob's contents back into the parent.
+### `make_blob_from_node` + `splitBlob` (Stage 2d phase B)
+
+`make_blob_from_node` is the primitive: take a subtree, deep-copy
+it into a fresh blob (recursive walk through every NodeType,
+including Leaf extents), return `(new_buf, entry_slot)` ready for
+the caller to write through the backend.
+
+`splitBlob` is the in-band spillover trigger sitting inside the
+walker's multi-blob insert loop:
+
+```
+walker::insert_at(slot, key, value, depth):
+    descend …
+    if NodeType::Blob:                         # cross-blob crossing
+        load child blob via backend
+        recurse into child (with its own spillover retry loop)
+        on Done: patch BlobNode child_entry_ptr if it changed
+        write child blob back
+
+walker::insert_multi(root_buf):
+    loop up to MAX_SPILLOVER_ATTEMPTS (= 64):
+        try insert_at(root_slot)
+        if Err(AllocError::OutOfSpace):
+            spillover_blob(root_frame):
+                pick_victim_subtree    # largest non-Blob child
+                make_blob_from_node    # deep-clone to new buf
+                backend.write_blob     # persist new child
+                free_subtree           # release source slot entries
+                alloc(BlobNode)        # reuse Prefix free list if no bump room
+                rewire parent → BlobNode
+            continue   # retry insert; descent now follows the new BlobNode
+        if Ok: return
+```
+
+The `splitBlob` heuristic picks the **largest non-`Blob` child** of
+the source root's first branching node. Skipping `Blob` children
+matters: previously-migrated children would otherwise get re-
+migrated into wrapper blobs without freeing any actual data.
+Picking the *largest* child maximises space freed per spillover
+iteration.
+
+### Cross-type 128-byte free list
+
+A spillover allocates a `BlobNode` (128 B body) at exactly the
+moment the source blob's bump cursor is past its limit. To keep
+spillover from itself OOM'ing, `BlobFrame::alloc_node` falls back
+across the two 128-byte NodeTypes — `alloc_node(Blob)` reuses a
+freed `Prefix` slot body when the `Blob` free list is empty, and
+vice versa. Each spillover's `free_subtree` typically frees one or
+more `Prefix` nodes, so the next `BlobNode` install reuses one of
+those bodies for free.
+
+### Caveat: leaked extents
+
+Until `compactBlob` ships (Stage 6 reclaim), Leaf key/value
+**extents leak after every same-size update** (in-place value
+overwrite reuses the extent; new keys allocate a fresh extent
+bump). `spillover_blob` reclaims *slot table* entries but **not**
+the bump-area bytes those extents occupied. The bump cursor is
+monotonic until compaction.
+
+In practice the live integration tests insert past one blob's
+capacity (~2000 keys × 200 B values overflows the 448 KB usable
+data area) and verify all keys round-trip across multiple blobs.
+Significantly larger workloads currently require multi-spillover
+sequences whose per-call budget would need `compactBlob` to
+release. Stage 6 closes this loop.
+
+`mergeBlob` (the inverse of `splitBlob`) and a true balanced
+multi-child `splitBlob` are both queued — see ROADMAP.md.
 
 ## 6. Persistence + crash safety
 

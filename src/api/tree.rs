@@ -196,21 +196,33 @@ impl Tree {
     /// Insert or replace `(key, value)`. Returns the previous value
     /// if the key already existed.
     ///
+    /// Walks across [`BlobNode`] crossings (Stage 2d phase B). When
+    /// any blob hits `AllocError::OutOfSpace`, the walker
+    /// automatically migrates a subtree out via `splitBlob` and
+    /// retries — so trees may grow well past the 512 KB single-blob
+    /// limit without caller involvement.
+    ///
     /// Modifies the in-memory cached root blob; flushes to the
     /// backend immediately when `TreeConfig::flush_on_write` is
-    /// `true` (the default).
+    /// `true` (the default). Newly-created child blobs are *always*
+    /// written through the backend at the moment of spillover, so
+    /// crash-recovery never finds a dangling BlobNode pointing at
+    /// nothing.
+    ///
+    /// [`BlobNode`]: crate::layout::BlobNode
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
 
         let mut state = self.state.lock().unwrap();
-        let outcome;
-        {
-            let mut frame = BlobFrame::wrap(state.root_buf.as_mut_slice());
-            let root_slot = frame.header().root_slot;
-            outcome = engine::walker::insert(&mut frame, root_slot, &padded, value, seq)?;
-            frame.header_mut().root_slot = outcome.new_root_slot;
-        }
+        let outcome = engine::insert_multi(
+            &*self.backend,
+            self.root_guid,
+            &mut state.root_buf,
+            &padded,
+            value,
+            seq,
+        )?;
         if self.cfg.flush_on_write {
             self.backend.write_blob(self.root_guid, &state.root_buf)?;
         }
