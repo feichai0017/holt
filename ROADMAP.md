@@ -232,7 +232,7 @@ Required for the v0.1 tag:
 - [x] **CI** — GitHub Actions matrix (ubuntu + macOS) × build /
       test / doctest + lint (`cargo fmt --check`, `cargo clippy
       -- -D warnings`) + docs (`cargo doc -- -D warnings`) +
-      MSRV (Rust 1.79). See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+      MSRV (Rust 1.82). See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
 - [x] **Zero clippy warnings** under `-D warnings`. The vetted
       `#![allow]` block in `src/lib.rs` documents the categories
       where `clippy::pedantic` fires for intentional design

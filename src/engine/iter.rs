@@ -1,4 +1,4 @@
-//! `fa_iter`-style stateful iterator.
+//! Stateful tree iterator.
 //!
 //! **Status: stub.** Will implement a path-stack-based iterator
 //! supporting:

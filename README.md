@@ -112,7 +112,7 @@ Queued — see [ROADMAP.md](ROADMAP.md):
 - `Tree::range` / `Tree::txn` iterators
 - io_uring submission on the persistent backend (Stage 7)
 - `mergeBlob` (child-blob → parent inverse of splitBlob)
-- Erase-time node shrinkage (Node256 → 48 → 16 → 4)
+- Tombstone + lazy reclaim
 
 ## Quick taste
 
@@ -174,7 +174,7 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the deep dive.
   optimistic readers take a version snapshot and validate; shared
   readers take a reader counter; writers take exclusive. Reader
   fast path is wait-free under no contention.
-- **Crash safety** via a physiological WAL with 13+ TxnOp variants
+- **Crash safety** via a physiological WAL with 10 TxnOp variants
   and a synchronous (or eventually asynchronous) checkpointer.
 - **Per-blob free-list** lets recycled slot indices feed back into
   the bump allocator with zero overhead.
@@ -206,4 +206,4 @@ For these, combine artisan with a domain-appropriate engine:
 
 ## License
 
-Dual-licensed under Apache-2.0 OR MIT.
+Licensed under the [MIT licence](LICENSE).

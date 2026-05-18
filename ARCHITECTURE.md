@@ -264,9 +264,11 @@ the packed-image size, well below `PAGE_SIZE - SPILLOVER_RESERVATION`.
 
 - `mergeBlob` (the inverse of `splitBlob`) and a true balanced
   multi-child `splitBlob` are queued — see ROADMAP.md.
-- Erase-time node shrinkage (Node256 → 48 → 16 → 4) is not wired;
-  collapse always wraps the surviving child in `Prefix([byte])` to
-  preserve depth invariants. Mild space waste, compact reclaims it.
+- Erase-time node shrinkage (Node256 → 48 → 16 → 4) **is** wired —
+  thresholds 37 / 12 / 3 give hysteresis vs the grow thresholds
+  48 / 16 / 4. The terminal `Node4 → Prefix([byte])` lone-child
+  collapse still applies once a node has emptied to a single
+  child.
 
 ## 5b. BufferManager (Stage 6 phase 1 + 2a + 2b + 2c)
 
@@ -373,7 +375,7 @@ until the pinning walker drops its handle.
 
 ## 6. Persistence + crash safety
 
-WAL (write-ahead log) with 13+ physiological TxnOp variants:
+WAL (write-ahead log) with 10 physiological TxnOp variants:
 
 ```
 Insert, Erase, Split, Merge, Compact, RenameObject, Rename,

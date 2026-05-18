@@ -130,7 +130,7 @@ v0.1 items are higher-level API surface (`Tree::range`, `Tree::txn`,
 
 - **GitHub Actions CI** — matrix of ubuntu + macOS × build / test /
   doctest + lint (`cargo fmt --check`, `cargo clippy -D warnings`)
-  + docs (`cargo doc -D warnings`) + MSRV (1.79) build.
+  + docs (`cargo doc -D warnings`) + MSRV (1.82) build.
 - **Zero clippy / rustdoc warnings** under `-D warnings`. The
   curated `#![allow]` block in `src/lib.rs` lists the
   `clippy::pedantic` lints we've reviewed and judged either
@@ -139,7 +139,7 @@ v0.1 items are higher-level API surface (`Tree::range`, `Tree::txn`,
 
 ### Notes
 
-- The crate is pinned to MSRV **1.79**.
-- License: Apache-2.0 OR MIT.
+- The crate is pinned to MSRV **1.82**.
+- License: MIT.
 - v0.2 will add the 3-thread async checkpointer, `io_uring` backend
   (Linux), SIMD CRC32, and the buffer-pool tuning knobs.

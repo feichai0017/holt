@@ -56,7 +56,7 @@ methodology and the apples-to-apples ground rules vs RocksDB.
 
 ### Code
 
-- **Edition: 2021. MSRV: 1.79.**
+- **Edition: 2021. MSRV: 1.82.**
 - **Module layout** follows logical layers: `layout < store < engine
   < journal < api`. New abstractions should slot into the right
   layer, not span them.
@@ -117,7 +117,6 @@ direction conversations beat surprise patches.
 
 ## Licence
 
-artisan is **Apache-2.0 OR MIT** at your option. By contributing,
-you agree your contribution is licensed under both. See
-[`LICENSE-APACHE`](LICENSE-APACHE) / [`LICENSE-MIT`](LICENSE-MIT)
-for the legal text.
+artisan is **MIT** licensed. By contributing, you agree your
+contribution is licensed under the MIT licence. See
+[`LICENSE`](LICENSE) for the legal text.
