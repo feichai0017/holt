@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use holt::{AlignedBlobBuf, Backend, MemoryBackend, Tree, TreeBuilder, TreeConfig, TreeStats};
+use holt::{Backend, MemoryBackend, Tree, TreeBuilder, TreeConfig, TreeStats};
 
 #[test]
 fn open_memory_get_on_empty_tree_returns_none() {
@@ -598,87 +598,6 @@ fn auto_spillover_preserves_data_across_reopen() {
             backend.list_blobs().unwrap().len(),
         );
     }
-}
-
-#[test]
-fn tree_get_follows_blob_node_crossing_across_two_blobs() {
-    use holt::engine::make_blob_from_node;
-    use holt::layout::{BlobNode, NodeType};
-    use holt::store::BlobFrame;
-
-    // Step 1: build a normal tree with some keys.
-    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-    {
-        let tree = TreeBuilder::new("ignored")
-            .open_with_backend(backend.clone())
-            .unwrap();
-        for i in 0..10u32 {
-            let k = format!("k{i:02}").into_bytes();
-            let v = format!("v{i}").into_bytes();
-            tree.put(&k, &v).unwrap();
-        }
-    }
-
-    // Step 2: read root blob; deep-clone its subtree into a fresh
-    // child blob.
-    let root_guid = [0u8; 16];
-    let child_guid = [0xAA; 16];
-
-    let mut root_buf = AlignedBlobBuf::zeroed();
-    backend.read_blob(root_guid, &mut root_buf).unwrap();
-
-    let (saved_root_slot, child_outcome) = {
-        let root_frame = BlobFrame::wrap(root_buf.as_mut_slice());
-        let saved_root = root_frame.header().root_slot;
-        let outcome = make_blob_from_node(&root_frame, saved_root, child_guid).unwrap();
-        (saved_root, outcome)
-    };
-
-    // Step 3: write the child blob through the backend.
-    backend.write_blob(child_guid, &child_outcome.buf).unwrap();
-
-    // Step 4: rewrite root blob: allocate a BlobNode at a fresh
-    // slot pointing at (child_guid, entry_slot), and re-point
-    // header.root_slot there. The old saved_root subtree leaks
-    // (its slot entries stay tagged live but unreachable) — fine
-    // for this test; production spillover (phase B) will free
-    // them via free_node walks.
-    {
-        let mut root_frame = BlobFrame::wrap(root_buf.as_mut_slice());
-        let bn_out = root_frame.alloc_node(NodeType::Blob).unwrap();
-        let bn = BlobNode::new(b"", child_guid, u32::from(child_outcome.entry_slot));
-        // SAFETY: layout types are #[repr(C)] POD; body has the
-        // right size; BlobFrame's bump allocator gives 8-byte
-        // alignment.
-        let body = root_frame.body_of_slot_mut(bn_out.slot).unwrap();
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &bn as *const BlobNode as *const u8,
-                body.as_mut_ptr(),
-                std::mem::size_of::<BlobNode>(),
-            );
-        }
-        root_frame.header_mut().root_slot = bn_out.slot;
-        let _ = saved_root_slot; // intentionally orphaned in this test
-    }
-    backend.write_blob(root_guid, &root_buf).unwrap();
-
-    // Step 5: open a fresh Tree against the same backend; verify
-    // every original key is reachable through the BlobNode crossing.
-    let tree = TreeBuilder::new("ignored")
-        .open_with_backend(backend.clone())
-        .unwrap();
-    for i in 0..10u32 {
-        let k = format!("k{i:02}").into_bytes();
-        let v = format!("v{i}").into_bytes();
-        assert_eq!(
-            tree.get(&k).unwrap().as_deref(),
-            Some(&v[..]),
-            "post-crossing lookup failed for key {k:?}",
-        );
-    }
-    // Missing keys still NotFound.
-    assert!(tree.get(b"k99").unwrap().is_none());
 }
 
 #[test]

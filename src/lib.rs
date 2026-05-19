@@ -31,16 +31,26 @@
 //!
 //! ## Module map
 //!
+//! Public modules (the supported import surface):
+//!
+//! - [`api`] — high-level [`Tree`] + [`TxnBatch`] +
+//!   [`TreeBuilder`], plus the curated [`api::range`] /
+//!   [`api::stats`] re-export modules.
 //! - [`layout`] — extern struct layouts (BlobHeader, SlotEntry,
 //!   per-NodeType bodies). Each struct has a
 //!   `const _: () = assert!(...)` that pins its size + offsets.
-//! - [`concurrency`] — `HybridLatch` 3-mode lock + guards.
-//! - [`store`] — `BlobFrame` (single-blob ops) + backend trait.
-//! - [`engine`] — recursive walker (insert / lookup / erase /
-//!   scan / rename / compact).
-//! - [`journal`] — WAL + replay + checkpoint.
-//! - [`api`] — high-level `Tree` + [`TxnBatch`] (single-record
-//!   batched transactions) + the queued `Iter` surface.
+//!   Exposed so advanced users can inspect on-disk frames.
+//! - [`store`] — [`BufferManager`] + backend trait
+//!   ([`MemoryBackend`] / [`PersistentBackend`]).
+//! - [`journal`] — WAL codec + replay scanner + writer. Useful
+//!   for tools that want to inspect or replay journal files.
+//!
+//! Internal modules (`pub(crate)`, not part of the SemVer surface):
+//!
+//! - `engine` — recursive walker (insert / lookup / erase /
+//!   scan / rename / compact). Its public types (range iterators,
+//!   stats) are re-exported via [`api::range`] / [`api::stats`].
+//! - `concurrency` — `HybridLatch` 3-mode lock + guards.
 //!
 //! ## Platform support
 //!
@@ -108,25 +118,35 @@ compile_error!(
 );
 
 pub mod api;
-pub mod concurrency;
-pub mod engine;
 pub mod journal;
 pub mod layout;
 pub mod store;
 
-mod prelude_private {
-    // Internal helpers shared across modules without exposing
-    // them in the public API. Empty for now.
-}
+pub(crate) mod concurrency;
+pub(crate) mod engine;
 
 // -- Top-level re-exports -----------------------------------------
+//
+// The flat `holt::*` surface — every name a user reaches for via
+// `use holt::X` lives here. Module-pathed access (e.g.
+// `holt::api::stats::TreeStats`) still works for users who prefer
+// it.
 
+// Core handle + configuration.
+pub use api::builder::TreeBuilder;
 pub use api::config::{Storage, TreeConfig};
 pub use api::errors::{Error, Result};
+pub use api::tree::Tree;
 
-pub use api::builder::TreeBuilder;
-pub use api::tree::{BlobStats, Tree, TreeStats};
+// Range-scan iterator surface.
+pub use api::range::{RangeBuilder, RangeEntry, RangeIter};
+
+// Stats snapshots returned by `Tree::stats`.
+pub use api::stats::{BlobStats, TreeStats};
+
+// Single-record batched transactions.
 pub use api::txn::TxnBatch;
-pub use engine::{RangeBuilder, RangeEntry, RangeIter};
+
+// Backend trait + bundled backends + zero-copy blob buffer.
 pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
 pub use store::BufferManager;

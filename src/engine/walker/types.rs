@@ -31,24 +31,30 @@ pub struct BlobNodeCrossing {
     pub child_depth: usize,
 }
 
-/// Outcome of an [`super::insert`].
+/// Outcome of an [`super::insert::insert`] / [`super::insert::insert_multi`].
 #[derive(Debug)]
 pub struct InsertOutcome {
     /// The slot the tree's `root_slot` should now point at — may
     /// differ from the caller's input when a split promotes a new
-    /// node above the existing root.
+    /// node above the existing root. Only consumed by single-blob
+    /// test drivers; the multi-blob path updates `root_slot` in
+    /// place under the BM's write guard.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub new_root_slot: u16,
     /// If the key already existed, the value it carried before.
     pub previous: Option<Vec<u8>>,
 }
 
-/// Outcome of an [`super::erase`].
+/// Outcome of an [`super::erase::erase`] / [`super::erase::erase_multi`].
 #[derive(Debug)]
 pub struct EraseOutcome {
     /// The slot the tree's `root_slot` should now point at — may
     /// differ from the caller's input when the root collapses
     /// (e.g. last leaf removed → fresh EmptyRoot sentinel; Node4
-    /// shrinks to its lone child and that child is promoted).
+    /// shrinks to its lone child and that child is promoted). Only
+    /// consumed by single-blob test drivers; the multi-blob path
+    /// updates `root_slot` in place under the BM's write guard.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub new_root_slot: u16,
     /// If a matching leaf was removed, the value it carried.
     /// `None` means "key was not in the tree" — the call is then
@@ -66,25 +72,6 @@ pub struct MakeBlobOutcome {
     /// Slot inside the new blob where the cloned subtree's root
     /// lives. Equals `buf`'s `header.root_slot`.
     pub entry_slot: u16,
-}
-
-/// Statistics from a [`super::compact_blob`] run. Useful for
-/// telemetry and tests that want to assert "compact actually freed
-/// N bytes".
-#[derive(Debug, Clone, Copy)]
-pub struct CompactStats {
-    /// `space_used` before compaction.
-    pub bytes_before: u32,
-    /// `space_used` after compaction.
-    pub bytes_after: u32,
-    /// `bytes_before - bytes_after`. Always ≥ 0.
-    pub bytes_reclaimed: u32,
-    /// The blob's `header.root_slot` before compaction.
-    pub old_root: u16,
-    /// The blob's `header.root_slot` after compaction. May differ
-    /// from `old_root` because the live subtree is re-allocated
-    /// into freshly-bumped slots in the new packed image.
-    pub new_root: u16,
 }
 
 // ---------- internal types (pub(super) for sibling submodules) ----------

@@ -47,18 +47,21 @@ mod tests;
 mod types;
 mod writers;
 
-// ---------- public API ----------
+// ---------- public-to-engine surface ----------
+//
+// Only the multi-blob entry points + tree-wide passes are reachable
+// from outside the walker. Single-blob primitives (`insert`, `erase`,
+// `lookup`, `lookup_at`) and the Outcome types live behind their
+// submodule paths and are only consumed by sibling submodules and
+// the walker's own `tests`.
 
-pub use erase::{erase, erase_multi};
-pub use insert::{insert, insert_multi};
-pub use lookup::{lookup, lookup_at, lookup_multi};
-pub use merge::{try_merge_children, MergeStats};
-pub use migrate::{compact_blob, is_mergeable, make_blob_from_node, merge_blob};
+pub use erase::erase_multi;
+pub use insert::insert_multi;
+pub use lookup::lookup_multi;
+pub use merge::try_merge_children;
+pub use migrate::compact_blob;
 pub use range::{RangeBuilder, RangeEntry, RangeIter};
 pub use scan::{collect_blob_guids, refresh_blob_node_pointers};
-pub use types::{
-    BlobNodeCrossing, CompactStats, EraseOutcome, InsertOutcome, LookupResult, MakeBlobOutcome,
-};
 
 // ---------- shared internals ----------
 

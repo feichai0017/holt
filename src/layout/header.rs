@@ -61,9 +61,9 @@ pub struct BlobHeader {
     pub num_ext_blobs: u16,
     /// Reserved counter slot.
     pub field_5e: u16,
-    /// Number of times [`compact_blob`](crate::engine::compact_blob)
-    /// has rebuilt this blob in place. Bumped at the end of every
-    /// successful compaction. Surfaced via [`Tree::stats`](crate::Tree::stats).
+    /// Number of times the engine's in-place compactor has rebuilt
+    /// this blob. Bumped at the end of every successful compaction.
+    /// Surfaced via [`Tree::stats`](crate::Tree::stats).
     pub compact_times: u32,
     _pad_64: [u8; 4],
     /// Cumulative count of size-table bytes ever allocated for
@@ -72,7 +72,7 @@ pub struct BlobHeader {
     /// Count of leaves in this blob currently in tombstone state
     /// (soft-deleted, awaiting reclaim by compaction). Bumped on
     /// `erase`, decremented on `insert` resurrection, reset to 0
-    /// at the end of every [`compact_blob`](crate::engine::compact_blob).
+    /// at the end of every successful in-place compaction.
     pub tombstone_leaf_cnt: u32,
     /// Per-NodeType free-list head. Index 0 = ntype 1 (Leaf),
     /// index 1 = ntype 2 (Prefix), …, index 7 = ntype 8 (EmptyRoot).

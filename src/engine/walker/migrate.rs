@@ -26,7 +26,7 @@ use crate::store::backend::{AlignedBlobBuf, Backend};
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
 
 use super::cast;
-use super::types::{CompactStats, MakeBlobOutcome};
+use super::types::MakeBlobOutcome;
 use super::writers::{write_prefix_chain, write_struct_to_slot};
 
 /// Conservative bump-area headroom kept free during a merge.
@@ -107,15 +107,15 @@ pub fn make_blob_from_node(
 /// **What this costs:** one scratch `AlignedBlobBuf` (512 KB on
 /// the heap, lives for the duration of the call) plus one full
 /// blob memcpy at the end. Roughly tens of µs on a modern machine.
-pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<CompactStats> {
-    let (old_space_used, blob_guid, old_root, old_compact_times) = {
+pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
+    let (blob_guid, old_root, old_compact_times) = {
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
         let h = old_frame.header();
-        (h.space_used, h.blob_guid, h.root_slot, h.compact_times)
+        (h.blob_guid, h.root_slot, h.compact_times)
     };
 
     let mut new_buf = AlignedBlobBuf::zeroed();
-    let (new_root, new_space_used) = {
+    {
         let mut new_frame = BlobFrame::init(new_buf.as_mut_slice(), blob_guid)?;
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
         let cloned = clone_subtree(&old_frame, &mut new_frame, old_root, true)?;
@@ -135,19 +135,10 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<CompactStats> {
         h.root_slot = entry;
         h.tombstone_leaf_cnt = 0;
         h.compact_times = old_compact_times.saturating_add(1);
-        let used = new_frame.header().space_used;
-        (entry, used)
-    };
+    }
 
     buf.as_mut_slice().copy_from_slice(new_buf.as_slice());
-
-    Ok(CompactStats {
-        bytes_before: old_space_used,
-        bytes_after: new_space_used,
-        bytes_reclaimed: old_space_used.saturating_sub(new_space_used),
-        old_root,
-        new_root,
-    })
+    Ok(())
 }
 
 // ---------- merge primitives ----------

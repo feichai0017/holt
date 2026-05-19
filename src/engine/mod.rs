@@ -21,9 +21,10 @@
 pub mod simd;
 pub mod walker;
 
+// Re-export only the items consumed outside the `walker` subtree
+// (api::tree, api::range, api::stats). Walker-internal types stay
+// hidden behind `mod walker;`.
 pub use walker::{
-    collect_blob_guids, compact_blob, erase, erase_multi, insert, insert_multi, is_mergeable,
-    lookup, lookup_at, lookup_multi, make_blob_from_node, merge_blob, refresh_blob_node_pointers,
-    try_merge_children, BlobNodeCrossing, CompactStats, EraseOutcome, InsertOutcome, LookupResult,
-    MakeBlobOutcome, MergeStats, RangeBuilder, RangeEntry, RangeIter,
+    collect_blob_guids, compact_blob, erase_multi, insert_multi, lookup_multi,
+    refresh_blob_node_pointers, try_merge_children, RangeBuilder, RangeEntry, RangeIter,
 };

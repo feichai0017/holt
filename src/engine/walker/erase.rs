@@ -24,12 +24,13 @@ use super::writers::{
 // ---------- public entry points ----------
 
 /// Single-blob erase. Surfaces [`Error::NotYetImplemented`] if the
-/// descent reaches a [`NodeType::Blob`] crossing — Stage 2d
-/// callers wanting cross-blob erase should use [`erase_multi`].
+/// descent reaches a [`NodeType::Blob`] crossing — callers wanting
+/// cross-blob erase should use [`erase_multi`].
 ///
 /// Returns the new root slot (caller updates `header.root_slot`)
 /// and the prior value if the key was present. If `key` was not in
 /// the tree, `previous` is `None` and `new_root_slot == root_slot`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<EraseOutcome> {
     let r = erase_at(None, frame, root_slot, key, 0)?;
     let new_root = resolve_new_root_after_erase(frame, root_slot, &r.signal)?;

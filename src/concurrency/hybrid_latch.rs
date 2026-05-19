@@ -23,17 +23,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const WRITER: u32 = u32::MAX;
 
-/// Mode used to acquire the latch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LatchMode {
-    /// Snapshot-and-validate (no real lock taken).
-    Optimistic,
-    /// Shared / readers lock.
-    Shared,
-    /// Exclusive / writer lock.
-    Exclusive,
-}
-
 /// 3-mode latch protecting one blob frame's content.
 #[derive(Debug)]
 pub struct HybridLatch {
@@ -137,18 +126,6 @@ impl HybridLatch {
         self.version.fetch_add(1, Ordering::Release);
         self.counter.store(0, Ordering::Release);
     }
-
-    /// Attempt to upgrade a shared lock to exclusive without
-    /// releasing. Succeeds only if we're the SOLE shared reader.
-    /// Returns true on success, false on contention (caller must
-    /// release shared and re-acquire exclusive, possibly yielding
-    /// to other waiters).
-    #[must_use]
-    pub fn try_upgrade(&self) -> bool {
-        self.counter
-            .compare_exchange(1, WRITER, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-    }
 }
 
 /// RAII guard state — tracks what we currently hold.
@@ -168,8 +145,7 @@ pub enum GuardState {
 ///
 /// Use `Guard::optimistic(&latch)` / `Guard::shared(&latch)` /
 /// `Guard::exclusive(&latch)` to acquire. Call `validate()`
-/// before trusting an optimistic read, and `upgrade_to_shared()`
-/// or `upgrade_to_exclusive()` to escalate.
+/// before trusting an optimistic read.
 #[derive(Debug)]
 pub struct Guard<'a> {
     latch: &'a HybridLatch,
@@ -210,12 +186,6 @@ impl<'a> Guard<'a> {
         }
     }
 
-    /// Current state.
-    #[must_use]
-    pub fn state(&self) -> GuardState {
-        self.state
-    }
-
     /// Validate the optimistic snapshot is still current. For
     /// non-optimistic guards always returns true.
     #[must_use]
@@ -224,41 +194,6 @@ impl<'a> Guard<'a> {
             GuardState::Optimistic => self.latch.validate(self.snapshot),
             GuardState::Shared | GuardState::Exclusive => true,
             GuardState::Unlocked => false,
-        }
-    }
-
-    /// Promote `Optimistic` → `Shared`. Returns false if the
-    /// snapshot was already stale (caller must restart).
-    pub fn upgrade_to_shared(&mut self) -> bool {
-        debug_assert_eq!(self.state, GuardState::Optimistic);
-        self.latch.acquire_shared();
-        if self.latch.version.load(Ordering::Acquire) != self.snapshot {
-            self.latch.release_shared();
-            return false;
-        }
-        self.state = GuardState::Shared;
-        true
-    }
-
-    /// Promote to `Exclusive`. From Optimistic: always acquires
-    /// fresh (snapshot discarded). From Shared: tries CAS upgrade,
-    /// else releases + reacquires (yields to other waiters).
-    pub fn upgrade_to_exclusive(&mut self) {
-        match self.state {
-            GuardState::Optimistic => {
-                self.latch.acquire_exclusive();
-                self.state = GuardState::Exclusive;
-            }
-            GuardState::Shared => {
-                if self.latch.try_upgrade() {
-                    self.state = GuardState::Exclusive;
-                } else {
-                    self.latch.release_shared();
-                    self.latch.acquire_exclusive();
-                    self.state = GuardState::Exclusive;
-                }
-            }
-            GuardState::Exclusive | GuardState::Unlocked => {}
         }
     }
 
@@ -314,25 +249,6 @@ mod tests {
         drop(g1);
         drop(g2);
         assert_eq!(l.counter.load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn try_upgrade_succeeds_when_sole_reader() {
-        let l = HybridLatch::new();
-        l.acquire_shared();
-        assert!(l.try_upgrade());
-        assert_eq!(l.counter.load(Ordering::Relaxed), WRITER);
-        l.release_exclusive();
-    }
-
-    #[test]
-    fn try_upgrade_fails_when_contended() {
-        let l = HybridLatch::new();
-        l.acquire_shared();
-        l.acquire_shared();
-        assert!(!l.try_upgrade());
-        l.release_shared();
-        l.release_shared();
     }
 
     #[test]

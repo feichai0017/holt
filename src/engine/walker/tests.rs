@@ -3,9 +3,13 @@
 //! BlobNode descent) + `compact_blob`.
 
 use super::cast;
+use super::erase::erase;
+use super::insert::insert;
+use super::lookup::{lookup, lookup_at};
+use super::migrate::{compact_blob, make_blob_from_node};
 use super::readers::read_prefix;
+use super::types::LookupResult;
 use super::writers::write_struct_to_slot;
-use super::{compact_blob, erase, insert, lookup, lookup_at, make_blob_from_node, LookupResult};
 use crate::api::errors::Error;
 use crate::layout::{BlobGuid, NodeType, PAGE_SIZE};
 use crate::store::backend::AlignedBlobBuf;
@@ -854,14 +858,13 @@ fn compact_blob_is_noop_on_empty_tree() {
     let (buf_vec, guid) = fresh_blob();
     let mut buf = aligned_from_vec(&buf_vec);
     let before = { BlobFrame::wrap(buf.as_mut_slice()).header().space_used };
-    let stats = compact_blob(&mut buf).unwrap();
-    assert!(
-        stats.bytes_after <= before + 32,
-        "empty-tree compact grew unexpectedly: {} -> {}",
-        stats.bytes_before,
-        stats.bytes_after,
-    );
+    compact_blob(&mut buf).unwrap();
     let frame = BlobFrame::wrap(buf.as_mut_slice());
+    let after = frame.header().space_used;
+    assert!(
+        after <= before + 32,
+        "empty-tree compact grew unexpectedly: {before} -> {after}",
+    );
     assert_eq!(frame.header().blob_guid, guid);
 }
 
@@ -889,10 +892,12 @@ fn compact_blob_reclaims_extents_after_churn() {
         }
     }
 
-    let stats = compact_blob(&mut buf).unwrap();
+    let bytes_before = { BlobFrame::wrap(buf.as_mut_slice()).header().space_used };
+    compact_blob(&mut buf).unwrap();
+    let bytes_after = { BlobFrame::wrap(buf.as_mut_slice()).header().space_used };
     assert!(
-        stats.bytes_reclaimed > 0,
-        "compact should reclaim something after 100 deletes: {stats:?}",
+        bytes_before > bytes_after,
+        "compact should reclaim something after 100 deletes: {bytes_before} -> {bytes_after}",
     );
 
     let frame = BlobFrame::wrap(buf.as_mut_slice());
@@ -952,4 +957,87 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
             _ => panic!("post-compact insert {k:?} unreadable"),
         }
     }
+}
+
+
+/// Synthetic two-blob tree: build a normal tree, deep-clone its
+/// subtree into a fresh child blob, then rewrite the root blob's
+/// `header.root_slot` to point at a freshly-allocated `BlobNode`
+/// referencing the child. Verifies `Tree::get` follows the
+/// crossing even when it was built outside the spillover path.
+///
+/// Lives here (not in `tests/tree_smoke.rs`) because it needs
+/// `engine::walker::*` internals (`make_blob_from_node`) that
+/// are `pub(crate)` after the v0.2 surface lockdown. Organic
+/// cross-blob coverage is in the integration suite's
+/// `compact_merges_shrunk_child_blob_back_into_parent` and
+/// friends; this test exists to keep BlobNode descent honest
+/// against a synthetic shape.
+#[test]
+fn tree_get_follows_blob_node_crossing_across_two_blobs() {
+    use crate::layout::BlobNode;
+    use crate::store::backend::{Backend, MemoryBackend};
+    use crate::TreeBuilder;
+    use std::sync::Arc;
+
+    let backend: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+    {
+        let tree = TreeBuilder::new("ignored")
+            .open_with_backend(backend.clone())
+            .unwrap();
+        for i in 0..10u32 {
+            let k = format!("k{i:02}").into_bytes();
+            let v = format!("v{i}").into_bytes();
+            tree.put(&k, &v).unwrap();
+        }
+    }
+
+    let root_guid = [0u8; 16];
+    let child_guid = [0xAA; 16];
+
+    let mut root_buf = AlignedBlobBuf::zeroed();
+    backend.read_blob(root_guid, &mut root_buf).unwrap();
+
+    let (saved_root_slot, child_outcome) = {
+        let root_frame = BlobFrame::wrap(root_buf.as_mut_slice());
+        let saved_root = root_frame.header().root_slot;
+        let outcome = make_blob_from_node(&root_frame, saved_root, child_guid).unwrap();
+        (saved_root, outcome)
+    };
+
+    backend.write_blob(child_guid, &child_outcome.buf).unwrap();
+
+    {
+        let mut root_frame = BlobFrame::wrap(root_buf.as_mut_slice());
+        let bn_out = root_frame.alloc_node(NodeType::Blob).unwrap();
+        let bn = BlobNode::new(b"", child_guid, u32::from(child_outcome.entry_slot));
+        // SAFETY: layout types are #[repr(C)] POD; body has the
+        // right size; BlobFrame's bump allocator gives 8-byte
+        // alignment.
+        let body = root_frame.body_of_slot_mut(bn_out.slot).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                std::ptr::from_ref(&bn).cast::<u8>(),
+                body.as_mut_ptr(),
+                std::mem::size_of::<BlobNode>(),
+            );
+        }
+        root_frame.header_mut().root_slot = bn_out.slot;
+        let _ = saved_root_slot;
+    }
+    backend.write_blob(root_guid, &root_buf).unwrap();
+
+    let tree = TreeBuilder::new("ignored")
+        .open_with_backend(backend.clone())
+        .unwrap();
+    for i in 0..10u32 {
+        let k = format!("k{i:02}").into_bytes();
+        let v = format!("v{i}").into_bytes();
+        assert_eq!(
+            tree.get(&k).unwrap().as_deref(),
+            Some(&v[..]),
+            "post-crossing lookup failed for key {k:?}",
+        );
+    }
+    assert!(tree.get(b"k99").unwrap().is_none());
 }

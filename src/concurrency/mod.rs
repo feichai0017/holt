@@ -5,4 +5,4 @@
 
 mod hybrid_latch;
 
-pub use hybrid_latch::{Guard, GuardState, HybridLatch, LatchMode};
+pub use hybrid_latch::{Guard, HybridLatch};
