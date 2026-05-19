@@ -293,15 +293,110 @@ Required for the v0.1 tag:
 - [x] **CONTRIBUTING.md** (build / test / commit-style guide)
 - [x] **CODE_OF_CONDUCT.md** (Contributor Covenant 2.1)
 
-## v0.2 — Performance
+## v0.2 — Performance + concurrency upgrades
 
-- Async checkpointer (3 background threads: checkpoint / io / eviction)
-- io_uring backend (Linux, behind feature flag)
-- SIMD-accelerated CRC32 (PCLMULQDQ on x86_64, CRC32 intrinsic
-  on AArch64) — the 256-entry table from v0.1 gets us to
-  ≈1.5 GB/s; the SIMD variants push past 8 GB/s
-- Buffer-pool tuning + adaptive eviction
-- Metrics export (Prometheus + OpenTelemetry traces)
+v0.2 is **scoped to the metadata-engine core**. No new public API
+surface (those land in v0.3). The bench surfaces from v0.1 are
+the success criteria — `objstore_get` should stay sub-200 ns,
+`*_list` should drop another 30-50 %, `*_list_dir` should drop
+by `~leaves_per_rollup` once fast-forward lands.
+
+### Hot-path performance
+
+- [ ] **`io_uring` persistent-backend submission/completion**
+      (Linux, behind a `feature = "io-uring"` flag). The current
+      backend uses `pread`/`pwrite`; uring removes the per-call
+      syscall + lets the BM batch reads on cold-cache walks.
+      Stage 7 of the original Stage chain.
+- [ ] **SIMD CRC32** — PCLMULQDQ on x86_64, CRC32 intrinsic on
+      AArch64. The 256-entry table from v0.1's WAL fast-path
+      gets ≈1.5 GB/s; SIMD variants push past 8 GB/s. Drops
+      persistent-put cost another ≈80 ns.
+- [ ] **Cached `Tree.root_pin`** — every `get` / `put` / `delete`
+      currently re-pins `root_guid` through `BufferManager`'s
+      `Mutex<HashMap>` lookup. Keep an `Arc<CachedBlob>` for the
+      root inside `Tree` and skip that lookup. Estimated saving
+      ≈300 ns / op.
+- [ ] **`RangeIter` fast-forward in delimiter mode** — after
+      emitting a `CommonPrefix(C)`, ascend the descent stack past
+      `C`'s subtree instead of scanning every leaf under it to
+      dedup. This alone makes `*_list_dir` go from
+      `O(leaves_under_prefix)` to `O(distinct_rollups)` —
+      typically a 100-1000× speedup on `?delimiter=/` queries
+      with deep buckets.
+- [ ] **Sharded `BufferManager` state** — replace the single
+      `Mutex<BMState>` with sharded buckets (DashMap-style) so
+      concurrent pins on different blobs don't contend.
+
+### Concurrency primitive upgrades
+
+- [ ] **Per-node `HybridLatch`** — currently lives on
+      `BlobFrame.Header` (per-blob granularity); any write in a
+      blob invalidates every optimistic reader in that blob.
+      Moving the latch to `NodeHeader` lets readers and writers
+      of disjoint subtrees inside one blob run truly in parallel.
+- [ ] **Cross-blob lock-coupling** — acquire the child blob's
+      latch before stepping into it (currently happens inside
+      `resolveNodePtr`). Tightens descent's visible-state window
+      and prepares the ground for ext-blob latching.
+- [ ] **Multi-reader stress bench** — extend `benches/main.rs`
+      with a concurrent-reader scenario so the HybridLatch
+      wait-free claim has a number behind it (currently the
+      bench is single-threaded).
+
+### Durability + background work
+
+- [ ] **Async checkpoint thread** (one thread — we're an
+      embedded engine, not the upstream's three-thread RPC
+      server). Triggers on a dirty-bytes threshold,
+      runs `Tree::checkpoint` off the application thread, surfaces
+      progress via metrics. Caller can opt out for "explicit
+      checkpoint only" mode.
+- [ ] **Free-list retry/backoff subsystem** — under heap
+      exhaustion, the per-NodeType LIFO chains today fail-fast.
+      The original ancestor has a backoff path
+      (`free_list is {} sleep 10ms retry={}`); adding it would
+      buy resilience under stress.
+- [ ] **Adaptive buffer-pool eviction** — touched-recently scan,
+      not strict LRU. The current LRU `VecDeque` does an O(n)
+      remove on every pin's touch; with `buffer_pool_size > 128`
+      this starts to bite.
+
+### Observability
+
+- [ ] **Metrics export** — Prometheus counters + OpenTelemetry
+      traces. Hooks for: put / get / delete / rename throughput,
+      spillover / merge / compact counts, cache hit rate, WAL
+      flush latency, optimistic-read restart count.
+- [ ] **Tracing spans** — `tracing` crate spans on `spillover`,
+      `merge_blob`, `compact_blob`, WAL flush, BM evict — lets
+      downstream apps correlate holt's internal events with
+      their own request traces.
+- [ ] **Extended `Tree::stats`** — expose free-list health
+      (chains length, gap_space distribution), cache hit rate,
+      latch contention counters.
+
+### Ergonomics + diagnostics
+
+- [ ] **Richer `Error::NodeCorrupt`** — currently carries only a
+      `&'static str` context; add `blob_guid` + `slot` so a
+      caller's bug-report has actionable detail without us
+      needing to instrument.
+- [ ] **`Tree::scan_prefix(p)` shorthand** for the common
+      `tree.range().prefix(p)` case — cosmetic but tightens the
+      90% query.
+- [ ] **Property tests for `txn` + `range` semantics** — extend
+      `tests/properties.rs`'s `HashMap` oracle to cover batch
+      transactions and range queries.
+
+### Polish
+
+- [ ] **`cargo deny check` in CI** — wire `deny.toml` into the
+      `.github/workflows/ci.yml` matrix so license drift /
+      RustSec advisories fail the build.
+- [ ] **PGO build profile docs** — measure + document the
+      `cargo pgo` gain on `objstore_get` / `*_list`. Probably
+      worth 10-15 % on hot paths.
 
 ## v0.3 — Advanced features
 
