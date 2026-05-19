@@ -1,13 +1,22 @@
 //! SIMD hot paths used by the walker.
 //!
-//! Two operations dominate the ART walker's read cost:
+//! Four operations dominate the ART walker's byte-scan cost:
 //!
 //! 1. **Node16 byte search** — find the index `i` in `keys[0..count]`
 //!    such that `keys[i] == byte`. The scalar form is a 16-iteration
 //!    loop; SSE2 / NEON do the same work in ~3 instructions.
+//!    [`node16_find_byte`].
 //! 2. **Longest common prefix** — find the first divergence between
 //!    two byte slices (Leaf split, Prefix split). 16 bytes per
-//!    iteration via vector compare.
+//!    iteration via vector compare. [`longest_common_prefix`].
+//! 3. **Node48 index scan** — find the next non-zero byte in
+//!    `index[256]` starting from `start`. Used by the range
+//!    iterator to advance through Node48 children in lex order.
+//!    [`find_next_nonzero_byte`].
+//! 4. **Node256 children scan** — find the next non-zero `u32` in
+//!    `children[256]` (the slot-index array) starting from
+//!    `start`. Same shape as #3 but on `u32` lanes.
+//!    [`find_next_nonzero_u32`].
 //!
 //! Dispatch is compile-time only — `cfg(target_arch = ...)` selects
 //! the SSE2 path on x86_64 (always available — SSE2 is part of the
@@ -93,6 +102,108 @@ pub fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
     i
 }
 
+/// Find the smallest index `i ∈ [start, bytes.len())` with
+/// `bytes[i] != 0`, or `None` if every byte from `start` onwards
+/// is zero.
+///
+/// Drives the range iterator's Node48 lex-order walk (`index[256]`
+/// where the entry at byte `b` is `0` if no child has key byte
+/// `b`). The scalar loop is at most 256 iterations; SSE2 / NEON
+/// scan 16 bytes per instruction.
+#[inline]
+pub fn find_next_nonzero_byte(bytes: &[u8], start: usize) -> Option<usize> {
+    let len = bytes.len();
+    if start >= len {
+        return None;
+    }
+    let mut i = start;
+
+    // Align the SIMD window to whole 16-byte chunks. The tail (and
+    // an unaligned `start`) falls through to the scalar loop below.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    while i + 16 <= len {
+        let ptr = unsafe { bytes.as_ptr().add(i) };
+        let mask = unsafe { nonzero_byte_mask_16(ptr) };
+        if mask != 0 {
+            return Some(i + mask.trailing_zeros() as usize);
+        }
+        i += 16;
+    }
+
+    while i < len {
+        if bytes[i] != 0 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the smallest index `i ∈ [start, words.len())` with
+/// `words[i] != 0`, or `None` if every `u32` from `start`
+/// onwards is zero.
+///
+/// Drives the range iterator's Node256 lex-order walk
+/// (`children[256]` of `u32` slot indices; entry `0` means "no
+/// child at this key byte"). SSE2 / NEON compare 4 `u32` lanes
+/// per instruction.
+#[inline]
+pub fn find_next_nonzero_u32(words: &[u32], start: usize) -> Option<usize> {
+    let len = words.len();
+    if start >= len {
+        return None;
+    }
+    let mut i = start;
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    while i + 4 <= len {
+        let ptr = unsafe { words.as_ptr().add(i) };
+        let mask = unsafe { nonzero_u32_mask_4(ptr) };
+        if mask != 0 {
+            return Some(i + mask.trailing_zeros() as usize);
+        }
+        i += 4;
+    }
+
+    while i < len {
+        if words[i] != 0 {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+// ---------------------------------------------------------------
+// arch-specific glue for the two new scans
+// ---------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn nonzero_byte_mask_16(ptr: *const u8) -> u32 {
+    // Compare 16 bytes against zero, then *invert* the mask so 1
+    // means "non-zero".
+    unsafe { x86::cmp_byte_neq_zero_mask_16(ptr) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn nonzero_u32_mask_4(ptr: *const u32) -> u32 {
+    unsafe { x86::cmp_u32_neq_zero_mask_4(ptr) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn nonzero_byte_mask_16(ptr: *const u8) -> u32 {
+    unsafe { arm::cmp_byte_neq_zero_mask_16(ptr) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn nonzero_u32_mask_4(ptr: *const u32) -> u32 {
+    unsafe { arm::cmp_u32_neq_zero_mask_4(ptr) }
+}
+
 // ---------------------------------------------------------------
 // x86_64 — SSE2 (always available in the base x86_64 ISA)
 // ---------------------------------------------------------------
@@ -100,7 +211,8 @@ pub fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::{
-        __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+        __m128i, _mm_cmpeq_epi32, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
+        _mm_movemask_ps, _mm_set1_epi8, _mm_setzero_si128,
     };
 
     /// Compare 16 bytes from `a` against 16 from `b`. Returns a
@@ -136,6 +248,40 @@ mod x86 {
             Some(masked.trailing_zeros() as u8)
         }
     }
+
+    /// 16-bit mask where bit `i = 1` iff byte `i` of the 16-byte
+    /// window at `ptr` is **non-zero**. Caller guarantees `ptr` is
+    /// at least 16 bytes valid.
+    #[inline]
+    pub(super) unsafe fn cmp_byte_neq_zero_mask_16(ptr: *const u8) -> u32 {
+        let vec = unsafe { _mm_loadu_si128(ptr.cast::<__m128i>()) };
+        let zero = _mm_setzero_si128();
+        let cmp_eq_zero = _mm_cmpeq_epi8(vec, zero); // 0xFF where zero
+                                                     // Invert via movemask + bitwise NOT trimmed to the low 16
+                                                     // bits — avoids a `pxor` and lets the trailing_zeros caller
+                                                     // see "non-zero positions" directly.
+        let zero_mask = _mm_movemask_epi8(cmp_eq_zero) as u32;
+        (!zero_mask) & 0xFFFF
+    }
+
+    /// 4-bit mask where bit `i = 1` iff `u32` lane `i` of the
+    /// 4-lane window at `ptr` is **non-zero**. Caller guarantees
+    /// `ptr` is at least 16 bytes (4 × `u32`) valid.
+    #[inline]
+    pub(super) unsafe fn cmp_u32_neq_zero_mask_4(ptr: *const u32) -> u32 {
+        let vec = unsafe { _mm_loadu_si128(ptr.cast::<__m128i>()) };
+        let zero = _mm_setzero_si128();
+        // Compare 4 `u32` lanes against zero. Result lanes are
+        // 0xFFFF_FFFF if zero, 0x0000_0000 otherwise.
+        let cmp_eq_zero = _mm_cmpeq_epi32(vec, zero);
+        // `_mm_movemask_ps` extracts the top bit of each 4-byte
+        // lane → a 4-bit mask. Reinterpreting the integer compare
+        // result as a float vector is a standard SSE idiom.
+        let as_ps =
+            unsafe { std::mem::transmute::<__m128i, std::arch::x86_64::__m128>(cmp_eq_zero) };
+        let zero_mask = (_mm_movemask_ps(as_ps) as u32) & 0xF;
+        (!zero_mask) & 0xF
+    }
 }
 
 // ---------------------------------------------------------------
@@ -145,8 +291,9 @@ mod x86 {
 #[cfg(target_arch = "aarch64")]
 mod arm {
     use std::arch::aarch64::{
-        uint8x16_t, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vreinterpret_u64_u8,
-        vreinterpretq_u16_u8, vshrn_n_u16,
+        uint8x16_t, vceqq_u32, vceqq_u8, vdupq_n_u32, vdupq_n_u8, vget_lane_u64, vld1q_u32,
+        vld1q_u8, vmvnq_u32, vmvnq_u8, vreinterpret_u64_u8, vreinterpretq_u16_u8,
+        vreinterpretq_u8_u32, vshrn_n_u16,
     };
 
     /// Pack a `uint8x16_t` byte-mask (each byte = 0xFF or 0x00)
@@ -190,6 +337,66 @@ mod arm {
             // First non-zero nibble's position / 4 = byte index.
             Some((masked.trailing_zeros() / 4) as u8)
         }
+    }
+
+    /// 16-bit mask where bit `i = 1` iff byte `i` of the 16-byte
+    /// window at `ptr` is **non-zero**. Caller guarantees `ptr` is
+    /// at least 16 bytes valid.
+    ///
+    /// Mirrors the SSE2 path: compare the lanes to a zero vector,
+    /// invert, then narrow to a 1-bit-per-byte mask via the same
+    /// nibble-shrink trick used in [`cmp_16_bytes_nibble`] but
+    /// post-processed to one bit per byte (we want trailing_zeros
+    /// to return the byte index, not the nibble index).
+    #[inline]
+    pub(super) unsafe fn cmp_byte_neq_zero_mask_16(ptr: *const u8) -> u32 {
+        let vec = unsafe { vld1q_u8(ptr) };
+        let zero = vdupq_n_u8(0);
+        let cmp_eq_zero = vceqq_u8(vec, zero);
+        let cmp_neq_zero = vmvnq_u8(cmp_eq_zero);
+        // Each byte lane is 0xFF for non-zero, 0x00 for zero;
+        // shrink to a 64-bit nibble mask, then collapse adjacent
+        // nibble pairs into a single bit per byte.
+        let nib = unsafe { byte_mask_to_nibble_u64(cmp_neq_zero) };
+        // bit_i_of_output = OR of nibble_2i and nibble_2i+1 ...
+        // but since each nibble is either 0xF or 0x0, we can
+        // just observe: nibble != 0  ⟺  byte != 0. So pick the
+        // low bit of each nibble.
+        let mut out: u32 = 0;
+        let mut i = 0;
+        while i < 16 {
+            if ((nib >> (i * 4)) & 0xF) != 0 {
+                out |= 1u32 << i;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// 4-bit mask where bit `i = 1` iff `u32` lane `i` of the
+    /// 4-lane window at `ptr` is **non-zero**. Caller guarantees
+    /// `ptr` is at least 16 bytes (4 × `u32`) valid.
+    #[inline]
+    pub(super) unsafe fn cmp_u32_neq_zero_mask_4(ptr: *const u32) -> u32 {
+        let vec = unsafe { vld1q_u32(ptr) };
+        let zero = vdupq_n_u32(0);
+        let cmp_eq_zero = vceqq_u32(vec, zero); // 0xFFFFFFFF where zero
+        let cmp_neq_zero = vmvnq_u32(cmp_eq_zero); // 0xFFFFFFFF where non-zero
+                                                   // Reinterpret as u8 and reuse the nibble-shrink. Each
+                                                   // u32 lane occupies 8 nibbles in the output (all 0xF for
+                                                   // non-zero, all 0x0 for zero); sample one nibble per
+                                                   // lane.
+        let as_bytes = vreinterpretq_u8_u32(cmp_neq_zero);
+        let nib = unsafe { byte_mask_to_nibble_u64(as_bytes) };
+        let mut out: u32 = 0;
+        let mut i = 0;
+        while i < 4 {
+            if ((nib >> ((i * 4) * 4)) & 0xF) != 0 {
+                out |= 1u32 << i;
+            }
+            i += 1;
+        }
+        out
     }
 }
 
@@ -350,5 +557,122 @@ mod tests {
         let a = b"aaaaaaaaaaaaaaaaXrest";
         let b = b"aaaaaaaaaaaaaaaaYrest";
         assert_eq!(longest_common_prefix(a, b), 16);
+    }
+
+    // ---- find_next_nonzero_byte ----
+
+    fn scalar_next_nonzero_byte(bytes: &[u8], start: usize) -> Option<usize> {
+        bytes
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, b)| **b != 0)
+            .map(|(i, _)| i)
+    }
+
+    #[test]
+    fn find_next_nonzero_byte_empty() {
+        let bytes = [0u8; 256];
+        assert_eq!(find_next_nonzero_byte(&bytes, 0), None);
+        assert_eq!(find_next_nonzero_byte(&bytes, 100), None);
+        assert_eq!(find_next_nonzero_byte(&bytes, 256), None);
+    }
+
+    #[test]
+    fn find_next_nonzero_byte_at_chunk_boundaries() {
+        for pos in [0usize, 1, 15, 16, 17, 31, 32, 240, 254, 255] {
+            let mut bytes = [0u8; 256];
+            bytes[pos] = 0xAB;
+            assert_eq!(find_next_nonzero_byte(&bytes, 0), Some(pos), "pos={pos}");
+            assert_eq!(find_next_nonzero_byte(&bytes, pos), Some(pos), "pos={pos}");
+            if pos + 1 < 256 {
+                assert_eq!(find_next_nonzero_byte(&bytes, pos + 1), None, "pos+1={pos}");
+            }
+        }
+    }
+
+    #[test]
+    fn find_next_nonzero_byte_random_matches_scalar() {
+        let mut state: u64 = 0xCAFE_F00D_1234_5678;
+        let step = |s: &mut u64| -> u8 {
+            *s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*s >> 33) as u8
+        };
+        for _ in 0..500 {
+            let mut bytes = [0u8; 256];
+            // Sparse: ~5% non-zero.
+            for b in &mut bytes {
+                if step(&mut state) < 13 {
+                    *b = step(&mut state).max(1);
+                }
+            }
+            let start = (step(&mut state) as usize) % 257;
+            assert_eq!(
+                find_next_nonzero_byte(&bytes, start),
+                scalar_next_nonzero_byte(&bytes, start),
+                "start={start}",
+            );
+        }
+    }
+
+    // ---- find_next_nonzero_u32 ----
+
+    fn scalar_next_nonzero_u32(words: &[u32], start: usize) -> Option<usize> {
+        words
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, w)| **w != 0)
+            .map(|(i, _)| i)
+    }
+
+    #[test]
+    fn find_next_nonzero_u32_empty() {
+        let words = [0u32; 256];
+        assert_eq!(find_next_nonzero_u32(&words, 0), None);
+        assert_eq!(find_next_nonzero_u32(&words, 100), None);
+        assert_eq!(find_next_nonzero_u32(&words, 256), None);
+    }
+
+    #[test]
+    fn find_next_nonzero_u32_at_chunk_boundaries() {
+        for pos in [0usize, 1, 3, 4, 5, 7, 8, 9, 240, 254, 255] {
+            let mut words = [0u32; 256];
+            words[pos] = 0xABCD_1234;
+            assert_eq!(find_next_nonzero_u32(&words, 0), Some(pos), "pos={pos}");
+            assert_eq!(find_next_nonzero_u32(&words, pos), Some(pos), "pos={pos}");
+            if pos + 1 < 256 {
+                assert_eq!(find_next_nonzero_u32(&words, pos + 1), None);
+            }
+        }
+    }
+
+    #[test]
+    fn find_next_nonzero_u32_random_matches_scalar() {
+        let mut state: u64 = 0xF00D_CAFE_8765_4321;
+        let step = |s: &mut u64| -> u32 {
+            *s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*s >> 32) as u32
+        };
+        for _ in 0..500 {
+            let mut words = [0u32; 256];
+            for w in &mut words {
+                // ~6% non-zero — give the scan plenty of empty
+                // chunks but enough hits to exercise every lane.
+                if step(&mut state).trailing_zeros() >= 4 {
+                    *w = step(&mut state).max(1);
+                }
+            }
+            let start = (step(&mut state) as usize) % 257;
+            assert_eq!(
+                find_next_nonzero_u32(&words, start),
+                scalar_next_nonzero_u32(&words, start),
+                "start={start}",
+            );
+        }
     }
 }

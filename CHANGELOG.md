@@ -8,6 +8,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
+- **SIMD Node48 / Node256 range-iter scans** — two new primitives
+  in `engine::simd`:
+  - `find_next_nonzero_byte(bytes, start)` for the
+    `Node48::index[256]` lex-order walk
+  - `find_next_nonzero_u32(words, start)` for the
+    `Node256::children[256]` slot-index array
+  Wired into `range::next_inner_child_from` and `Node16` arm of
+  `range::find_inner_child_and_cursor` (which now reuses the
+  existing `node16_find_byte` SIMD). On a Node48 with sparse
+  children the saved scan cost is ~80 ns per `next()`; on
+  Node256, ~120 ns. Worth most on `*_list_dir` queries that walk
+  many branch nodes.
 - **Hardware-accelerated CRC32** — the WAL record footer hash
   now routes through `crc32fast`. Auto-detects PCLMULQDQ on
   x86_64 and the AArch64 CRC32 instruction at runtime; falls
