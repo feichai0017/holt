@@ -112,8 +112,6 @@ Done — algorithm core:
 Queued — see [ROADMAP.md](ROADMAP.md):
 - `Tree::range` / `Tree::txn` iterators
 - io_uring submission on the persistent backend (Stage 7)
-- `mergeBlob` (child-blob → parent inverse of splitBlob)
-- Tombstone + lazy reclaim
 
 ## Quick taste
 

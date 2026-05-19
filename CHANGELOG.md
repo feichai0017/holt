@@ -9,9 +9,8 @@ v0.1.0 ships.
 
 The v0.1 cycle is "build the engine end-to-end." The algorithm core,
 storage cache, WAL, and persistence stack are landed; the remaining
-v0.1 items are higher-level API surface (`Tree::range`, `Tree::txn`,
-`Tree::stats`) and `mergeBlob` / tombstone reclaim. See
-[`ROADMAP.md`](ROADMAP.md) for the live list.
+v0.1 items are the higher-level API surface (`Tree::range`,
+`Tree::txn`). See [`ROADMAP.md`](ROADMAP.md) for the live list.
 
 ### Added — algorithm core
 
@@ -30,6 +29,26 @@ v0.1 items are higher-level API surface (`Tree::range`, `Tree::txn`,
   workloads (insert + delete + reinsert) stay in fewer blobs.
 - **`make_blob_from_node` deep-clone primitive** + `free_subtree`
   recursive slot reclaim.
+- **`mergeBlob` inverse of splitBlob** — `engine::merge_blob`
+  inlines a child blob's subtree back into its parent at the
+  `BlobNode` slot, preserves the BlobNode's inline prefix as a
+  `Prefix` chain over the inlined root, and deletes the child
+  blob. `engine::is_mergeable` guards the fold (combined data
+  area + slot count fit, child has no nested crossings, no
+  tombstones). `engine::try_merge_children` walks a parent's
+  tree and folds every direct mergeable `BlobNode` child.
+  `Tree::compact` runs it after the per-blob compact pass —
+  heavy-erase workloads collapse multi-blob trees back toward a
+  single root.
+- **`refresh_blob_node_pointers` post-compact invariant repair**
+  — `compact_blob` rebuilds a child's `header.root_slot` in
+  isolation, breaking the lock-step
+  `BlobNode.child_entry_ptr == child.header.root_slot`
+  invariant that insert / erase keep inline.
+  `Tree::compact` runs `refresh_blob_node_pointers` between the
+  per-blob compact pass and the merge pass to walk every
+  `BlobNode` crossing and re-point it at the child's current
+  root slot.
 - **`SPILLOVER_RESERVATION = 128 B`** bump-area headroom so
   `spillover_blob` always has room to allocate its emergency
   `BlobNode` placeholder.

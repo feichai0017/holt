@@ -472,31 +472,77 @@ impl Tree {
         })
     }
 
-    /// Compact every blob reachable from the root in place.
+    /// Compact every blob reachable from the root in place, then
+    /// fold every mergeable cross-blob crossing back into its
+    /// parent.
     ///
-    /// Per-blob: takes an exclusive guard, runs
-    /// [`crate::engine::compact_blob`] (rebuild dropping orphans /
-    /// tombstones and reclaiming bump-area waste), and commits the
-    /// rebuilt buffer through the BM. `compact_times` is bumped by
-    /// one on each blob; `tombstone_leaf_cnt` resets to zero (the
-    /// leaves it counted are dropped from the new image — wired in
-    /// the tombstone work).
+    /// Two phases:
     ///
-    /// Does **not** fsync the backend or touch the WAL — compaction
-    /// is logically idempotent (the post-compact tree is observationally
-    /// identical to the pre-compact one), so a crash mid-compact just
-    /// means the next run re-does the work. Call [`Tree::checkpoint`]
-    /// after if you want the rebuilt blobs durable on disk.
+    /// 1. **Per-blob compact**: every reachable blob runs through
+    ///    [`crate::engine::compact_blob`] (rebuild dropping
+    ///    tombstones + reclaiming bump-area waste). `compact_times`
+    ///    bumps by one on each; `tombstone_leaf_cnt` resets to zero.
+    /// 2. **Tree-wide merge**: each parent blob is walked with
+    ///    [`crate::engine::try_merge_children`], which folds every
+    ///    `BlobNode` child satisfying [`crate::engine::is_mergeable`]
+    ///    back into the parent and drops the child blob from the BM.
+    ///    A heavy-erase workload that leaves children mostly-empty
+    ///    collapses back toward a single root blob.
+    ///
+    /// Both phases commit each touched blob through the BM. Does
+    /// **not** fsync the backend or touch the WAL — compaction
+    /// is logically idempotent (the post-compact tree is
+    /// observationally identical to the pre-compact one), so a
+    /// crash mid-compact just means the next run re-does the work.
+    /// Call [`Tree::checkpoint`] after if you want the rebuilt
+    /// blobs durable on disk.
+    ///
+    /// Single-pass merge: nested crossings (a mergeable child whose
+    /// own children are themselves merge candidates) aren't unfolded
+    /// recursively in v0.1. Re-invoke `compact` for another pass if
+    /// the workload has cascaded crossings.
     pub fn compact(&self) -> Result<()> {
+        // Phase 1 — per-blob compact.
         let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
-        for guid in guids {
-            let pin = self.backend.pin(guid)?;
+        for guid in &guids {
+            let pin = self.backend.pin(*guid)?;
             {
                 let mut guard = pin.write();
                 engine::compact_blob(&mut guard)?;
             }
             drop(pin);
-            self.backend.commit(guid)?;
+            self.backend.commit(*guid)?;
+        }
+
+        // Phase 1.5 — restore the `BlobNode.child_entry_ptr ==
+        // child.header.root_slot` invariant that compact_blob broke
+        // when it rebuilt each child's root inside its own blob in
+        // isolation. Insert / erase rewrite the pair in lock-step
+        // inline, so this sweep only matters after a compact.
+        engine::refresh_blob_node_pointers(&self.backend, self.root_guid)?;
+
+        // Phase 2 — tree-wide merge pass. Walk parents in BFS order
+        // from the root; each parent's `try_merge_children` collapses
+        // any direct `BlobNode` child whose blob is small enough to
+        // inline. Snapshot the BFS list first; merges performed
+        // earlier in the iteration delete the merged child blobs,
+        // so later iterations may encounter guids that no longer
+        // exist — skip those rather than re-pinning a missing blob.
+        let parents = engine::collect_blob_guids(&self.backend, self.root_guid)?;
+        for guid in parents {
+            if !self.backend.has_blob(guid)? {
+                continue;
+            }
+            let pin = self.backend.pin(guid)?;
+            let merged = {
+                let mut guard = pin.write();
+                let mut frame = BlobFrame::wrap(guard.as_mut_slice());
+                engine::try_merge_children(&self.backend, &mut frame)?
+            };
+            drop(pin);
+            if merged.merged > 0 {
+                self.backend.commit(guid)?;
+            }
         }
         Ok(())
     }

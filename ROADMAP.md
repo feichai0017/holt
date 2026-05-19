@@ -75,7 +75,22 @@ Required for the v0.1 tag:
 - [x] `SPILLOVER_RESERVATION` (128 B bump headroom) — walker
       `alloc_node`/`alloc_extent` (non-Blob) leave one BlobNode's
       worth of bump area for spillover's emergency placeholder
-- [ ] `mergeBlob` (compaction inverse — child blob → parent)
+- [x] **`mergeBlob`** (compaction inverse — child blob → parent) —
+      [`engine::merge_blob`](src/engine/walker/migrate.rs) inlines
+      a child's subtree back into its parent at the `BlobNode`
+      slot (preserving the inline-prefix wrap), then deletes the
+      child blob. Guarded by `engine::is_mergeable` (combined
+      space + slots fit, child has no own crossings, no
+      tombstones). [`engine::try_merge_children`](src/engine/walker/merge.rs)
+      is the tree-walker fold: [`Tree::compact`](src/api/tree.rs)
+      runs `compact_blob` per blob, then
+      `refresh_blob_node_pointers` repairs the
+      `BlobNode.child_entry_ptr == child.header.root_slot`
+      invariant `compact_blob` couldn't keep in lock-step, then a
+      single-pass merge sweep folds every direct mergeable
+      `BlobNode` child. Nested crossings (mergeable-child-of-
+      mergeable-child) are deferred to a second `Tree::compact`
+      pass.
 - [x] In-place leaf-value update when new value fits existing
       extent footprint (zero alloc, zero extent leak)
 - [x] SIMD Node16 byte search (SSE2 / NEON / scalar fallback)

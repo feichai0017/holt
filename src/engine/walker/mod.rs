@@ -26,12 +26,17 @@
 //! - `scan` — tree-wide BFS over reachable blobs ([`collect_blob_guids`]).
 //!   Used by [`crate::Tree::stats`] and [`crate::Tree::compact`] to
 //!   fan out across the whole on-disk tree.
+//! - `merge` — tree-wide single-pass walker ([`try_merge_children`])
+//!   that folds every mergeable `BlobNode` child back into its
+//!   parent via [`merge_blob`]. Wired into [`crate::Tree::compact`]
+//!   after the per-blob compaction pass.
 
 use std::mem::size_of;
 
 mod erase;
 mod insert;
 mod lookup;
+mod merge;
 mod migrate;
 mod readers;
 mod scan;
@@ -46,8 +51,9 @@ mod writers;
 pub use erase::{erase, erase_multi};
 pub use insert::{insert, insert_multi};
 pub use lookup::{lookup, lookup_at, lookup_multi};
-pub use migrate::{compact_blob, make_blob_from_node};
-pub use scan::collect_blob_guids;
+pub use merge::{try_merge_children, MergeStats};
+pub use migrate::{compact_blob, is_mergeable, make_blob_from_node, merge_blob};
+pub use scan::{collect_blob_guids, refresh_blob_node_pointers};
 pub use types::{
     BlobNodeCrossing, CompactStats, EraseOutcome, InsertOutcome, LookupResult, MakeBlobOutcome,
 };

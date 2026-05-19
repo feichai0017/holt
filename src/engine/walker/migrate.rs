@@ -20,14 +20,22 @@
 use crate::api::errors::{Error, Result};
 use crate::layout::{
     leaf_extent_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix,
-    BLOB_MAX_INLINE, PREFIX_MAX_INLINE,
+    BLOB_MAX_INLINE, DATA_AREA_START, MAX_SLOTS, PAGE_SIZE, PREFIX_MAX_INLINE,
 };
-use crate::store::backend::AlignedBlobBuf;
-use crate::store::BlobFrame;
+use crate::store::backend::{AlignedBlobBuf, Backend};
+use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
 
 use super::cast;
 use super::types::{CompactStats, MakeBlobOutcome};
 use super::writers::{write_prefix_chain, write_struct_to_slot};
+
+/// Conservative bump-area headroom kept free during a merge.
+///
+/// Larger than `SPILLOVER_RESERVATION` (128 B) so the parent
+/// retains room for slot-table growth + a future emergency
+/// spillover after the merge completes. Tuning past 4 KB rarely
+/// helps; smaller leaves merges flaky under realistic workloads.
+const MERGE_RESERVE: u32 = 0x1000;
 
 /// Deep-clone the subtree rooted at `src_slot` of `src_frame` into
 /// a fresh 512 KB blob keyed by `new_guid`.
@@ -140,6 +148,112 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<CompactStats> {
         old_root,
         new_root,
     })
+}
+
+// ---------- merge primitives ----------
+
+/// Decide whether the child blob beneath `parent_bn_slot` is safe
+/// to fold back into the parent in a single pass.
+///
+/// Returns `true` when **all** of:
+///
+/// 1. The combined data-area usage fits in `PAGE_SIZE` with
+///    `MERGE_RESERVE` headroom (rephrased below as a
+///    child-fits-into-parent-remaining test).
+/// 2. The combined slot-table usage stays under `MAX_SLOTS`.
+/// 3. The child has **no** own `BlobNode` crossings
+///    (`child.num_ext_blobs == 0`) — v0.1 doesn't unfold nested
+///    crossings; a child whose subtree itself spans multiple blobs
+///    needs that handled by a separate pass first.
+/// 4. The child has no tombstoned leaves (`tombstone_leaf_cnt == 0`).
+///    Compact the child first if the workload has just churned
+///    deletes through it; merging tombstone weight is wasted work.
+pub fn is_mergeable(
+    bm: &BufferManager,
+    parent_frame: &BlobFrame<'_>,
+    parent_bn_slot: u16,
+) -> Result<bool> {
+    let bn = read_blob_node(parent_frame, parent_bn_slot)?;
+    let child_pin = bm.pin(bn.child_blob_guid)?;
+    let guard = child_pin.read();
+    let child_frame = BlobFrameRef::wrap(guard.as_slice());
+
+    let parent_h = parent_frame.header();
+    let child_h = child_frame.header();
+
+    let parent_remaining = PAGE_SIZE
+        .saturating_sub(parent_h.space_used)
+        .saturating_sub(MERGE_RESERVE);
+    let child_data_bytes = child_h.space_used.saturating_sub(DATA_AREA_START);
+    let space_ok = child_data_bytes <= parent_remaining;
+
+    let combined_slots = u32::from(parent_h.num_slots) + u32::from(child_h.num_slots);
+    let slots_ok = combined_slots <= MAX_SLOTS;
+
+    let no_grandchild = child_h.num_ext_blobs == 0;
+    let no_tombstones = child_h.tombstone_leaf_cnt == 0;
+
+    Ok(space_ok && slots_ok && no_grandchild && no_tombstones)
+}
+
+/// Inline a child blob's subtree back into its parent, replacing
+/// the cross-blob `BlobNode` crossing with the child's contents.
+///
+/// Reads the child via an exclusive guard, deep-clones the child's
+/// entry-point subtree into `parent_frame` (preserve-mode — caller
+/// should compact the child first if dropping tombstones matters),
+/// optionally wraps the cloned root in the `BlobNode`'s inline
+/// prefix, frees the parent's `BlobNode` slot, and drops the child
+/// blob from the BM. Returns the slot in `parent_frame` where the
+/// inlined subtree's root now lives.
+///
+/// **The caller's responsibility**: rewire the grandparent's
+/// pointer to the returned slot. Typical pattern: a recursive
+/// merge walker that returns the new slot up the chain so each
+/// parent rewires its own child pointer; if `parent_bn_slot` was
+/// the parent's `root_slot`, the caller writes the new slot back
+/// into the parent's header.
+///
+/// `is_mergeable(bm, parent_frame, parent_bn_slot)` should return
+/// `true` before this is called. Calling without that check risks
+/// `OutOfSpace` mid-clone on a too-big merge or wasted work on a
+/// merge that violates the no-nested-crossings precondition.
+pub fn merge_blob(
+    bm: &BufferManager,
+    parent_frame: &mut BlobFrame<'_>,
+    parent_bn_slot: u16,
+) -> Result<u16> {
+    let bn = read_blob_node(parent_frame, parent_bn_slot)?;
+    let child_guid = bn.child_blob_guid;
+    let child_entry_ptr = bn.child_entry_ptr as u16;
+    let plen = (bn.prefix_len as usize).min(BLOB_MAX_INLINE);
+    let prefix_bytes: Vec<u8> = bn.bytes[..plen].to_vec();
+
+    let new_subtree_root = {
+        let child_pin = bm.pin(child_guid)?;
+        let mut child_guard = child_pin.write();
+        let child_frame = BlobFrame::wrap(child_guard.as_mut_slice());
+        clone_subtree(&child_frame, parent_frame, child_entry_ptr, false)?
+            .expect("preserve mode never returns None")
+    };
+
+    let inlined_root = if prefix_bytes.is_empty() {
+        new_subtree_root
+    } else {
+        write_prefix_chain(parent_frame, &prefix_bytes, new_subtree_root)?
+    };
+
+    parent_frame.free_node(parent_bn_slot)?;
+    bm.delete_blob(child_guid)?;
+
+    Ok(inlined_root)
+}
+
+fn read_blob_node(frame: &BlobFrame<'_>, slot: u16) -> Result<BlobNode> {
+    let body = frame.body_of_slot(slot).ok_or(Error::NodeCorrupt {
+        context: "read_blob_node: body resolution failed",
+    })?;
+    Ok(*cast::<BlobNode>(body))
 }
 
 // ---------- clone primitives ----------

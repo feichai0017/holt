@@ -921,6 +921,87 @@ fn compact_collapses_all_tombstoned_tree_to_empty_root() {
 }
 
 #[test]
+fn compact_merges_shrunk_child_blob_back_into_parent() {
+    // Force a spillover with large values, then erase most of the
+    // keys. Compact phase 1 drops the tombstones (child blob's
+    // space_used drops); phase 2 sees the now-small child and
+    // folds it back into the parent, dropping blob_count to 1.
+    let tree = TreeBuilder::new("ignored")
+        .memory()
+        .buffer_pool_size(16)
+        .open()
+        .unwrap();
+    let big = vec![0xCDu8; 4 * 1024];
+    for i in 0..256u32 {
+        tree.put(format!("k{i:08}").as_bytes(), &big).unwrap();
+    }
+    let before = tree.stats().unwrap();
+    assert!(
+        before.blob_count >= 2,
+        "the workload must spill across blobs first (got {} blobs)",
+        before.blob_count,
+    );
+
+    // Drop most of the keys — only a handful of survivors stay.
+    for i in 0..248u32 {
+        tree.delete(format!("k{i:08}").as_bytes()).unwrap();
+    }
+
+    tree.compact().unwrap();
+
+    let after = tree.stats().unwrap();
+    assert_eq!(
+        after.blob_count, 1,
+        "compact must merge the shrunk child blobs back into the root, got blobs={}",
+        after.blob_count,
+    );
+    assert_eq!(after.total_tombstones, 0);
+    // Each surviving key still readable through the public API.
+    for i in 248..256u32 {
+        let v = tree.get(format!("k{i:08}").as_bytes()).unwrap();
+        assert_eq!(v.as_deref(), Some(&big[..]));
+    }
+    // The dropped keys stay gone.
+    for i in 0..248u32 {
+        assert!(tree.get(format!("k{i:08}").as_bytes()).unwrap().is_none());
+    }
+}
+
+#[test]
+fn compact_skips_merge_when_child_blob_still_large() {
+    // Same shape but stop the erases before the child shrinks
+    // enough — combined parent + child should still exceed the
+    // page-size threshold, so phase 2 leaves the BlobNode crossing
+    // alone.
+    let tree = TreeBuilder::new("ignored")
+        .memory()
+        .buffer_pool_size(16)
+        .open()
+        .unwrap();
+    let big = vec![0xEFu8; 4 * 1024];
+    for i in 0..256u32 {
+        tree.put(format!("k{i:08}").as_bytes(), &big).unwrap();
+    }
+    let multi = tree.stats().unwrap();
+    assert!(multi.blob_count >= 2);
+
+    // Compact without any erases — child blobs are still near-full,
+    // so merges should not fire.
+    tree.compact().unwrap();
+
+    let after = tree.stats().unwrap();
+    assert_eq!(
+        after.blob_count, multi.blob_count,
+        "compact must not merge children that are still too large"
+    );
+    // All 256 keys still present.
+    for i in 0..256u32 {
+        let v = tree.get(format!("k{i:08}").as_bytes()).unwrap();
+        assert_eq!(v.as_deref(), Some(&big[..]));
+    }
+}
+
+#[test]
 fn stats_aggregates_across_multi_blob_tree() {
     // Force the tree across blob boundaries with large values.
     let tree = TreeBuilder::new("ignored")
