@@ -1,0 +1,35 @@
+version: 2
+updates:
+  # Rust crate dependencies (Cargo.toml + Cargo.lock).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      # Bundle dev-dep updates together — RocksDB / SQLite / proptest
+      # / criterion bumps don't ship to users, so one combined PR is
+      # less noise than five.
+      dev-deps:
+        dependency-type: "development"
+
+  # GitHub Actions workflow dependencies (uses: actions/*@vX, etc).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "chore(ci)"
+      include: "scope"

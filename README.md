@@ -1,6 +1,17 @@
 # holt
 
+[![Crates.io](https://img.shields.io/crates/v/holt.svg)](https://crates.io/crates/holt)
+[![Docs.rs](https://docs.rs/holt/badge.svg)](https://docs.rs/holt)
+[![CI](https://github.com/feichai0017/holt/actions/workflows/ci.yml/badge.svg)](https://github.com/feichai0017/holt/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.82-blue.svg)](https://github.com/feichai0017/holt/blob/main/Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 > A carefully crafted **adaptive radix tree** for path-shaped metadata.
+
+> ⚠️ **Pre-1.0 (v0.1.0).** The public API is still evolving —
+> minor releases may break source compatibility. Pin the exact
+> version in your `Cargo.toml` (`holt = "=0.1.0"`) until 1.0
+> stabilises the surface.
 
 `holt` is an embedded Rust library for storing **hierarchical
 keys** — file paths, S3 object names, multi-tenant namespaces,
@@ -19,6 +30,15 @@ It targets workloads where:
 It is **not** a general-purpose KV store; if you need full-text or
 vector similarity, reach for the right tool. For this shape, holt
 should beat LMDB / RocksDB / SQLite on its target workload.
+
+## Why "holt"?
+
+A **holt** (Old English *holt*) is a small grove or copse — a
+self-contained collection of trees on a single piece of ground.
+That maps directly to the design: each `holt::Tree` is **one** ART
+made of **many** 512 KB blob frames, bounded and self-contained,
+grown by repeated `splitBlob`. Short to type, distinct from other
+crates, easy to say.
 
 ## When to reach for holt
 

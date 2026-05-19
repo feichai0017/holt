@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# A single release job — publish to crates.io + create a GitHub
+# Release with the relevant CHANGELOG slice. The crates.io token
+# lives in the repo's `Settings → Secrets and variables → Actions`
+# as `CARGO_REGISTRY_TOKEN`.
+permissions:
+  contents: write   # creating GitHub Releases
+
+jobs:
+  publish:
+    name: Publish ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install LLVM (rocksdb dev-dep needs llvm-config)
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - name: Run the full test suite
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Verify the tag matches Cargo.toml's version
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import sys, json; print(json.load(sys.stdin)['packages'][0]['version'])")
+          if [ "$TAG" != "$PKG_VERSION" ]; then
+            echo "Tag v$TAG does not match Cargo.toml version $PKG_VERSION" >&2
+            exit 1
+          fi
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+      - name: Extract the matching CHANGELOG slice
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Pull everything between "## [VERSION]" and the next
+          # top-level "## [" header. `awk` is more portable here
+          # than `sed` ranges across BSD / GNU.
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { p = 1; next }
+            p && $0 ~ "^## \\[" { exit }
+            p { print }
+          ' CHANGELOG.md > release_notes.md
+          echo "notes_path=release_notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: ${{ steps.changelog.outputs.notes_path }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

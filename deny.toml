@@ -1,0 +1,51 @@
+# cargo-deny configuration. Run with `cargo deny check`.
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+no-default-features = false
+
+[advisories]
+# RustSec advisory DB. Yank == bad, vulnerability == fail.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/RustSec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+[licenses]
+# `holt` itself is MIT. The dep graph is mostly MIT / Apache-2.0
+# / BSD-3-Clause / ISC / Unicode-3.0 — the standard permissive
+# set. We refuse copyleft (GPL / LGPL / MPL) without an explicit
+# allow.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Don't let two semver-incompatible major versions of the same
+# crate end up in the build at once — usually a sign of a stale
+# transitive that should be bumped.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+# Only allow deps from crates.io. Any git / path dep is a yellow
+# flag for a published library — usually a sign that something
+# slipped in unintentionally.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
