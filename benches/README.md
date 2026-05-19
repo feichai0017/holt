@@ -19,9 +19,10 @@ Each scenario runs three operations:
 - `*_put` — random key replacement (in-place update)
 - `*_mixed` — 50% get / 50% put, key chosen at random
 
-`N_KEYS = 10 000` — large enough that the data spreads across
-**multiple holt blobs** (~3–4 × 512 KB), so the bench exercises
-`BlobNode` crossings rather than single-blob descent.
+`N_KEYS = 20 000` — large enough that the data spreads across
+**multiple holt blobs** (~6–8 × 512 KB), so the bench exercises
+`BlobNode` crossings + cross-blob spillover/compact retries, not
+just single-blob descent.
 
 ## Running
 
@@ -70,7 +71,7 @@ crash, not a power failure" mode high-throughput services target:
 - **SQLite**: file-backed DB, `journal_mode=WAL`,
   `synchronous=NORMAL`, 64 MB page cache.
 
-Shared settings: 10 000 unique keys preloaded; bench iterates a
+Shared settings: 20 000 unique keys preloaded; bench iterates a
 seeded permutation of that set; `cargo bench` builds with
 `lto="thin"`, `codegen-units=1`, `opt-level=3`; single-threaded.
 
@@ -100,14 +101,7 @@ hierarchical, prefix-rich keys; if your keys are random bytes
    to OS page cache only. A real `fsync`-per-op workload is
    fsync-bound (~1–3 ms on consumer SSD) and overwhelms every
    engine's algorithm cost.
-3. **`kv` may surface a holt corner case at much larger N.**
-   At `N_KEYS = 20 000` random keys the bench reproducibly hits
-   a walker `NodeCorrupt: invalid slot` panic during the second
-   preload of a fresh tree (likely a spillover-victim selection
-   edge case under repeat-random-key pressure). The current
-   `N_KEYS = 10 000` runs clean; the higher-N reproducer is
-   tracked as a follow-up.
-4. **Bench numbers are machine-dependent.** Don't take any
+3. **Bench numbers are machine-dependent.** Don't take any
    absolute throughput claim from this README at face value —
    re-run on your hardware. The relative ordering (holt wins on
    path-shaped, loses on random-kv) is the load-bearing

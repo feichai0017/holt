@@ -4,7 +4,7 @@
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{leaf_extent_size, BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
-use crate::store::{BlobFrame, BufferManager};
+use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
 
 use super::cast;
 use super::readers::{longest_common, ntype_of, read_leaf_kv, read_prefix};
@@ -437,7 +437,7 @@ fn insert_at_blob_node(
     }
 
     let child_guid = bn.child_blob_guid;
-    let child_entry = bn.child_entry_ptr as u16;
+    let mut child_entry = bn.child_entry_ptr as u16;
     let child_depth = depth + plen;
 
     // Pin the child blob in the BM cache for the duration of the
@@ -469,6 +469,20 @@ fn insert_at_blob_node(
                         let mut guard = child_pin.write();
                         compact_blob(&mut guard)?;
                     }
+                    // `compact_blob` rebuilds the child blob in
+                    // place and renumbers every slot index — the
+                    // entry slot we cached from the parent's
+                    // `BlobNode.child_entry_ptr` is now stale.
+                    // Re-pick it from the child's freshly-written
+                    // `header.root_slot` so the next retry walks
+                    // a valid slot. (The parent's BlobNode pointer
+                    // gets refreshed below after the loop exits via
+                    // the `slot_after` rewire.)
+                    child_entry = {
+                        let guard = child_pin.read();
+                        let cf = BlobFrameRef::wrap(guard.as_slice());
+                        cf.header().root_slot
+                    };
                 }
                 Err(e) => {
                     last_err = Some(e);

@@ -1248,3 +1248,44 @@ fn range_prefix_plus_start_after_combines() {
     let got = collect_keys(tree.range().prefix(b"img/").start_after(b"img/02"));
     assert_eq!(got, vec![b"img/03".to_vec(), b"img/04".to_vec()]);
 }
+
+#[test]
+fn random_kv_insert_after_child_blob_compact_stays_consistent() {
+    // Regression for the spillover NodeCorrupt at N≈10k random KV.
+    //
+    // Pattern: insert random 32-byte keys until the workload spills
+    // across multiple blobs; eventually a child blob OOMs, the
+    // `insert_at_blob_node` retry loop runs spillover_blob +
+    // compact_blob on the child, the compact renumbers slots, and
+    // before the fix the retry then walked through the stale
+    // cached `child_entry` (from the parent's BlobNode) into a
+    // slot that no longer exists -> "walker: invalid slot".
+    //
+    // The fix in `insert_at_blob_node` re-reads `child_entry` from
+    // the child's freshly-rewritten `header.root_slot` after
+    // compact_blob, so the retry descends through a live slot.
+    use rand::{rngs::StdRng, RngCore, SeedableRng};
+    let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_CAFE_BABE);
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..20_000)
+        .map(|_| {
+            let mut k = vec![0u8; 32];
+            let mut v = vec![0u8; 64];
+            rng.fill_bytes(&mut k);
+            rng.fill_bytes(&mut v);
+            (k, v)
+        })
+        .collect();
+
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    for (i, (k, v)) in pairs.iter().enumerate() {
+        tree.put(k, v).unwrap_or_else(|e| {
+            panic!("put #{i} failed: {e:?}");
+        });
+    }
+    // Spot-check a few keys come back intact through the same
+    // multi-blob tree.
+    for &i in &[0usize, 5000, 12345, 19_999] {
+        let (k, v) = &pairs[i];
+        assert_eq!(tree.get(k).unwrap().as_deref(), Some(v.as_slice()));
+    }
+}

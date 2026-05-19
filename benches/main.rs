@@ -56,7 +56,7 @@ use rocksdb::{Options, WriteOptions, DB};
 
 /// Dataset size — large enough to spread across ≈ 5–7 holt blobs
 /// for the kv/objstore/fs shapes (≈ 100 B/leaf amortised).
-const N_KEYS: usize = 10_000;
+const N_KEYS: usize = 20_000;
 const KV_KEY_LEN: usize = 32;
 const KV_VAL_LEN: usize = 64;
 
