@@ -27,9 +27,14 @@ It targets workloads where:
 - Latency is **micro-critical** — no LSM compaction stalls, no
   single-writer locks.
 
-It is **not** a general-purpose KV store; if you need full-text or
-vector similarity, reach for the right tool. For this shape, holt
-should beat LMDB / RocksDB / SQLite on its target workload.
+It is **not** a general-purpose KV store; if you need full-text
+or vector similarity, reach for the right tool. For this shape,
+holt beats LMDB / RocksDB / SQLite cleanly on point lookup and
+prefix scan at every dataset size we test through 2 M keys. On
+random point writes with a working set well past the buffer pool
+(~200 MB+), LSM-style write amortization in RocksDB starts to
+edge ahead — see [`benches/RESULTS.md`](benches/RESULTS.md) for
+the honest scale-curve numbers.
 
 ## Why "holt"?
 

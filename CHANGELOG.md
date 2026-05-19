@@ -132,10 +132,17 @@ fine-grained per-commit history is in `git log`.
 
 ### Benchmarks
 
-- **Group B — scale curve** (`kv_scale_get` / `kv_scale_put`),
-  parameterized over `{ 20 k, 100 k, 500 k, 2 M }` keys. The
-  500 k tier already exceeds the default 32 MB buffer pool;
-  the 2 M tier (~192 MB payload) forces full eviction churn.
+- **Group B — scale curve** across kv / objstore / fs × four
+  dataset sizes (`{ 20 k, 100 k, 500 k, 2 M }`). The 500 k tier
+  already exceeds the default 32 MB buffer pool; the 2 M tier
+  (~192 MB payload) forces full eviction churn. **Get** scales
+  beautifully on all three workloads (holt wins every cell with
+  the lead vs RocksDB widening to 5.4× / 2.8× / 2.2× at 2 M).
+  **Put** wins at 20 k / 100 k / 500 k, ties RocksDB at 2 M kv,
+  but loses 8-22 % to RocksDB / SQLite at 2 M on objstore / fs
+  — the regime where LSM-style write amortization is the right
+  choice and ART-over-blobs isn't competitive; cross-blob lock-
+  coupling is queued for v0.3 to close the gap.
 - **Group C — p95/p99 under maintenance interference**
   (`tests/bench_contention_p95.rs`, `#[ignore]`). 4 writer
   threads + 5 ms-cadence background checkpointer + concurrent

@@ -609,14 +609,66 @@ fn gen_kv_dataset_sized(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
-fn bench_scale_get(c: &mut Criterion) {
+/// S3-shape dataset of arbitrary size, preserving the
+/// 32-buckets fan-out so the prefix-sharing characteristic
+/// stays constant across tiers (more files per bucket at
+/// larger tiers = deeper subtrees, but the same number of
+/// distinct top-level prefixes).
+fn gen_objstore_dataset_sized(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let buckets = OBJSTORE_BUCKETS;
+    let files_per_bucket = n.div_ceil(buckets);
+    let mut pairs = Vec::with_capacity(buckets * files_per_bucket);
+    for b in 0..buckets {
+        for f in 0..files_per_bucket {
+            let key = format!("bucket-{b:02}/path/sub/file-{f:06}.bin").into_bytes();
+            let value = format!(
+                "{{\"size\":{:08},\"etag\":\"{:08x}\",\"class\":\"STD\"}}",
+                f * 1000 + b * 100,
+                (b.wrapping_mul(1000).wrapping_add(f)) as u32,
+            )
+            .into_bytes();
+            pairs.push((key, value));
+        }
+    }
+    pairs.truncate(n);
+    pairs
+}
+
+/// POSIX-fs-shape dataset of arbitrary size, 16 directories
+/// fan-out preserved.
+fn gen_fs_dataset_sized(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let dirs = FS_DIRS;
+    let files_per_dir = n.div_ceil(dirs);
+    let mut pairs = Vec::with_capacity(dirs * files_per_dir);
+    for d in 0..dirs {
+        for f in 0..files_per_dir {
+            let key = format!("/usr/local/share/category-{d}/file-{f:06}").into_bytes();
+            let mut value = Vec::with_capacity(32);
+            value.extend_from_slice(&((f as u64) * 1024).to_le_bytes());
+            value.extend_from_slice(&(1_700_000_000u64 + f as u64).to_le_bytes());
+            value.extend_from_slice(&0o644u32.to_le_bytes());
+            value.extend_from_slice(&1000u32.to_le_bytes());
+            value.extend_from_slice(&1000u32.to_le_bytes());
+            value.extend_from_slice(&1u32.to_le_bytes());
+            pairs.push((key, value));
+        }
+    }
+    pairs.truncate(n);
+    pairs
+}
+
+fn bench_scale_get_workload(
+    c: &mut Criterion,
+    name: &str,
+    gen: impl Fn(usize) -> Vec<(Vec<u8>, Vec<u8>)>,
+) {
     use criterion::BenchmarkId;
 
-    let mut group = c.benchmark_group("kv_scale_get");
+    let mut group = c.benchmark_group(format!("{name}_scale_get"));
     group.throughput(Throughput::Elements(1));
 
     for &n in SCALE_SIZES {
-        let pairs = gen_kv_dataset_sized(n);
+        let pairs = gen(n);
         let key_count = pairs.len();
 
         let holt = make_holt();
@@ -671,14 +723,18 @@ fn bench_scale_get(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_scale_put(c: &mut Criterion) {
+fn bench_scale_put_workload(
+    c: &mut Criterion,
+    name: &str,
+    gen: impl Fn(usize) -> Vec<(Vec<u8>, Vec<u8>)>,
+) {
     use criterion::BenchmarkId;
 
-    let mut group = c.benchmark_group("kv_scale_put");
+    let mut group = c.benchmark_group(format!("{name}_scale_put"));
     group.throughput(Throughput::Elements(1));
 
     for &n in SCALE_SIZES {
-        let pairs = gen_kv_dataset_sized(n);
+        let pairs = gen(n);
         let key_count = pairs.len();
 
         let holt = make_holt();
@@ -1046,8 +1102,15 @@ fn fs_benches(c: &mut Criterion) {
 }
 
 fn scale_benches(c: &mut Criterion) {
-    bench_scale_get(c);
-    bench_scale_put(c);
+    // kv = random 32-byte keys (ART anti-pattern, no prefix sharing)
+    bench_scale_get_workload(c, "kv", gen_kv_dataset_sized);
+    bench_scale_put_workload(c, "kv", gen_kv_dataset_sized);
+    // objstore = S3-shape path keys with ~30-byte shared prefix per bucket
+    bench_scale_get_workload(c, "objstore", gen_objstore_dataset_sized);
+    bench_scale_put_workload(c, "objstore", gen_objstore_dataset_sized);
+    // fs = POSIX paths with very long common prefix per directory
+    bench_scale_get_workload(c, "fs", gen_fs_dataset_sized);
+    bench_scale_put_workload(c, "fs", gen_fs_dataset_sized);
 }
 
 criterion_group!(
