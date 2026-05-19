@@ -63,7 +63,7 @@ impl TreeBuilder {
         self
     }
 
-    /// Background checkpointer policy (v0.2).
+    /// Background checkpointer policy.
     ///
     /// Default is disabled — callers drive
     /// [`Tree::checkpoint`] synchronously. Pass

@@ -4,7 +4,6 @@
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
-use crate::store::backend::Backend;
 use std::sync::Arc;
 
 use crate::store::{BlobFrame, BufferManager, CachedBlob};
@@ -32,7 +31,9 @@ use super::writers::{
 /// the tree, `previous` is `None` and `new_root_slot == root_slot`.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<EraseOutcome> {
-    let r = erase_at(None, frame, root_slot, key, 0)?;
+    // Single-blob path passes `None` for `bm`, which rejects the
+    // BlobNode arm — so the `seq` argument is dead. Pass `0`.
+    let r = erase_at(None, frame, root_slot, key, 0, 0)?;
     let new_root = resolve_new_root_after_erase(frame, root_slot, &r.signal)?;
     Ok(EraseOutcome {
         new_root_slot: new_root,
@@ -49,6 +50,7 @@ pub fn erase_multi(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
     key: &[u8],
+    seq: u64,
 ) -> Result<EraseOutcome> {
     // The caller (typically `Tree`) keeps `root_pin` alive across
     // every op so we skip `BufferManager`'s pin-Mutex on the hot
@@ -56,12 +58,17 @@ pub fn erase_multi(
     //
     // One continuous exclusive critical section — see
     // `insert_multi` for why per-phase guard drops would race.
+    //
+    // `seq` is the WAL seq the caller pre-allocated for this op;
+    // every child blob the walker mutates gets a corresponding
+    // `bm.mark_dirty(child_guid, seq)` so the checkpoint round
+    // flushes WAL **before** the child bytes reach the backend.
     let mut guard = root_pin.write();
 
     let r = {
         let mut frame = BlobFrame::wrap(guard.as_mut_slice());
         let root_slot = frame.header().root_slot;
-        erase_at(Some(bm), &mut frame, root_slot, key, 0)?
+        erase_at(Some(bm), &mut frame, root_slot, key, 0, seq)?
     };
     let new_root = {
         let mut frame = BlobFrame::wrap(guard.as_mut_slice());
@@ -104,6 +111,7 @@ pub(super) fn erase_at(
     slot: u16,
     key: &[u8],
     depth: usize,
+    seq: u64,
 ) -> Result<EraseReturn> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
     match ntype {
@@ -115,12 +123,12 @@ pub(super) fn erase_at(
             previous: None,
         }),
         NodeType::Leaf => erase_at_leaf(frame, slot, key),
-        NodeType::Prefix => erase_at_prefix(bm, frame, slot, key, depth),
+        NodeType::Prefix => erase_at_prefix(bm, frame, slot, key, depth, seq),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            erase_at_inner(bm, frame, slot, ntype, key, depth)
+            erase_at_inner(bm, frame, slot, ntype, key, depth, seq)
         }
         NodeType::Blob => match bm {
-            Some(b) => erase_at_blob_node(b, frame, slot, key, depth),
+            Some(b) => erase_at_blob_node(b, frame, slot, key, depth, seq),
             None => Err(Error::NotYetImplemented(
                 "walker::erase_at: BlobNode crossing requires BufferManager — use erase_multi",
             )),
@@ -179,6 +187,7 @@ fn erase_at_prefix(
     pfx_slot: u16,
     key: &[u8],
     depth: usize,
+    seq: u64,
 ) -> Result<EraseReturn> {
     let p = read_prefix(frame.as_ref(), pfx_slot)?;
     let plen = p.prefix_len as usize;
@@ -192,7 +201,7 @@ fn erase_at_prefix(
         });
     }
 
-    let r = erase_at(bm, frame, child_slot, key, depth + plen)?;
+    let r = erase_at(bm, frame, child_slot, key, depth + plen, seq)?;
     match r.signal {
         EraseSignal::Unchanged => Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
@@ -222,6 +231,7 @@ fn erase_at_inner(
     ntype: NodeType,
     key: &[u8],
     depth: usize,
+    seq: u64,
 ) -> Result<EraseReturn> {
     if depth >= key.len() {
         return Ok(EraseReturn {
@@ -237,7 +247,7 @@ fn erase_at_inner(
         });
     };
 
-    let r = erase_at(bm, frame, child, key, depth + 1)?;
+    let r = erase_at(bm, frame, child, key, depth + 1, seq)?;
     match r.signal {
         EraseSignal::Unchanged => Ok(EraseReturn {
             signal: EraseSignal::Unchanged,
@@ -444,6 +454,7 @@ fn erase_at_blob_node(
     bn_slot: u16,
     key: &[u8],
     depth: usize,
+    seq: u64,
 ) -> Result<EraseReturn> {
     let bn = {
         let body = parent_frame
@@ -476,13 +487,26 @@ fn erase_at_blob_node(
     let r = {
         let mut guard = child_pin.write();
         let mut cf = BlobFrame::wrap(guard.as_mut_slice());
-        erase_at(Some(bm), &mut cf, child_entry, key, child_depth)?
+        erase_at(Some(bm), &mut cf, child_entry, key, child_depth, seq)?
     };
+
+    // Mark the child blob dirty when the descent actually mutated
+    // its cached image (any non-`Unchanged-with-no-previous`
+    // outcome). The bg checkpointer / `Tree::checkpoint` will
+    // flush the bytes to backend **after** the WAL record for
+    // this op is on disk (invariant W2D — see `BufferManager`
+    // module docs). An inline `bm.commit(child_guid)` here would
+    // let child bytes reach backend before the WAL record,
+    // breaking the invariant.
+    let child_touched = matches!(r.signal, EraseSignal::Replaced(_))
+        || (matches!(r.signal, EraseSignal::Unchanged) && r.previous.is_some());
 
     match r.signal {
         EraseSignal::Unchanged => {
             drop(child_pin);
-            bm.commit(child_guid)?;
+            if child_touched {
+                bm.mark_dirty(child_guid, seq);
+            }
             Ok(EraseReturn {
                 signal: EraseSignal::Unchanged,
                 previous: r.previous,
@@ -498,7 +522,7 @@ fn erase_at_blob_node(
             new_bn.child_entry_ptr = u32::from(new_entry);
             write_struct_to_slot(parent_frame, bn_slot, &new_bn)?;
             drop(child_pin);
-            bm.commit(child_guid)?;
+            bm.mark_dirty(child_guid, seq);
             Ok(EraseReturn {
                 signal: EraseSignal::Unchanged,
                 previous: r.previous,
@@ -507,7 +531,18 @@ fn erase_at_blob_node(
         EraseSignal::SubtreeGone => {
             parent_frame.free_node(bn_slot)?;
             drop(child_pin);
-            bm.delete_blob(child_guid)?;
+            // Hand the child blob to the deferred-delete protocol
+            // — the actual `backend.delete_blob` runs from the
+            // checkpoint round after the WAL record for this op
+            // is durable (invariant W2D). An inline
+            // `bm.delete_blob(child_guid)` here would drop the
+            // manifest's child entry to in-memory before the
+            // user's WAL append; a racing `backend.flush` from
+            // any other op could then persist that manifest view
+            // while the user's erase record was still unflushed,
+            // and on crash + reopen the root's `BlobNode` would
+            // point at a slot the manifest no longer recognises.
+            bm.mark_for_delete(child_guid, seq);
             Ok(EraseReturn {
                 signal: EraseSignal::SubtreeGone,
                 previous: r.previous,

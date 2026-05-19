@@ -23,10 +23,10 @@ use crate::checkpoint::CheckpointConfig;
 pub enum Storage {
     /// File-backed durable storage at `dir`. On Linux the
     /// [`crate::PersistentBackend`] opens the underlying file with
-    /// `O_DIRECT` and (in Stage 7) drives I/O through `io_uring`.
+    /// `O_DIRECT` and (with the `io-uring` feature enabled) drives
+    /// I/O through `io_uring`.
     Persistent {
-        /// Directory holding `blobs.dat` + `manifest.bin` (+ WAL,
-        /// once Stage 5 lands).
+        /// Directory holding `blobs.dat` + `manifest.bin` + `journal.wal`.
         dir: PathBuf,
     },
     /// In-memory only — volatile, drops on the last `Tree` handle.
@@ -39,7 +39,7 @@ pub struct TreeConfig {
     /// Where the tree's data lives.
     pub storage: Storage,
     /// How many 512 KB blob frames to keep pinned in the buffer
-    /// pool (Stage 6). Default 64 (= 32 MB resident).
+    /// pool. Default 64 (= 32 MB resident).
     pub buffer_pool_size: usize,
     /// Controls the WAL durability boundary on every `put` /
     /// `delete` / `rename`:
@@ -58,8 +58,8 @@ pub struct TreeConfig {
     /// per-op durability flip this to `true`.
     pub wal_sync_on_commit: bool,
     /// Bytes appended to the WAL before triggering an automatic
-    /// checkpoint. Reserved — Stage 5d's auto-flush bounds the
-    /// in-memory buffer; the user is still responsible for
+    /// checkpoint. Reserved — the WAL writer's auto-flush bounds
+    /// the in-memory buffer; the user is still responsible for
     /// calling `Tree::checkpoint` to truncate the on-disk log.
     /// Default 16 MB.
     pub checkpoint_byte_interval: u64,
@@ -76,7 +76,7 @@ pub struct TreeConfig {
     /// WAL is the per-op durability path and the blob image only
     /// flushes at `Tree::checkpoint`. See [`Self::wal_sync_on_commit`].
     pub flush_on_write: bool,
-    /// Background checkpointer policy (v0.2). Default disabled —
+    /// Background checkpointer policy. Default disabled —
     /// callers drive [`crate::Tree::checkpoint`] synchronously.
     /// Enable via [`CheckpointConfig::enabled`] or
     /// [`crate::TreeBuilder::checkpoint`].

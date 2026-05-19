@@ -24,15 +24,15 @@
 //!
 //! One [`UringContext`] per [`super::PersistentBackend`]. The
 //! backend wraps it in a `Mutex` so multiple writers serialise on
-//! the submission queue. With a single I/O worker thread (v0.2's
-//! `holt-ckpt-io`) the lock is uncontended on the hot path.
+//! the submission queue. With a single I/O worker thread
+//! (`holt-ckpt-io`) the lock is uncontended on the hot path.
 //!
 //! ## SQE depth
 //!
 //! `RING_DEPTH = 8` — comfortably accommodates one submit + one
-//! completion at a time plus head-room for future batching (v0.3
-//! will explore SQE-batched flushes once the planner can prepare a
-//! whole snapshot of dirty blobs in one go).
+//! completion at a time plus head-room for batched flushes once
+//! the planner can prepare a whole snapshot of dirty blobs in
+//! one go.
 
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -40,7 +40,8 @@ use std::os::unix::io::AsRawFd;
 use io_uring::{opcode, types, IoUring};
 
 /// Number of SQEs / CQEs the ring is sized for. Each blob is one
-/// SQE today; v0.3's batched-flush mode will saturate this.
+/// SQE today; the depth has head-room for a future batched-flush
+/// mode that submits a whole dirty-set in one go.
 const RING_DEPTH: u32 = 8;
 
 /// Owns a single `io_uring` plus the `RawFd` of the file we

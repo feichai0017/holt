@@ -56,9 +56,9 @@ use super::txn::{BatchOp, TxnBatch};
 pub struct Tree {
     cfg: TreeConfig,
     backend: Arc<BufferManager>,
-    /// GUID of the blob holding the tree root. v0.1 uses a fixed
-    /// sentinel; multi-tenant trees (post-v0.1) will allocate
-    /// per-tree root GUIDs from a manifest.
+    /// GUID of the blob holding the tree root. Currently a fixed
+    /// sentinel; a multi-tenant manifest could allocate per-tree
+    /// root GUIDs in the future.
     root_guid: BlobGuid,
     /// Cached pin on the root blob — held for the life of this
     /// `Tree` handle so every `get` / `put` / `delete` / `rename`
@@ -82,8 +82,7 @@ pub struct Tree {
     /// Background checkpointer handle. `Some` iff
     /// `cfg.checkpoint.enabled`. Shared via `Arc` so the thread
     /// shuts down on the **last** `Tree` clone's drop, not the
-    /// first.
-    #[allow(dead_code)]
+    /// first. Exposed to `Tree::stats` for counter readout.
     checkpointer: Option<Arc<crate::checkpoint::Checkpointer>>,
 }
 
@@ -96,8 +95,8 @@ impl std::fmt::Debug for Tree {
     }
 }
 
-/// Fixed GUID of the root blob in v0.1. Multi-root trees
-/// (post-v0.1) will allocate per-tree root GUIDs from a manifest.
+/// Fixed GUID of the root blob (single-tree mode). A future
+/// multi-tenant manifest could allocate per-tree root GUIDs.
 pub(crate) const ROOT_BLOB_GUID: BlobGuid = [0; 16];
 
 /// Append the engine's internal terminator byte (`\0`) to a
@@ -193,7 +192,7 @@ impl Tree {
         // shares the pin via `Arc::clone`.
         let root_pin = bm.pin(root_guid)?;
 
-        // Spawn the v0.2 background checkpointer if opted-in.
+        // Spawn the background checkpointer if opted-in.
         // `Checkpointer::spawn` returns `None` for disabled
         // configs, so the `Option` chain stays clean.
         let checkpointer = crate::checkpoint::Checkpointer::spawn(
@@ -243,12 +242,14 @@ impl Tree {
     /// involvement.
     ///
     /// Mutates the BM-pinned root buffer in place under an
-    /// exclusive write guard; the durable write to the inner
-    /// backend happens when `flush_on_write` is `true` (the
-    /// default) via [`BufferManager::commit`]. Newly-created child
-    /// blobs are **always** written through the backend at the
-    /// moment of spillover, so crash-recovery never finds a
-    /// dangling `BlobNode` pointing at nothing.
+    /// exclusive write guard. Cross-blob mutations (descent into
+    /// a child blob, spillover creating a new child) stage their
+    /// changes via `mark_dirty` / `install_new_blob`; the durable
+    /// write to the inner backend happens when the WAL record
+    /// covering this op is on disk — driven either by the
+    /// background checkpoint round or by [`Tree::checkpoint`].
+    /// Per-op `flush_on_write` mode drains the dirty set inline
+    /// after the WAL append.
     ///
     /// [`BlobNode`]: crate::layout::BlobNode
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -286,11 +287,13 @@ impl Tree {
             }
         } else if self.cfg.flush_on_write {
             // No WAL (memory mode, or backend supplied by user).
-            // `flush_on_write` still pushes the BM root through
-            // its `Backend`'s write-through path so callers that
-            // want per-op durability against a custom backend
-            // keep getting it.
-            self.backend.commit(self.root_guid)?;
+            // `flush_on_write` still pushes the BM through its
+            // `Backend`'s write-through path so callers that want
+            // per-op durability against a custom backend keep
+            // getting it. The walker may have dirtied child blobs
+            // too (spillover, cross-blob descent), so drain the
+            // full dirty set rather than just the root.
+            self.flush_dirty_inline()?;
         }
         Ok(outcome.previous)
     }
@@ -300,22 +303,31 @@ impl Tree {
     ///
     /// Walks across [`BlobNode`] crossings. When a child blob
     /// becomes empty as a result of the erase, its parent's
-    /// `BlobNode` is freed and the orphaned child blob is dropped
-    /// from cache + the inner backend — no GC pass needed.
+    /// `BlobNode` is freed and the orphaned child blob is queued
+    /// for deferred deletion via the BM — the actual
+    /// `backend.delete_blob` runs from the checkpoint round
+    /// after the WAL record covering this erase is durable
+    /// (invariant W2D).
     ///
     /// [`BlobNode`]: crate::layout::BlobNode
     pub fn delete(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
-        // No Tree-wide lock — per-blob `HybridLatch` exclusive on
-        // the root serialises concurrent `delete` / `put` calls.
-        let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded)?;
+        // Pre-allocate the seq before the walker descends so any
+        // child blob the walker touches can `mark_dirty(child, seq)`
+        // — invariant W2D (see `BufferManager` module docs) demands
+        // a single seq for the whole op across all blobs it dirties.
+        // A no-op delete (key absent) still burns the seq; that's
+        // fine — `next_seq` is monotonic and the unused seq doesn't
+        // appear in any WAL record or dirty entry.
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
+        let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded, seq)?;
 
         if let Some(wal) = &self.wal {
             if let Some(prev) = &outcome.previous {
-                let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-                // Only mark dirty on an actual erase — a no-op
-                // delete (key absent) leaves the cached image
-                // byte-identical to the backend.
+                // Only mark the **root** dirty on an actual erase
+                // — a no-op delete (key absent) leaves the root
+                // image byte-identical to the backend, and the
+                // walker already mark_dirty'd any child it touched.
                 self.backend.mark_dirty(self.root_guid, seq);
                 let mut w = wal.lock().unwrap();
                 // Fast-path: skips the `TxnOp::Erase` enum's
@@ -328,10 +340,18 @@ impl Tree {
             // No-op delete (key wasn't there) is not logged.
         } else if self.cfg.flush_on_write {
             if outcome.previous.is_some() {
-                let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
                 self.backend.mark_dirty(self.root_guid, seq);
             }
-            self.backend.commit(self.root_guid)?;
+            // Flush every blob the walker touched (root + any
+            // children) — no WAL means this is the sole durability
+            // path. snapshot_dirty drains all entries; we commit
+            // each through the backend.
+            self.flush_dirty_inline()?;
+            // Plus drain any deferred deletes the SubtreeGone path
+            // queued — the cache image of those children is gone,
+            // but the backend slot is still alive until we apply
+            // `backend.delete_blob`.
+            self.flush_pending_deletes_inline()?;
         }
         Ok(outcome.previous)
     }
@@ -345,11 +365,10 @@ impl Tree {
     ///   overwritten.
     ///
     /// Atomic with respect to other renames (`rename_lock` is held
-    /// for the whole sequence). Concurrent `put`/`delete` on
-    /// disjoint subtrees are not blocked. Stage 5 (WAL) will swap
-    /// the multi-step path for a dedicated `RenameTxnOp` so the
-    /// child-blob writes between erase and insert commit as one
-    /// journal record.
+    /// for the whole sequence). Concurrent `put` / `delete` on
+    /// disjoint subtrees are not blocked. The op emits a single
+    /// `RenameObject` WAL record so its erase + insert phases
+    /// recover atomically on replay.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
         let src_padded = pad_key(src);
         let dst_padded = pad_key(dst);
@@ -373,8 +392,14 @@ impl Tree {
         }
 
         // erase(src) + insert(dst, value). Both walk through
-        // `BlobNode` crossings and commit any touched child blobs.
-        engine::erase_multi(&self.backend, &self.root_pin, &src_padded)?;
+        // `BlobNode` crossings; any child blob the walker mutates
+        // gets `mark_dirty(child_guid, seq)` so the checkpoint
+        // round flushes them under invariant W2D (WAL-before-data).
+        // Sharing one `seq` across both phases keeps the rename
+        // atomic from the dirty-tracking perspective — failing
+        // halfway leaves a coherent partial-dirty set rather than
+        // two separately-staged ops.
+        engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq)?;
         engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq)?;
         // Both walker calls mutated the root blob's cached image.
         self.backend.mark_dirty(self.root_guid, seq);
@@ -388,7 +413,11 @@ impl Tree {
                 w.flush()?;
             }
         } else if self.cfg.flush_on_write {
-            self.backend.commit(self.root_guid)?;
+            // Walker may have dirtied child blobs across the
+            // erase + insert sequence — drain the full set.
+            // The erase half can also queue SubtreeGone deletes.
+            self.flush_dirty_inline()?;
+            self.flush_pending_deletes_inline()?;
         }
         Ok(())
     }
@@ -491,7 +520,12 @@ impl Tree {
                 w.flush()?;
             }
         } else if self.cfg.flush_on_write {
-            self.backend.commit(self.root_guid)?;
+            // Every inner op may have dirtied root + cross-blob
+            // children — drain the whole set rather than just the
+            // root. Inner deletes/renames may also have queued
+            // SubtreeGone deferred deletes.
+            self.flush_dirty_inline()?;
+            self.flush_pending_deletes_inline()?;
         }
         Ok(())
     }
@@ -518,6 +552,65 @@ impl Tree {
         RangeBuilder::new(Arc::clone(&self.backend), self.root_guid)
     }
 
+    /// Drain the BM dirty map and synchronously commit each entry
+    /// through the inner backend.
+    ///
+    /// Used by:
+    /// - The no-WAL `flush_on_write` path, where every op must
+    ///   reach backend before returning (no checkpointer to defer
+    ///   to).
+    /// - `Tree::checkpoint`, where the user explicitly asks for a
+    ///   full-tree durability barrier.
+    ///
+    /// `snapshot_dirty` atomically drains the map; concurrent
+    /// `mark_dirty` calls land in the fresh empty map and stay
+    /// tracked for the next round. `BufferManager::commit` writes
+    /// the cached image through and clears the dirty entry on
+    /// success (or restores it on failure so a future flush retries).
+    fn flush_dirty_inline(&self) -> Result<()> {
+        let snap = self.backend.snapshot_dirty();
+        for guid in snap.into_keys() {
+            self.backend.commit(guid)?;
+        }
+        Ok(())
+    }
+
+    /// Drain the BM pending-delete queue and apply each
+    /// `backend.delete_blob` synchronously.
+    ///
+    /// Companion to [`Self::flush_dirty_inline`] for the deferred
+    /// delete protocol — `erase` ops that emptied a child blob
+    /// stage the delete here so the manifest mutation can't reach
+    /// disk before the WAL record covering the erase is durable
+    /// (invariant W2D).
+    ///
+    /// Must run **after** `flush_dirty_inline` (any new bytes in
+    /// dirty land first) and **before** the trailing
+    /// `backend.flush` (which persists the manifest deletion).
+    /// Restoration is automatic on individual failures — the
+    /// remaining entries stay queued for the next attempt.
+    fn flush_pending_deletes_inline(&self) -> Result<()> {
+        let pending = self.backend.snapshot_pending_deletes();
+        let mut failed: std::collections::HashMap<BlobGuid, u64> =
+            std::collections::HashMap::new();
+        let mut first_err: Option<Error> = None;
+        for (guid, seq) in pending {
+            if let Err(e) = self.backend.execute_pending_delete(guid) {
+                failed.insert(guid, seq);
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        if !failed.is_empty() {
+            self.backend.restore_pending_deletes(failed);
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(())
+    }
+
     fn apply_put_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<TxnOp> {
         let padded = pad_key(key);
         let outcome = engine::insert_multi(&self.backend, &self.root_pin, &padded, value, seq)?;
@@ -533,7 +626,7 @@ impl Tree {
 
     fn apply_delete_inner(&self, key: &[u8], seq: u64) -> Result<Option<TxnOp>> {
         let padded = pad_key(key);
-        let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded)?;
+        let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded, seq)?;
         if outcome.previous.is_some() {
             // Only an actual erase mutated bytes; the no-op path
             // leaves the cached image byte-identical to backend.
@@ -558,7 +651,7 @@ impl Tree {
             {
                 return Err(Error::DstExists);
             }
-            engine::erase_multi(&self.backend, &self.root_pin, &src_padded)?;
+            engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq)?;
             engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq)?;
             self.backend.mark_dirty(self.root_guid, seq);
         }
@@ -575,14 +668,24 @@ impl Tree {
     /// the WAL.
     ///
     /// Sequence:
-    /// 1. Flush every buffered WAL record (`sync_data` on the log).
-    /// 2. Write the BM-cached root blob through to the inner
-    ///    backend.
-    /// 3. `flush` the backend (`fdatasync` on persistent; no-op on
-    ///    memory).
-    /// 4. Truncate the WAL — its records are now redundant with
-    ///    the freshly-durable blob image, so the next replay
-    ///    starts from an empty log.
+    /// 1. Flush every buffered WAL record (`sync_data` on the log)
+    ///    — invariant W2D: WAL must be durable before any byte
+    ///    that mirrors a record reaches the data file.
+    /// 2. Drain the BM dirty set and write each entry through to
+    ///    the inner backend. Covers both the root and any
+    ///    cross-blob children the walker has touched since the
+    ///    last checkpoint.
+    /// 3. Drain the BM pending-delete set and apply each
+    ///    `backend.delete_blob` (manifest mutation, in-memory).
+    ///    Must follow step 2 so any final bytes for a soon-deleted
+    ///    blob are NOT written through (the slot is about to be
+    ///    released).
+    /// 4. `flush` the backend (`fdatasync` on persistent; no-op on
+    ///    memory). Persists the manifest's delete entries in the
+    ///    same syscall as the dirty bytes.
+    /// 5. Truncate the WAL — its records are now redundant with
+    ///    the freshly-durable blob images + manifest, so the next
+    ///    replay starts from an empty log.
     ///
     /// `flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
@@ -590,7 +693,8 @@ impl Tree {
         if let Some(wal) = &self.wal {
             wal.lock().unwrap().flush()?;
         }
-        self.backend.commit(self.root_guid)?;
+        self.flush_dirty_inline()?;
+        self.flush_pending_deletes_inline()?;
         self.backend.flush()?;
         if let Some(wal) = &self.wal {
             wal.lock().unwrap().truncate()?;
@@ -672,23 +776,37 @@ impl Tree {
     ///    resets to zero.
     /// 2. **Tree-wide merge**: each parent blob is walked and every
     ///    mergeable `BlobNode` child is folded back into the parent,
-    ///    then the child blob is dropped from the BM. A heavy-erase
-    ///    workload that leaves children mostly-empty collapses back
-    ///    toward a single root blob.
+    ///    then the child blob is queued for deferred deletion via
+    ///    the BM. A heavy-erase workload that leaves children
+    ///    mostly-empty collapses back toward a single root blob.
     ///
-    /// Both phases commit each touched blob through the BM. Does
-    /// **not** fsync the backend or touch the WAL — compaction
-    /// is logically idempotent (the post-compact tree is
-    /// observationally identical to the pre-compact one), so a
-    /// crash mid-compact just means the next run re-does the work.
-    /// Call [`Tree::checkpoint`] after if you want the rebuilt
-    /// blobs durable on disk.
+    /// Both phases stage their changes via `mark_dirty` /
+    /// `mark_for_delete` on the [`crate::store::BufferManager`]
+    /// rather than writing through to backend inline. This keeps
+    /// compact compatible with invariant **W2D**: a naive
+    /// `bm.commit(*guid)` per touched blob would push the cache
+    /// image (including any user mutations whose WAL records
+    /// aren't yet durable) straight to backend, and a crash
+    /// before those WAL records flushed would leave the backend
+    /// at a post-mutation state with no journal to reconcile
+    /// against — silent data loss after a WAL replay rebuilds
+    /// the cache to the pre-mutation state.
     ///
-    /// Single-pass merge: nested crossings (a mergeable child whose
-    /// own children are themselves merge candidates) aren't unfolded
-    /// recursively in v0.1. Re-invoke `compact` for another pass if
-    /// the workload has cascaded crossings.
+    /// Does **not** fsync the backend or touch the WAL — call
+    /// [`Tree::checkpoint`] after if you want the rebuilt blobs
+    /// durable on disk. Compaction is logically idempotent (the
+    /// post-compact tree is observationally identical to the
+    /// pre-compact one), so a crash mid-compact just means the
+    /// next run re-does the work; the W2D protocol keeps the
+    /// backend image consistent throughout.
+    ///
+    /// Single-pass merge: nested crossings (a mergeable child
+    /// whose own children are themselves merge candidates) aren't
+    /// unfolded recursively. Re-invoke `compact` for another pass
+    /// if the workload has cascaded crossings.
     pub fn compact(&self) -> Result<()> {
+        use crate::store::buffer_manager::STRUCTURAL_SEQ;
+
         // Phase 1 — per-blob compact.
         let guids = engine::collect_blob_guids(&self.backend, self.root_guid)?;
         for guid in &guids {
@@ -698,7 +816,9 @@ impl Tree {
                 engine::compact_blob(&mut guard)?;
             }
             drop(pin);
-            self.backend.commit(*guid)?;
+            // Stage the rebuilt image; let `Tree::checkpoint` (or
+            // the bg checkpointer) push it through under W2D.
+            self.backend.mark_dirty(*guid, STRUCTURAL_SEQ);
         }
 
         // Phase 1.5 — restore the `BlobNode.child_entry_ptr ==
@@ -724,11 +844,11 @@ impl Tree {
             let merged = {
                 let mut guard = pin.write();
                 let mut frame = BlobFrame::wrap(guard.as_mut_slice());
-                engine::try_merge_children(&self.backend, &mut frame)?
+                engine::try_merge_children(&self.backend, &mut frame, STRUCTURAL_SEQ)?
             };
             drop(pin);
             if merged.merged > 0 {
-                self.backend.commit(guid)?;
+                self.backend.mark_dirty(guid, STRUCTURAL_SEQ);
             }
         }
         Ok(())
@@ -759,8 +879,22 @@ impl Tree {
 ///
 /// `RenameObject` is rebuilt as the same erase + insert it ran
 /// originally. `Rename` (cross-tree) doesn't apply to the
-/// single-tree v0.1 surface and is rejected. `NewTree` / `RmTree`
-/// are also future-multi-tenant ops, ignored here.
+/// single-tree API surface and is rejected. `NewTree` / `RmTree`
+/// reserved for multi-tenant deployment; ignored here.
+///
+/// ## Dirty tracking on replay
+///
+/// Walker calls (`insert_multi` / `erase_multi`) mutate the
+/// BM-cached root + any cross-blob children, but the root's
+/// `mark_dirty` is the **caller's** responsibility (see
+/// `Tree::put`). Replay must honour that contract — every
+/// logical op that landed in cache is mirrored by
+/// `bm.mark_dirty(root_guid, seq)`. Without this, a `Tree::open`
+/// → `Tree::checkpoint` immediately after replay would find an
+/// empty dirty set, write nothing to backend, then truncate the
+/// WAL — silently losing every replayed record (the cached image
+/// matched the in-memory state but the backend image was still
+/// pre-replay; truncating the WAL removed the only durable copy).
 fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<u64> {
     // Pin the root once for the entire replay loop; saves a
     // BM-Mutex per op (replays can be thousands of ops on a
@@ -768,14 +902,30 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
     let root_pin = bm.pin(root_guid)?;
     let mut highest = 0u64;
     let _ = replay(path, |op, seq, _off| {
-        match op {
+        // Track the highest seq we've **seen** before any branch
+        // can short-circuit (e.g. the `RenameObject` no-op arm).
+        // `next_seq` must advance past every record on disk, even
+        // ones whose effect was already reconciled by an earlier
+        // replay pass — otherwise the writer could re-issue an
+        // already-used seq.
+        highest = highest.max(seq);
+
+        // `touched_root` tracks whether this op actually mutated
+        // the BM-cached root image. No-op replays (e.g. an erase
+        // for a key already absent because a prior replay pass
+        // reconciled it) leave the cache byte-identical to
+        // backend — skipping `mark_dirty` for those is a small
+        // win and matches `Tree::delete`'s same-shape branch.
+        let touched_root = match op {
             TxnOp::Insert { key, value, .. } => {
                 let padded = pad_key(key);
                 engine::insert_multi(bm, &root_pin, &padded, value, seq)?;
+                true
             }
             TxnOp::Erase { key, .. } => {
                 let padded = pad_key(key);
-                engine::erase_multi(bm, &root_pin, &padded)?;
+                let outcome = engine::erase_multi(bm, &root_pin, &padded, seq)?;
+                outcome.previous.is_some()
             }
             TxnOp::RenameObject {
                 src_key,
@@ -787,18 +937,21 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
                 let dst_padded = pad_key(dst_key);
                 if engine::lookup_multi(bm, &root_pin, &src_padded)?.is_none() {
                     // Already reconciled in a prior replay pass —
-                    // skip.
+                    // skip. `highest` was bumped above so the
+                    // post-replay `next_seq` still advances past
+                    // this record's seq.
                     return Ok(());
                 }
                 if !force && engine::lookup_multi(bm, &root_pin, &dst_padded)?.is_some() {
                     return Ok(());
                 }
                 let value = engine::lookup_multi(bm, &root_pin, &src_padded)?.unwrap_or_default();
-                engine::erase_multi(bm, &root_pin, &src_padded)?;
+                engine::erase_multi(bm, &root_pin, &src_padded, seq)?;
                 engine::insert_multi(bm, &root_pin, &dst_padded, &value, seq)?;
+                true
             }
             // Structural / multi-tenant / marker variants don't
-            // affect logical state at v0.1's single-tree surface.
+            // affect logical state at the single-tree API surface.
             // `Batch` is unpacked into per-inner callbacks inside
             // `journal::reader::replay_bytes`, so it never reaches
             // this match — defensive arm only.
@@ -809,9 +962,17 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
             | TxnOp::NewTree { .. }
             | TxnOp::RmTree { .. }
             | TxnOp::MemMarker { .. }
-            | TxnOp::Batch { .. } => {}
+            | TxnOp::Batch { .. } => false,
+        };
+        if touched_root {
+            // Honour the walker's caller-side `mark_dirty(root,
+            // seq)` contract — see the module doc above. The
+            // walker itself only marks cross-blob children dirty
+            // (via `mark_dirty(child_guid, seq)` inside
+            // `insert_at_blob_node` / `erase_at_blob_node`); the
+            // root is always the caller's job.
+            bm.mark_dirty(root_guid, seq);
         }
-        highest = highest.max(seq);
         Ok(())
     })?;
     // After commit, the blob image is durable; we still want the

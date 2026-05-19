@@ -96,7 +96,7 @@ pub struct PersistentBackend {
     manifest: RwLock<Manifest>,
     /// `io_uring` context — present iff Linux + `feature =
     /// "io-uring"`. Held behind a `Mutex` so concurrent callers
-    /// serialise on the submission queue; with the v0.2 single I/O
+    /// serialise on the submission queue; with the single I/O
     /// worker thread this lock is uncontended on the hot path.
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     uring: Mutex<UringContext>,
@@ -106,9 +106,10 @@ pub struct PersistentBackend {
 struct Manifest {
     /// guid → slot index (offset on disk = slot * u64::from(PAGE_SIZE)).
     slots: HashMap<BlobGuid, u64>,
-    /// Next free slot to hand out. Monotonically increasing in
-    /// Stage 1 (slot reuse comes in Stage 6 with the buffer
-    /// manager's free-list reclamation).
+    /// Next free slot to hand out. Monotonically increasing —
+    /// slot reuse is a follow-up (buffer manager would maintain
+    /// a per-backend free list of slots released by
+    /// `delete_blob`).
     next_slot: u64,
     /// Path to the manifest file (for tmp+rename writes).
     path: PathBuf,
@@ -257,9 +258,10 @@ impl Backend for PersistentBackend {
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
         let mut m = self.manifest.write().unwrap();
         m.slots.remove(&guid);
-        // Stage 6 will free the slot for reuse via a per-backend
-        // free-list. Stage 1 just leaks the slot — the data on disk
-        // becomes garbage until a future compaction overwrites it.
+        // TODO: feed the released slot into a per-backend free
+        // list so `assign_slot` can reuse it. Today the slot
+        // leaks — the data on disk stays as garbage until a
+        // future compaction overwrites it.
         Ok(())
     }
 

@@ -15,12 +15,10 @@
 //!   torn-tail handling. Unpacks `Batch` records into per-inner
 //!   callbacks so consumers don't need a `Batch` arm.
 //!
-//! Checkpoint (flush WAL + commit BM root + truncate WAL) lives
-//! on [`crate::Tree::checkpoint`], not in this module — it
-//! straddles the tree + journal boundary and the synchronous
-//! single-tree variant doesn't need its own subsystem. v0.2's
-//! background checkpoint thread will get its own module when it
-//! lands.
+//! Checkpoint (flush WAL → drain dirty → fdatasync → truncate
+//! WAL) lives in [`crate::Tree::checkpoint`] and the background
+//! [`crate::checkpoint`] module, not in here — it straddles the
+//! tree + journal boundary.
 
 pub mod codec;
 pub mod reader;

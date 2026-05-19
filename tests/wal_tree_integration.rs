@@ -67,6 +67,75 @@ fn persistent_put_then_reopen_via_wal_replay() {
 }
 
 #[test]
+fn replay_then_checkpoint_then_reopen_preserves_data() {
+    // Regression test for the "replay → checkpoint → reopen
+    // loses data" hole:
+    //
+    // 1. Open, put N keys, drop without checkpoint (WAL has
+    //    every record on disk; backend root blob is still
+    //    pristine because nothing was flushed).
+    // 2. Reopen — `replay_wal` re-applies every WAL record onto
+    //    the BM-cached root. The root blob's IN-MEMORY image now
+    //    matches the post-put state; the backend image is still
+    //    the empty seeded root.
+    // 3. Immediately call `tree.checkpoint()` — this must flush
+    //    the cached root through to backend BEFORE truncating
+    //    the WAL. The v0.2-pre `replay_wal` didn't `mark_dirty`
+    //    the root, so the dirty set was empty after replay; the
+    //    checkpoint round drained nothing, wrote nothing to
+    //    backend, and then truncated the WAL — silently losing
+    //    every replayed record.
+    // 4. Reopen again — the backend is the sole source of truth
+    //    now (WAL was truncated). All keys must still be there.
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    // Round 1: write durably to WAL, no checkpoint.
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        for i in 0..50u32 {
+            tree.put(format!("k{i:03}").as_bytes(), format!("v-{i}").as_bytes())
+                .unwrap();
+        }
+    }
+
+    // Round 2: reopen → replay; then checkpoint → truncates WAL.
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        // Sanity: WAL replay restored the cached state.
+        for i in 0..50u32 {
+            assert_eq!(
+                tree.get(format!("k{i:03}").as_bytes())
+                    .unwrap()
+                    .as_deref(),
+                Some(format!("v-{i}").as_bytes()),
+            );
+        }
+        // Now checkpoint. **This must flush the replayed state
+        // to backend before truncating the WAL.**
+        tree.checkpoint().unwrap();
+        let wal_size_after = fs::metadata(wal_path(dir.path())).unwrap().len();
+        assert_eq!(wal_size_after, 32, "WAL truncated to header-only");
+    }
+
+    // Round 3: backend is the source of truth (WAL empty). If
+    // checkpoint didn't actually flush the replayed state, this
+    // reopen sees the pre-put pristine root and every get returns
+    // None.
+    {
+        let tree = Tree::open(cfg).unwrap();
+        for i in 0..50u32 {
+            let k = format!("k{i:03}");
+            assert_eq!(
+                tree.get(k.as_bytes()).unwrap().as_deref(),
+                Some(format!("v-{i}").as_bytes()),
+                "key {k} lost — replay→checkpoint didn't persist replayed state",
+            );
+        }
+    }
+}
+
+#[test]
 fn checkpoint_truncates_wal_and_keys_survive_reopen() {
     let dir = tempdir().unwrap();
     // Need per-op fsync so the WAL has bytes on disk before
@@ -487,5 +556,380 @@ fn background_checkpointer_truncates_wal_and_keeps_data_durable() {
             Some(want.as_bytes()),
             "key {k} lost after bg-checkpoint-and-reopen",
         );
+    }
+}
+
+#[test]
+fn spillover_new_blobs_deferred_to_backend_until_checkpoint() {
+    // Regression test for the v0.2 W2D fix: spillover used to call
+    // `bm.write_blob → bm.flush` inline, leaking the new child
+    // blob's bytes to the inner backend before any WAL record
+    // covering the spillover-triggering op was durable. The fix
+    // routes the new blob through `install_new_blob` (cache +
+    // dirty), so the backend write happens only after the
+    // checkpoint round has flushed WAL first.
+    use holt::{Backend, MemoryBackend};
+    use std::sync::Arc;
+
+    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+
+    // `open_with_backend` skips the WAL and the bg checkpointer
+    // (default `CheckpointConfig::disabled`). Disable
+    // `flush_on_write` too so the test can observe the dirty-set
+    // state between ops and the explicit `checkpoint` call.
+    let mut cfg = TreeConfig::memory();
+    cfg.flush_on_write = false;
+    let tree = Tree::open_with_backend(cfg, Arc::clone(&inner)).unwrap();
+
+    // Inner backend starts with only the seeded root.
+    let initial = inner.list_blobs().unwrap();
+    assert_eq!(initial.len(), 1, "open seeds only the root blob");
+
+    // Force spillover by stuffing the tree with payloads big
+    // enough that a single 512 KB root can't hold them all.
+    let payload = vec![b'x'; 1024];
+    for i in 0..1000u32 {
+        tree.put(format!("k{i:05}").as_bytes(), &payload).unwrap();
+    }
+
+    // Spillover ran: the tree has multiple reachable blobs now.
+    let stats = tree.stats().unwrap();
+    assert!(
+        stats.blob_count > 1,
+        "spillover should have created at least one child blob (got {})",
+        stats.blob_count,
+    );
+    assert!(
+        stats.bm_dirty_count >= 1,
+        "every spillover'd blob + root must be tracked dirty",
+    );
+
+    // **The point of the test**: the inner backend has NOT yet
+    // received the spillover'd child blobs. Pre-fix, the inline
+    // `bm.write_blob` call in `spillover_blob` would have pushed
+    // them through immediately — a crash here would have left
+    // orphans in backend.
+    let mid = inner.list_blobs().unwrap();
+    assert_eq!(
+        mid.len(),
+        1,
+        "inner backend must NOT see spillover'd children until checkpoint (got {} blobs)",
+        mid.len(),
+    );
+
+    // Explicit checkpoint — drains the dirty set + fdatasync.
+    tree.checkpoint().unwrap();
+
+    let stats_after = tree.stats().unwrap();
+    assert_eq!(
+        stats_after.bm_dirty_count, 0,
+        "checkpoint must drain every dirty entry",
+    );
+
+    let final_blobs = inner.list_blobs().unwrap();
+    assert_eq!(
+        final_blobs.len() as u32, stats.blob_count,
+        "after checkpoint, inner backend has every reachable blob",
+    );
+
+    // Sanity: every payload still readable through the tree
+    // (sourced from the freshly-flushed inner backend on a
+    // cache miss).
+    for i in 0..1000u32 {
+        let k = format!("k{i:05}");
+        let v = tree.get(k.as_bytes()).unwrap().expect("key present");
+        assert_eq!(v.as_slice(), payload.as_slice(), "value drift for {k}");
+    }
+}
+
+#[test]
+fn compact_does_not_leak_pre_wal_state_to_backend() {
+    // Regression test: `Tree::compact` used to call
+    // `bm.commit(*guid)` for every touched blob, which pushes
+    // the cached image (including unflushed-WAL user mutations)
+    // straight to backend. A crash before the user's WAL record
+    // was durable would have left the backend at the post-put
+    // state while the WAL contained no record — and the next
+    // reopen-via-WAL-replay would have re-built a state that
+    // looks like "put never happened" (cache rebuilt from WAL =
+    // empty; checkpoint then truncates the empty WAL; reopen
+    // sees the backend which still has post-put state, but the
+    // user-visible model now disagrees with the durable image).
+    //
+    // The simplest demonstration: turn off WAL fsync, put a key,
+    // run compact (which races the WAL flush), drop without
+    // checkpoint, reopen. Pre-fix, compact had already shoved
+    // the put's bytes into the backend; the put's WAL record
+    // never made it to disk (`wal_sync_on_commit = false` and no
+    // explicit checkpoint), so the open-time replay sees no
+    // record and considers `next_seq` to start at 1 — but the
+    // backend has the put. Mixing those would surface as either
+    // a phantom value or a torn state on subsequent ops.
+    //
+    // Post-fix, compact only marks dirty + leaves flushing to
+    // the user / checkpointer. With no checkpoint between put
+    // and drop, the backend stays at the pre-put state, the WAL
+    // is empty (records weren't fsync'd), and reopen sees the
+    // pristine root → `get` returns None. That's the expected
+    // "lost write under no-fsync, no-checkpoint" semantics; the
+    // failure mode pre-fix was different and worse.
+    //
+    // We verify the post-fix invariant by checking that
+    // `tree.stats().bm_dirty_count > 0` *after* compact (i.e.,
+    // compact left things dirty rather than flushing them
+    // through), and that the backend file size remains at the
+    // initial seeded-root size (no spillover blobs leaked
+    // through).
+    use holt::{Backend, MemoryBackend};
+    use std::sync::Arc;
+
+    let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+
+    let mut cfg = TreeConfig::memory();
+    cfg.flush_on_write = false; // no implicit per-op flush
+    let tree = Tree::open_with_backend(cfg, Arc::clone(&inner)).unwrap();
+
+    let initial = inner.list_blobs().unwrap();
+    assert_eq!(initial.len(), 1, "open seeds only the root blob");
+
+    // Put a key so the root blob's cache image diverges from
+    // backend. mark_dirty(root, seq) fires inside Tree::put.
+    tree.put(b"key", b"value").unwrap();
+    assert!(
+        tree.stats().unwrap().bm_dirty_count >= 1,
+        "put must leave root dirty",
+    );
+
+    // Now compact. Pre-fix, this would commit the root through
+    // to backend, eagerly persisting the put's bytes without
+    // any WAL gate. Post-fix, compact only restructures cache +
+    // marks dirty.
+    tree.compact().unwrap();
+
+    // Backend still pristine — compact did NOT flush.
+    let after_compact = inner.list_blobs().unwrap();
+    assert_eq!(
+        after_compact.len(),
+        1,
+        "compact must not push cache state to backend",
+    );
+    // And the root is still dirty: the put + the compact reshuffle
+    // are both staged in cache, waiting for `checkpoint` to
+    // commit them under the W2D gate.
+    assert!(
+        tree.stats().unwrap().bm_dirty_count >= 1,
+        "compact must leave dirty entries (not auto-flush)",
+    );
+
+    // Now actually checkpoint — backend receives the merged state.
+    tree.checkpoint().unwrap();
+    assert_eq!(tree.stats().unwrap().bm_dirty_count, 0);
+
+    // Sanity: value still readable through the freshly-flushed
+    // backend.
+    assert_eq!(
+        tree.get(b"key").unwrap().as_deref(),
+        Some(&b"value"[..]),
+    );
+}
+
+#[test]
+fn batch_replay_then_checkpoint_then_reopen_preserves_data() {
+    // Same W2D closure as `replay_then_checkpoint_then_reopen_preserves_data`,
+    // but exercises the `apply_batch` path: a single `Batch` WAL
+    // record fan-outs into per-inner Insert/Erase/RenameObject
+    // callbacks during replay. The fix marks root dirty per
+    // inner op, so the inner Batch unwrap must surface the seq /
+    // mutation in the same way `Tree::put`/`delete` do.
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    // Round 1: durable batch, no checkpoint.
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.txn(|b| {
+            b.put(b"a", b"1");
+            b.put(b"b", b"2");
+            b.put(b"c", b"3");
+            b.delete(b"a");
+            b.rename(b"b", b"B", /*force=*/ false);
+        })
+        .unwrap();
+    }
+
+    // Round 2: replay → checkpoint → expect state to be durable.
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.checkpoint().unwrap();
+    }
+
+    // Round 3: backend is sole source of truth (WAL truncated).
+    {
+        let tree = Tree::open(cfg).unwrap();
+        assert_eq!(tree.get(b"a").unwrap(), None);
+        assert_eq!(tree.get(b"B").unwrap().as_deref(), Some(&b"2"[..]));
+        assert_eq!(tree.get(b"c").unwrap().as_deref(), Some(&b"3"[..]));
+    }
+}
+
+#[test]
+fn rename_replay_is_idempotent_across_two_drops() {
+    // The replay path skips a rename whose `src` no longer
+    // exists (already reconciled by a previous replay) and skips
+    // a non-forced rename when `dst` is already populated. This
+    // matters when two reopens happen without an intermediate
+    // checkpoint — round 2's replay re-applies the rename, then
+    // round 3's replay sees the same WAL records but the cache
+    // already reflects the post-rename state.
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    // Round 1: put + rename, drop without checkpoint.
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.put(b"src", b"v1").unwrap();
+        tree.rename(b"src", b"dst", false).unwrap();
+    }
+
+    // Round 2: replay, drop without checkpoint. Replay re-runs
+    // put then rename — both succeed because the cache is empty
+    // at open.
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        assert!(tree.get(b"src").unwrap().is_none());
+        assert_eq!(tree.get(b"dst").unwrap().as_deref(), Some(&b"v1"[..]));
+        // No checkpoint here.
+    }
+
+    // Round 3: replay AGAIN (still no checkpoint). Now the
+    // rename replay path's "src already gone" branch must fire
+    // — the cache after the put-replay has `dst` (the cache
+    // image isn't durable yet, but the put record re-fills it).
+    // Actually the cache is rebuilt fresh from an empty backend
+    // every reopen, so this exercises the same path; the test
+    // just guarantees no drift across repeated replays.
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        assert!(tree.get(b"src").unwrap().is_none());
+        assert_eq!(tree.get(b"dst").unwrap().as_deref(), Some(&b"v1"[..]));
+        // Now checkpoint and reopen — backend must hold the
+        // post-rename state.
+        tree.checkpoint().unwrap();
+    }
+    {
+        let tree = Tree::open(cfg).unwrap();
+        assert!(tree.get(b"src").unwrap().is_none());
+        assert_eq!(tree.get(b"dst").unwrap().as_deref(), Some(&b"v1"[..]));
+    }
+}
+
+#[test]
+fn subtree_gone_replay_reconstructs_correctly() {
+    // Cross-blob erase that empties a child blob: the v0.2-pre
+    // code called `bm.delete_blob` inline (W2D-broken). Post-fix
+    // the SubtreeGone path queues a deferred delete and the
+    // checkpoint round drains it after Sync.
+    //
+    // End-to-end test: fill enough data to spillover into N
+    // children, delete every key under one of the children so
+    // that SubtreeGone fires for that child, drop without
+    // checkpoint, reopen + checkpoint + reopen, verify nothing
+    // is corrupt.
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        // Push enough data that spillover triggers at least once.
+        let payload = vec![b'z'; 1024];
+        for i in 0..1000u32 {
+            tree.put(format!("k{i:05}").as_bytes(), &payload).unwrap();
+        }
+        // Now delete everything under one prefix — for some range
+        // of keys, deletion will collapse a child blob's leaves
+        // and surface SubtreeGone. (We don't know exactly which
+        // keys live in which blob, but deleting a contiguous
+        // half-stripe should hit at least one SubtreeGone.)
+        for i in 0..500u32 {
+            tree.delete(format!("k{i:05}").as_bytes()).unwrap();
+        }
+        // Don't checkpoint.
+    }
+
+    // Reopen → replay → checkpoint → reopen → verify.
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        // Half should be gone, half should still be there.
+        for i in 0..500u32 {
+            assert!(
+                tree.get(format!("k{i:05}").as_bytes()).unwrap().is_none(),
+                "deleted key k{i:05} resurrected on replay",
+            );
+        }
+        for i in 500..1000u32 {
+            assert!(
+                tree.get(format!("k{i:05}").as_bytes()).unwrap().is_some(),
+                "surviving key k{i:05} lost on replay",
+            );
+        }
+        tree.checkpoint().unwrap();
+    }
+
+    {
+        let tree = Tree::open(cfg).unwrap();
+        for i in 0..500u32 {
+            assert!(tree.get(format!("k{i:05}").as_bytes()).unwrap().is_none());
+        }
+        for i in 500..1000u32 {
+            assert!(tree.get(format!("k{i:05}").as_bytes()).unwrap().is_some());
+        }
+    }
+}
+
+#[test]
+fn cross_blob_writes_replay_correctly_through_wal_without_checkpoint() {
+    // End-to-end test for the walker's W2D fix: under
+    // `wal_sync_on_commit = true`, every record reaches disk
+    // before the op returns. The walker no longer commits any
+    // child blob inline (the v0.2-pre `bm.commit(child_guid)` is
+    // now `bm.mark_dirty(child_guid, seq)`), so the on-disk
+    // child blob state at the moment of drop is exactly "stale"
+    // — the WAL is the source of truth, and reopen-via-replay
+    // must reconstruct the cross-blob state correctly.
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+
+    // Round 1: fill enough to spill across blobs, drop without
+    // calling `checkpoint`.
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        let payload = vec![b'y'; 1024];
+        for i in 0..1000u32 {
+            tree.put(format!("k{i:05}").as_bytes(), &payload).unwrap();
+        }
+        // Verify spillover actually happened — otherwise the
+        // test isn't exercising the cross-blob path.
+        let stats = tree.stats().unwrap();
+        assert!(
+            stats.blob_count > 1,
+            "test premise: spillover must trigger (got blob_count={})",
+            stats.blob_count,
+        );
+    } // drop without checkpoint — WAL truncate didn't run.
+
+    // Round 2: reopen. WAL replay re-runs every op, including
+    // the ones that triggered spillover. Every key must be
+    // present.
+    {
+        let tree = Tree::open(cfg).unwrap();
+        let payload = vec![b'y'; 1024];
+        for i in 0..1000u32 {
+            let k = format!("k{i:05}");
+            assert_eq!(
+                tree.get(k.as_bytes()).unwrap().as_deref(),
+                Some(payload.as_slice()),
+                "cross-blob key {k} lost after replay",
+            );
+        }
     }
 }

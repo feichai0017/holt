@@ -3,9 +3,10 @@
 //!
 //! ## Why a separate thread
 //!
-//! v0.1's inline LRU runs only on capacity overflow (during a new
-//! `insert_into_cache`). Once the buffer pool stops growing, no
-//! eviction happens — every loaded blob stays resident.
+//! The inline overflow LRU on `insert_into_cache` only runs when
+//! the cache is growing past `capacity`. Once the buffer pool
+//! stops growing, no eviction happens — every loaded blob would
+//! stay resident.
 //!
 //! The eviction thread runs on its own cadence
 //! (`CheckpointConfig::eviction_interval`) and uses a

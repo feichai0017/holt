@@ -10,12 +10,14 @@
 //!
 //! ## Current status
 //!
-//! Early development. The crate skeleton is in place; the layout
-//! layer (extern-struct types + slot encoding + 4 KB blob header)
-//! is complete. The walker / persistence / journal layers are
-//! being built out. See `ROADMAP.md`.
+//! All core layers — layout, walker (insert / lookup / erase /
+//! range / spillover / compact / merge), persistent backend
+//! (`O_DIRECT` + optional `io_uring`), WAL with replay, sharded
+//! buffer manager, background checkpointer — are in place and
+//! covered by integration + property tests. See `ROADMAP.md`
+//! for the next milestone's work items.
 //!
-//! ## Quick taste (when v0.1 ships)
+//! ## Quick taste
 //!
 //! ```ignore
 //! use holt::TreeBuilder;
@@ -148,8 +150,8 @@ pub use api::stats::{BlobStats, CheckpointerStats, TreeStats};
 // Single-record batched transactions.
 pub use api::txn::TxnBatch;
 
-// Background checkpointer policy (v0.2). The `Checkpointer`
-// handle itself is crate-internal; users opt in via this config.
+// Background checkpointer policy. The `Checkpointer` handle
+// itself is crate-internal; users opt in via this config.
 pub use checkpoint::CheckpointConfig;
 
 // Backend trait + bundled backends + zero-copy blob buffer.

@@ -2,12 +2,12 @@
 //! for `BlobNode` crossings whose child blob is small enough to
 //! fold back inline, and folds them via [`super::merge_blob`].
 //!
-//! Holt's v0.1 trigger is [`crate::api::Tree::compact`]: after the
-//! per-blob `compact_blob` reduces each blob to its live core,
-//! this walker scans for mergeable BlobNode children and inlines
-//! them — a typical churn workload (lots of erases) leaves child
-//! blobs with little data, which this pass collapses back into a
-//! single parent so the BFS shrinks back toward one root blob.
+//! Triggered by [`crate::api::Tree::compact`]: after the per-blob
+//! `compact_blob` reduces each blob to its live core, this walker
+//! scans for mergeable `BlobNode` children and inlines them. A
+//! typical churn workload (lots of erases) leaves child blobs
+//! with little data, which this pass collapses back into a single
+//! parent so the BFS shrinks toward one root blob.
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobNode, NodeType, BLOB_MAX_INLINE};
@@ -43,13 +43,18 @@ pub struct MergeStats {
 /// re-checked for their own mergeable descendants. (`is_mergeable`
 /// rejects any child with its own crossings via `num_ext_blobs`,
 /// so nested merges are deferred to a future pass.)
+/// `seq` is forwarded to [`merge_blob`] so the deferred-delete
+/// entry it generates carries the correct WAL stamp. Internal
+/// callers (compact / checkpoint round) pass
+/// [`crate::store::buffer_manager::STRUCTURAL_SEQ`].
 pub fn try_merge_children(
     bm: &BufferManager,
     parent_frame: &mut BlobFrame<'_>,
+    seq: u64,
 ) -> Result<MergeStats> {
     let mut stats = MergeStats::default();
     let root = parent_frame.header().root_slot;
-    let new_root = try_merge_subtree(bm, parent_frame, root, &mut stats)?;
+    let new_root = try_merge_subtree(bm, parent_frame, root, &mut stats, seq)?;
     if new_root != root {
         parent_frame.header_mut().root_slot = new_root;
     }
@@ -61,6 +66,7 @@ fn try_merge_subtree(
     frame: &mut BlobFrame<'_>,
     slot: u16,
     stats: &mut MergeStats,
+    seq: u64,
 ) -> Result<u16> {
     let ntype = ntype_of(frame.as_ref(), slot)?;
     match ntype {
@@ -68,11 +74,11 @@ fn try_merge_subtree(
             context: "try_merge_subtree: hit NodeType::Invalid",
         }),
         NodeType::EmptyRoot | NodeType::Leaf => Ok(slot),
-        NodeType::Prefix => merge_under_prefix(bm, frame, slot, stats),
+        NodeType::Prefix => merge_under_prefix(bm, frame, slot, stats, seq),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            merge_under_inner(bm, frame, slot, ntype, stats)
+            merge_under_inner(bm, frame, slot, ntype, stats, seq)
         }
-        NodeType::Blob => merge_at_blob_node(bm, frame, slot, stats),
+        NodeType::Blob => merge_at_blob_node(bm, frame, slot, stats, seq),
     }
 }
 
@@ -81,10 +87,11 @@ fn merge_under_prefix(
     frame: &mut BlobFrame<'_>,
     pfx_slot: u16,
     stats: &mut MergeStats,
+    seq: u64,
 ) -> Result<u16> {
     let p = read_prefix(frame.as_ref(), pfx_slot)?;
     let child_slot = p.child as u16;
-    let new_child = try_merge_subtree(bm, frame, child_slot, stats)?;
+    let new_child = try_merge_subtree(bm, frame, child_slot, stats, seq)?;
     if new_child != child_slot {
         set_prefix_child(frame, pfx_slot, u32::from(new_child))?;
     }
@@ -98,6 +105,7 @@ fn merge_under_inner(
     inner_slot: u16,
     ntype: NodeType,
     stats: &mut MergeStats,
+    seq: u64,
 ) -> Result<u16> {
     // Snapshot child (byte, slot) pairs once — the inner-node body
     // stays at a fixed slot through the walk, so reading once + then
@@ -153,7 +161,7 @@ fn merge_under_inner(
     };
 
     for (byte, child_slot) in pairs {
-        let new_child = try_merge_subtree(bm, frame, child_slot, stats)?;
+        let new_child = try_merge_subtree(bm, frame, child_slot, stats, seq)?;
         if new_child != child_slot {
             inner_update_child(frame, inner_slot, ntype, byte, u32::from(new_child))?;
         }
@@ -166,6 +174,7 @@ fn merge_at_blob_node(
     frame: &mut BlobFrame<'_>,
     bn_slot: u16,
     stats: &mut MergeStats,
+    seq: u64,
 ) -> Result<u16> {
     // Defensive: confirm the body really is a BlobNode + check its
     // prefix_len fits. If `is_mergeable` returns false, the BlobNode
@@ -185,7 +194,7 @@ fn merge_at_blob_node(
     if !is_mergeable(bm, frame, bn_slot)? {
         return Ok(bn_slot);
     }
-    let new_slot = merge_blob(bm, frame, bn_slot)?;
+    let new_slot = merge_blob(bm, frame, bn_slot, seq)?;
     stats.merged += 1;
     Ok(new_slot)
 }

@@ -9,7 +9,10 @@
 
 pub mod backend;
 mod blob_frame;
-mod buffer_manager;
+// `pub(crate)` so internal crates can name
+// `crate::store::buffer_manager::STRUCTURAL_SEQ` directly; the
+// public API still goes through the re-exports below.
+pub(crate) mod buffer_manager;
 
 pub use blob_frame::{
     AllocError, AllocOutcome, BlobFrame, BlobFrameRef, ExtentAllocOutcome, FreeError,

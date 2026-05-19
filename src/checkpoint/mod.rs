@@ -1,4 +1,4 @@
-//! v0.2 background checkpointer — three threads coordinating
+//! Background checkpointer — three threads coordinating
 //! through a bounded I/O queue + per-thread stop signals.
 //!
 //! ## Architecture
@@ -46,13 +46,13 @@
 //! - **LeanStore** — round-driven dirty-set drain on the planner
 //!   thread.
 //!
-//! Going to three threads (vs. v0.2 MVP's single thread) buys:
+//! Three threads (rather than a single one) buy:
 //!
 //! 1. **Planner doesn't block on I/O** — once the queue has
 //!    capacity, the planner can prepare the next merge / snapshot
 //!    while previous tasks are still on the wire.
-//! 2. **io_uring readiness** — the I/O thread is the natural
-//!    home for the SQE submit + CQE poll loop in C2.
+//! 2. **io_uring fit** — the I/O thread is the natural home for
+//!    the SQE submit + CQE poll loop on the Linux fast path.
 //! 3. **Eviction is decoupled** — runs on its own cadence
 //!    against its own clock; doesn't compete with the planner
 //!    for BM mutex time.
@@ -290,7 +290,11 @@ impl Checkpointer {
     /// boundary (without waiting out the remainder of
     /// `idle_interval`). Safe to call from any thread; no-op if
     /// the planner is already running.
-    #[allow(dead_code)] // Threshold-wake from writers lands in a follow-up.
+    ///
+    /// Currently used only from tests — writer-side threshold
+    /// wake-up (e.g. once `dirty_count` crosses a watermark) is
+    /// a planned hook for the writer paths.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn wake(&self) {
         if let Some(h) = &self.checkpoint_handle {
             h.thread().unpark();
@@ -298,42 +302,36 @@ impl Checkpointer {
     }
 
     /// Number of rounds the planner has attempted.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn rounds_attempted(&self) -> u64 {
         self.shared.rounds_attempted.load(Ordering::Relaxed)
     }
 
     /// Number of rounds that completed without error.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn rounds_succeeded(&self) -> u64 {
         self.shared.rounds_succeeded.load(Ordering::Relaxed)
     }
 
     /// Total blobs flushed across all rounds.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn blobs_flushed(&self) -> u64 {
         self.shared.blobs_flushed.load(Ordering::Relaxed)
     }
 
     /// WAL truncates performed across all rounds.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn truncates(&self) -> u64 {
         self.shared.truncates.load(Ordering::Relaxed)
     }
 
     /// `BlobNode` crossings folded back into parents.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn merges_total(&self) -> u64 {
         self.shared.merges_total.load(Ordering::Relaxed)
     }
 
     /// Cache entries evicted by the eviction thread.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn evictions(&self) -> u64 {
         self.shared.evictions.load(Ordering::Relaxed)

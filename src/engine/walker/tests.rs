@@ -646,7 +646,7 @@ fn churn_100_keys_inserted_then_all_erased() {
 }
 
 // ============================================================
-// Stage 2d phase A — multi-blob lookup + make_blob_from_node
+// Multi-blob lookup + `make_blob_from_node`
 // ============================================================
 
 fn install_blob_node(
@@ -844,7 +844,7 @@ fn make_blob_from_node_then_lookup_yields_crossing_when_root_is_blob_node() {
 }
 
 // ============================================================
-// Stage 6 (reclaim) — compact_blob
+// `compact_blob` — in-place blob reclaim
 // ============================================================
 
 fn aligned_from_vec(v: &[u8]) -> AlignedBlobBuf {
@@ -967,8 +967,8 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
 ///
 /// Lives here (not in `tests/tree_smoke.rs`) because it needs
 /// `engine::walker::*` internals (`make_blob_from_node`) that
-/// are `pub(crate)` after the v0.2 surface lockdown. Organic
-/// cross-blob coverage is in the integration suite's
+/// stay `pub(crate)`. Organic cross-blob coverage is in the
+/// integration suite's
 /// `compact_merges_shrunk_child_blob_back_into_parent` and
 /// friends; this test exists to keep BlobNode descent honest
 /// against a synthetic shape.

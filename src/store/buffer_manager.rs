@@ -1,4 +1,4 @@
-//! `BufferManager` — LRU-bounded blob cache (Stage 6 phase 1).
+//! `BufferManager` — LRU-bounded blob cache.
 //!
 //! Sits between a [`Tree`](crate::Tree) and its underlying
 //! [`Backend`]. Itself implements `Backend`, so it's a transparent
@@ -6,35 +6,42 @@
 //! `flush` API, but reads of recently-touched blobs hit the cache
 //! and skip the inner backend's I/O.
 //!
-//! ## Mode: hybrid write-back / write-through
+//! ## Write protocol — staged through `dirty` + `pending_deletes`
 //!
-//! The walker mutates blobs via [`CachedBlob::write`] guards —
-//! those edits stay in cache (write-back) until something flushes
-//! them to backend. Two paths flush:
+//! The walker mutates blobs via [`CachedBlob::write`] guards;
+//! those edits stay in cache until a flush pushes them through.
+//! Two flush paths exist:
 //!
-//! - **Synchronous** [`BufferManager::commit`] — call per blob from
-//!   [`crate::Tree::checkpoint`] or per-op `flush_on_write` mode.
-//!   Writes the cache image to backend and atomically clears the
-//!   blob's dirty entry on success.
-//! - **Background checkpointer** (v0.2) — drives a round-based
-//!   flush of the entire dirty set; see
-//!   [`BufferManager::snapshot_dirty`] /
-//!   [`BufferManager::restore_dirty`] /
+//! - **Synchronous** [`BufferManager::commit`] — drives one blob
+//!   per call from [`crate::Tree::checkpoint`] or per-op
+//!   `flush_on_write` mode. Writes the cache image to backend
+//!   and atomically clears the blob's dirty entry on success.
+//! - **Background checkpointer** — drives a round-based flush of
+//!   the entire dirty set; see [`BufferManager::snapshot_dirty`]
+//!   / [`BufferManager::restore_dirty`] /
 //!   [`BufferManager::min_unflushed_txn`].
 //!
 //! The `write_blob` trait method is still write-through (cache +
-//! backend in one call) — used by spillover when it creates a
-//! fresh child blob that should be durable immediately.
+//! backend in one call). Internal call sites that produce a new
+//! blob (spillover) or unlink one (erase's `SubtreeGone` /
+//! merge) go through [`BufferManager::install_new_blob`] /
+//! [`BufferManager::mark_for_delete`] instead, so the backend
+//! write or manifest mutation is deferred until the next flush —
+//! invariant **W2D** below.
 //!
-//! ## Dirty tracking (v0.2)
+//! ## Dirty tracking + deferred deletes
 //!
 //! Every walker write tags its target blob via
-//! [`BufferManager::mark_dirty`]
-//! with the WAL seq that authored the change. The internal
-//! `dirty: Mutex<HashMap<BlobGuid, u64>>` keeps the **lowest**
-//! unflushed seq per blob — that value is the WAL trim watermark
-//! for that blob (records below it are already in backend, so the
-//! WAL doesn't need them).
+//! [`BufferManager::mark_dirty`] with the WAL seq that authored
+//! the change. The internal `dirty: Mutex<HashMap<BlobGuid, u64>>`
+//! keeps the **lowest** unflushed seq per blob — that value is
+//! the WAL trim watermark for that blob (records below it are
+//! already in backend, so the WAL doesn't need them).
+//!
+//! Erase ops that empty a child blob queue a deferred deletion
+//! via [`BufferManager::mark_for_delete`] — the `backend.delete_blob`
+//! syscall runs only after the corresponding WAL record is on
+//! disk.
 //!
 //! Invariants:
 //!
@@ -42,9 +49,14 @@
 //!   image of `guid` is newer than the backend image.
 //! - **I2**: WAL `trim_id <= min(dirty.values()) - 1` (or
 //!   `next_seq - 1` if `dirty` is empty).
-//! - **I3**: [`BufferManager::snapshot_dirty`] drains the map atomically, so
-//!   `mark_dirty` calls that race with a checkpoint round land in
-//!   the new (empty) map and are tracked for the next round.
+//! - **I3**: [`BufferManager::snapshot_dirty`] drains the map
+//!   atomically, so `mark_dirty` calls that race with a checkpoint
+//!   round land in the new (empty) map and are tracked for the
+//!   next round. [`BufferManager::snapshot_pending_deletes`] has
+//!   the same drain semantics.
+//! - **W2D**: any byte written to `backend.data_file` or any
+//!   manifest mutation persisted to disk must have its
+//!   corresponding WAL record durably on disk first.
 //!
 //! ## Per-blob locking — 3-mode `HybridLatch`
 //!
@@ -89,9 +101,9 @@
 //!   cache past `capacity`. Picks the entry with the oldest
 //!   `last_touched` tick whose `Arc::strong_count == 1` (no
 //!   outside pin). O(n) walk over the cache, called only on the
-//!   overflow path; the bg eviction thread (below) handles
+//!   overflow path; the background eviction thread handles
 //!   steady-state reclaim cheaply.
-//! - **Background sweep** (v0.2 [`crate::checkpoint`] eviction
+//! - **Background sweep** ([`crate::checkpoint`] eviction
 //!   thread) — periodic walk based on the same `last_touched`
 //!   tick + `eviction_idle_ticks` threshold. Snapshots the cache
 //!   under shard locks, then drops the snapshot's Arc clones
@@ -100,16 +112,16 @@
 //!
 //! The cache may temporarily exceed `capacity` while every entry
 //! is pinned; it shrinks back as readers drop their handles or
-//! the bg sweep catches up.
+//! the background sweep catches up.
 //!
 //! ## Concurrent sharding
 //!
 //! The cache is a [`DashMap`] (sharded concurrent `HashMap`) so
 //! `pin` / `get_cached` calls on different blobs hit different
-//! shards — no single global mutex on the hot read path. v0.1's
-//! `Mutex<HashMap>` + `VecDeque<BlobGuid>` inline LRU was the
-//! per-blob bottleneck for multi-threaded workloads; v0.2's
-//! sharded cache + tick-based eviction removes it.
+//! shards — no single global mutex on the hot read path. The
+//! sharded cache + tick-based eviction together replace what
+//! would otherwise be a per-blob bottleneck on multi-threaded
+//! workloads.
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -125,6 +137,16 @@ use crate::layout::BlobGuid;
 
 use super::backend::{AlignedBlobBuf, Backend};
 
+/// Sentinel seq for dirty / pending-delete entries that originate
+/// from purely structural mutations (compact, merge pass) — they
+/// have no corresponding WAL record and so must not pin the WAL
+/// trim watermark. `min(dirty.values())` is what gates the
+/// watermark; using `u64::MAX` ensures a structural entry only
+/// matters for trim decisions if no real WAL-seqed entry is
+/// present alongside it (in which case dirty is non-empty and
+/// the truncate gate already refuses to fire).
+pub const STRUCTURAL_SEQ: u64 = u64::MAX;
+
 /// LRU-bounded blob cache; see the module docs.
 pub struct BufferManager {
     backend: Arc<dyn Backend>,
@@ -132,10 +154,9 @@ pub struct BufferManager {
     /// Sharded blob cache. `DashMap` shards by `BlobGuid` so
     /// concurrent `pin` / `get_cached` on different blobs hit
     /// different shards — no single global mutex on the hot read
-    /// path. Replaces v0.1's `Mutex<HashMap>` + `VecDeque<BlobGuid>`
-    /// inline LRU; the v0.2 background eviction thread + each
-    /// entry's `last_touched` tick give "approximate LRU" without
-    /// needing an O(n) front-of-deque touch on every hit.
+    /// path. The background eviction thread + each entry's
+    /// `last_touched` tick give "approximate LRU" without needing
+    /// an O(n) front-of-deque touch on every hit.
     cache: DashMap<BlobGuid, Arc<CachedBlob>>,
     /// Per-blob lowest unflushed WAL seq. An entry exists ⟺ the
     /// cached image of that blob is newer than the backend image
@@ -143,7 +164,19 @@ pub struct BufferManager {
     /// [`BufferManager::snapshot_dirty`] so checkpoint rounds and
     /// concurrent writers don't step on each other.
     dirty: Mutex<HashMap<BlobGuid, u64>>,
-    /// Monotonic logical clock used by the v0.2 eviction thread to
+    /// Blobs the walker has unlinked from their parent in cache
+    /// but whose backend slot can't be released yet — invariant
+    /// W2D forbids removing them from the manifest before the WAL
+    /// record covering the unlink op is durable. The checkpoint
+    /// round drains this set **after** Sync (data + manifest
+    /// stable) and **before** WAL truncate, so the truncate gate
+    /// can promise "everything in this WAL is either redundant
+    /// with backend or already pending in dirty/pending-delete".
+    ///
+    /// `guid -> seq` mirrors `dirty`'s shape: `seq` is the WAL
+    /// seq of the op that unlinked this blob.
+    pending_deletes: Mutex<HashMap<BlobGuid, u64>>,
+    /// Monotonic logical clock used by the eviction thread to
     /// classify cache entries as cold. Every `pin` / `get_cached`
     /// stamps the touched entry's `last_touched` with
     /// `clock.fetch_add(1)`; the eviction thread compares the
@@ -168,7 +201,7 @@ pub struct CachedBlob {
     latch: HybridLatch,
     buf: UnsafeCell<AlignedBlobBuf>,
     /// Stamp set by `BufferManager` on every `pin` / `get_cached`.
-    /// Read by the v0.2 eviction thread to decide if this entry is
+    /// Read by the eviction thread to decide if this entry is
     /// cold enough to drop. Relaxed reads/writes — see
     /// [`BufferManager::clock`].
     last_touched: AtomicU64,
@@ -191,7 +224,7 @@ impl CachedBlob {
     }
 
     /// Logical tick at which this entry was last looked up. Used
-    /// by the v0.2 eviction thread to classify the entry as cold.
+    /// by the eviction thread to classify the entry as cold.
     #[must_use]
     pub(crate) fn last_touched(&self) -> u64 {
         self.last_touched.load(Ordering::Relaxed)
@@ -318,11 +351,12 @@ impl BufferManager {
             capacity: capacity.max(1),
             cache: DashMap::new(),
             dirty: Mutex::new(HashMap::new()),
+            pending_deletes: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(1),
         }
     }
 
-    /// Current logical clock value. Read by the v0.2 eviction
+    /// Current logical clock value. Read by the eviction
     /// thread to compare against each entry's `last_touched`. The
     /// returned tick is `Relaxed` — fine for "how cold is this
     /// entry" decisions, not for cross-thread synchronisation.
@@ -382,11 +416,12 @@ impl BufferManager {
     pub fn clear(&self) {
         self.cache.clear();
         self.dirty.lock().unwrap().clear();
+        self.pending_deletes.lock().unwrap().clear();
     }
 
     /// Internal: look up `guid` in the cache. On a hit, stamps
     /// the entry's `last_touched` with the current clock tick so
-    /// the v0.2 eviction thread treats this hit as fresh.
+    /// the eviction thread treats this hit as fresh.
     fn get_cached(&self, guid: BlobGuid) -> Option<Arc<CachedBlob>> {
         let entry = self.cache.get(&guid)?;
         let arc = Arc::clone(entry.value());
@@ -416,8 +451,8 @@ impl BufferManager {
         inserted.value().last_touched.store(tick, Ordering::Relaxed);
         drop(inserted);
 
-        // Inline overflow eviction. With the v0.2 background
-        // eviction thread, capacity overflow is a rare burst
+        // Inline overflow eviction. With the background eviction
+        // thread running, capacity overflow is a rare burst
         // event — the bg sweep keeps it well below capacity in
         // steady state. The loop bounds itself by the number of
         // entries we walk (so it always terminates).
@@ -556,7 +591,7 @@ impl BufferManager {
         Ok(())
     }
 
-    // ---------- dirty tracking (v0.2 background checkpointer) ----------
+    // ---------- dirty tracking ----------
 
     /// Tag `guid` as dirty at WAL seq `txn_id`.
     ///
@@ -633,10 +668,81 @@ impl BufferManager {
         self.dirty.lock().unwrap().len()
     }
 
+    // ---------- deferred delete (W2D for erase) ----------
+
+    /// Tag `guid` for **deferred** backend deletion at WAL seq
+    /// `txn_id`. Removes the blob from cache + dirty (the cache
+    /// image is dead; a lingering dirty entry would chase a
+    /// soon-deleted slot) and queues the `backend.delete_blob`
+    /// call for the next checkpoint round.
+    ///
+    /// Used by the erase walker's `SubtreeGone` branch. The naive
+    /// alternative — calling `bm.delete_blob` inline — modifies
+    /// the in-memory manifest before the WAL record covering the
+    /// unlink is durable; a racing `backend.flush` (from any other
+    /// op's checkpoint) would persist the manifest's "child gone"
+    /// view to disk while the WAL still lacks the erase record,
+    /// and on reopen the root's `BlobNode` points at a slot the
+    /// manifest no longer recognises (corruption). Deferring via
+    /// this queue closes the window.
+    ///
+    /// The checkpoint round drains this set after Sync (data file
+    /// plus initial manifest snapshot durable) and re-Syncs once
+    /// the deletions have been applied — only then can the WAL
+    /// be truncated.
+    pub fn mark_for_delete(&self, guid: BlobGuid, txn_id: u64) {
+        self.cache.remove(&guid);
+        self.dirty.lock().unwrap().remove(&guid);
+        let mut p = self.pending_deletes.lock().unwrap();
+        p.entry(guid)
+            .and_modify(|cur| *cur = (*cur).min(txn_id))
+            .or_insert(txn_id);
+    }
+
+    /// Atomically take the current pending-delete map, leaving an
+    /// empty one behind. Caller (checkpoint round / manual
+    /// `Tree::checkpoint`) is responsible for executing each
+    /// `backend.delete_blob` or restoring on failure.
+    #[must_use]
+    pub fn snapshot_pending_deletes(&self) -> HashMap<BlobGuid, u64> {
+        let mut p = self.pending_deletes.lock().unwrap();
+        std::mem::take(&mut *p)
+    }
+
+    /// Merge `entries` back into the pending-delete map, keeping
+    /// the per-blob min seq.
+    pub fn restore_pending_deletes(&self, entries: HashMap<BlobGuid, u64>) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut p = self.pending_deletes.lock().unwrap();
+        for (g, t) in entries {
+            p.entry(g)
+                .and_modify(|cur| *cur = (*cur).min(t))
+                .or_insert(t);
+        }
+    }
+
+    /// Number of blobs waiting for deferred backend deletion.
+    /// Reads as zero under the WAL-truncate gate are part of the
+    /// "WAL records are all redundant" invariant.
+    #[must_use]
+    pub fn pending_delete_count(&self) -> usize {
+        self.pending_deletes.lock().unwrap().len()
+    }
+
+    /// Execute a queued deletion against the inner backend.
+    /// Manifest mutation is in-memory; subsequent `backend.flush`
+    /// makes it durable. Failure is the caller's restoration
+    /// concern.
+    pub(crate) fn execute_pending_delete(&self, guid: BlobGuid) -> Result<()> {
+        self.backend.delete_blob(guid)
+    }
+
     /// Snapshot the cached bytes for `guid` into a freshly allocated
     /// `AlignedBlobBuf`. Returns `None` if the blob isn't cached.
     ///
-    /// Used by the v0.2 background checkpointer to hand off bytes to
+    /// Used by the background checkpointer to hand off bytes to
     /// the I/O worker thread without keeping the shared read guard
     /// open across the actual `backend.write_blob` call. The read
     /// guard is held only for the duration of the 512 KB memcpy, so
@@ -649,28 +755,82 @@ impl BufferManager {
     }
 
     /// Push pre-snapshotted bytes for `guid` directly to the inner
-    /// backend, bypassing the cache. Used by the v0.2 I/O worker
+    /// backend, bypassing the cache. Used by the I/O worker
     /// thread, which receives bytes that were snapshotted by the
     /// orchestrator under a shared read guard.
     ///
-    /// On success, clears the dirty entry for `guid` (the backend
-    /// image now matches the snapshot). On failure, leaves the
-    /// dirty entry intact so the next round retries.
-    pub(crate) fn write_through(&self, guid: BlobGuid, bytes: &AlignedBlobBuf) -> Result<()> {
+    /// `expected_seq` is the dirty-map value the checkpointer
+    /// observed when it snapshotted this blob. On a successful
+    /// backend write the dirty entry is removed **only if it
+    /// still equals `expected_seq`** — if a writer raced in
+    /// between snapshot and write and bumped the entry to a newer
+    /// seq, the new entry survives so the next round picks it up
+    /// (the snapshot's bytes don't include that writer's mutation,
+    /// so we mustn't claim the blob is clean).
+    ///
+    /// On failure both the unflushed-snapshot fact and any racing
+    /// writer's entry survive in the dirty map — restoration is
+    /// the caller's responsibility (see `round::run_round`).
+    pub(crate) fn write_through(
+        &self,
+        guid: BlobGuid,
+        bytes: &AlignedBlobBuf,
+        expected_seq: u64,
+    ) -> Result<()> {
         self.backend.write_blob(guid, bytes)?;
-        // Snapshot-time bytes are now durable in backend. Any
-        // concurrent writer that mutated cache after our snapshot
-        // already called `mark_dirty` with a newer entry; that
-        // entry survives this clear because we only `remove` the
-        // map slot if it's still present (see commit's pattern).
-        self.dirty.lock().unwrap().remove(&guid);
+        let mut d = self.dirty.lock().unwrap();
+        if let std::collections::hash_map::Entry::Occupied(e) = d.entry(guid) {
+            // Only retire the entry when no racing writer has
+            // bumped it. `mark_dirty` keeps the **minimum**
+            // unflushed seq, so a survivor here has a seq newer
+            // than ours iff a racer landed after we drained.
+            if *e.get() == expected_seq {
+                e.remove();
+            }
+        }
         Ok(())
     }
 
     /// Forward `flush` to the inner backend without touching the
-    /// cache. Used by the v0.2 I/O worker for `IoTask::Sync`.
+    /// cache. Used by the I/O worker for `IoTask::Sync`.
     pub(crate) fn backend_flush(&self) -> Result<()> {
         self.backend.flush()
+    }
+
+    /// Stage a freshly-created blob in cache and tag it dirty at
+    /// `seq` — the unified `mark_dirty → checkpoint round → backend
+    /// write` protocol takes ownership from there.
+    ///
+    /// Used by spillover when it produces a new child blob: the
+    /// bytes must NOT reach backend before the WAL record covering
+    /// the op that triggered spillover (invariant W2D). Deferring
+    /// the backend write via the dirty map preserves that ordering;
+    /// the previous code's inline `write_blob → flush` here let the
+    /// new child's bytes land on disk before the user's WAL record
+    /// was durable, so a crash between the two left an orphan blob
+    /// **and** could leave a parent `BlobNode` pointing at it (the
+    /// parent's mutation was cached, but on recovery a subsequent
+    /// op might flush the parent before the WAL record for the
+    /// spillover-trigger op was durable).
+    ///
+    /// Overflow eviction can't fire on this fresh entry — its
+    /// `dirty` entry would survive but the cache image wouldn't,
+    /// breaking invariant **I1** (dirty ⟺ cache newer than
+    /// backend). Inline overflow eviction is therefore skipped
+    /// here; the background eviction thread or the next round's
+    /// flush will catch up.
+    pub(crate) fn install_new_blob(&self, guid: BlobGuid, bytes: AlignedBlobBuf, seq: u64) {
+        let tick = self.clock.fetch_add(1, Ordering::Relaxed);
+        let entry = Arc::new(CachedBlob::new(bytes));
+        entry.last_touched.store(tick, Ordering::Relaxed);
+        // Defensive overwrite: a fresh GUID shouldn't collide, but
+        // if it does we want the newest bytes to win (the dirty
+        // entry below will also keep the lowest seq across both).
+        self.cache.insert(guid, entry);
+        let mut d = self.dirty.lock().unwrap();
+        d.entry(guid)
+            .and_modify(|cur| *cur = (*cur).min(seq))
+            .or_insert(seq);
     }
 }
 
@@ -937,6 +1097,54 @@ mod tests {
     }
 
     #[test]
+    fn write_through_keeps_racing_writer_dirty_entry() {
+        // Reproduces the dirty-race fix: a checkpointer drains the
+        // dirty map at snapshot time (snap_seq=50), then before
+        // `write_through` runs an in-process writer marks the
+        // same blob dirty with a newer seq (200). The writer's
+        // mutation is NOT in our snapshot bytes, so the entry
+        // must survive `write_through`'s clear.
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        inner.write_blob([0xAA; 16], &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let _pin = bm.pin([0xAA; 16]).unwrap();
+
+        // Simulate the planner's drain by manually setting up the
+        // "post-drain" state: dirty contains a NEW writer's entry.
+        bm.mark_dirty([0xAA; 16], 200);
+        let snap_bytes = bm.snapshot_bytes([0xAA; 16]).unwrap();
+
+        // The planner's snap had captured snap_seq=50 (a stale
+        // pre-drain value). Pass that through.
+        bm.write_through([0xAA; 16], &snap_bytes, 50).unwrap();
+        assert_eq!(
+            bm.dirty_count(),
+            1,
+            "write_through must not stomp a racing newer-seq entry",
+        );
+        let live = bm.snapshot_dirty();
+        assert_eq!(live[&[0xAA; 16]], 200, "racing writer's seq survives");
+    }
+
+    #[test]
+    fn write_through_retires_clean_snapshot() {
+        // Counterpart to the race test: when the dirty entry
+        // still matches the snapshot's seq (no racing writer),
+        // `write_through` does retire it.
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        inner.write_blob([0xBB; 16], &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let _pin = bm.pin([0xBB; 16]).unwrap();
+
+        bm.mark_dirty([0xBB; 16], 42);
+        let snap_bytes = bm.snapshot_bytes([0xBB; 16]).unwrap();
+
+        // expected_seq matches the current entry → safe to retire.
+        bm.write_through([0xBB; 16], &snap_bytes, 42).unwrap();
+        assert_eq!(bm.dirty_count(), 0);
+    }
+
+    #[test]
     fn write_blob_through_trait_clears_dirty() {
         let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
         let bm = BufferManager::new(inner, 4);
@@ -966,6 +1174,49 @@ mod tests {
             0,
             "deleted blobs must not linger as flush candidates"
         );
+    }
+
+    #[test]
+    fn install_new_blob_caches_and_marks_dirty_without_backend_write() {
+        // The unified-protocol fix: spillover's new child blob
+        // must land in cache + dirty, NOT in the inner backend,
+        // so the checkpoint round can enforce the W2D ordering
+        // (WAL flush THEN backend write).
+        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
+        let bm = BufferManager::new(Arc::clone(&inner), 4);
+
+        let new_guid = [0xCC; 16];
+        let mut bytes = AlignedBlobBuf::zeroed();
+        bytes.as_mut_slice()[200] = 0x77;
+
+        bm.install_new_blob(new_guid, bytes, /*seq=*/ 42);
+
+        // BM cached + dirty.
+        assert_eq!(bm.cached_count(), 1);
+        assert_eq!(bm.dirty_count(), 1);
+        assert_eq!(bm.min_unflushed_txn(), Some(42));
+
+        // Inner backend has nothing yet.
+        assert!(
+            !inner.has_blob(new_guid).unwrap(),
+            "install_new_blob must defer the backend write to the checkpoint round",
+        );
+
+        // Pinning the blob returns the cached image.
+        let pin = bm.pin(new_guid).unwrap();
+        let guard = pin.read();
+        assert_eq!(guard.as_slice()[200], 0x77);
+        drop(guard);
+        drop(pin);
+
+        // After commit, the inner backend has the bytes and the
+        // dirty entry is cleared.
+        bm.commit(new_guid).unwrap();
+        assert_eq!(bm.dirty_count(), 0);
+        assert!(inner.has_blob(new_guid).unwrap());
+        let mut dst = AlignedBlobBuf::zeroed();
+        inner.read_blob(new_guid, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[200], 0x77);
     }
 
     #[test]

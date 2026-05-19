@@ -29,9 +29,10 @@ pub enum Error {
         /// Caller-supplied length.
         len: usize,
     },
-    /// A walker-arm hit a NodeType the v0.1 engine doesn't yet
-    /// implement (Node48, Node256, Blob, etc.). Will go away as
-    /// the engine fills out.
+    /// A walker arm hit a code path that the engine doesn't yet
+    /// implement (e.g. degenerate `Leaf` / `EmptyRoot` spillover,
+    /// inline-prefix `BlobNode` splits). The static string names
+    /// the unimplemented case for diagnostics.
     NotYetImplemented(&'static str),
     /// A blob's slot table or header is corrupt — recovery
     /// should bail out rather than silently misbehave.

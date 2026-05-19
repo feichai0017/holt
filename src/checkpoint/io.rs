@@ -43,9 +43,18 @@ pub(crate) enum IoTask {
     /// owned by the task (snapshotted from cache by the planner)
     /// so the I/O thread doesn't touch the BM's read guard during
     /// the write.
+    ///
+    /// `expected_seq` is the dirty-map value the planner observed
+    /// when it drained the snapshot. The I/O worker only retires
+    /// the dirty entry after a successful write if the current
+    /// entry still equals this seq — guards against a racing
+    /// writer that called `mark_dirty(guid, newer_seq)` after the
+    /// drain (those bytes aren't in our snapshot, so we mustn't
+    /// pretend the blob is clean).
     Flush {
         guid: BlobGuid,
         bytes: AlignedBlobBuf,
+        expected_seq: u64,
         on_done: Completion,
     },
     /// `fdatasync` (via `Backend::flush`). The orchestrator sends
@@ -65,9 +74,10 @@ pub(crate) fn run(shared: &Arc<Shared>, rx: Receiver<IoTask>) {
             IoTask::Flush {
                 guid,
                 bytes,
+                expected_seq,
                 on_done,
             } => {
-                let result = shared.bm.write_through(guid, &bytes);
+                let result = shared.bm.write_through(guid, &bytes, expected_seq);
                 // `send` only fails if the orchestrator dropped
                 // the receiver — which only happens if the round
                 // aborted or the Tree is shutting down. Either

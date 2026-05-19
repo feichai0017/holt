@@ -71,9 +71,9 @@ pub struct TreeStats {
     pub checkpointer: Option<CheckpointerStats>,
 }
 
-/// Snapshot of the v0.2 background checkpointer's accumulated
+/// Snapshot of the background checkpointer's accumulated
 /// counters. Returned inside [`TreeStats::checkpointer`] when the
-/// bg thread group is enabled. All counters are cumulative since
+/// thread group is enabled. All counters are cumulative since
 /// the threads were spawned.
 #[derive(Debug, Clone, Copy)]
 pub struct CheckpointerStats {

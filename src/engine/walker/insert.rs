@@ -21,8 +21,8 @@ use super::MAX_SPILLOVER_ATTEMPTS;
 // ---------- public entry points ----------
 
 /// Single-blob insert. Surfaces [`Error::NotYetImplemented`] if
-/// the descent reaches a [`NodeType::Blob`] crossing — Stage 2d
-/// callers wanting cross-blob support should use [`insert_multi`].
+/// the descent reaches a [`NodeType::Blob`] crossing — callers
+/// that need cross-blob support should use [`insert_multi`].
 ///
 /// `seq` is the journal sequence number to stamp on the new leaf
 /// (callers should pass a monotonically-increasing value). Returns
@@ -55,9 +55,10 @@ pub fn insert(
 /// [`crate::store::AllocError::OutOfSpace`].
 ///
 /// Child blobs encountered during descent are pinned in the same
-/// BM cache and mutated in place; their durable write back to the
-/// inner backend happens via [`BufferManager::commit`] at the end
-/// of each cross-blob recursion.
+/// BM cache and mutated in place. The walker tags every touched
+/// child via `bm.mark_dirty(child_guid, seq)`; the actual
+/// backend write is the checkpoint round's job (and only happens
+/// after the WAL record for `seq` is durable — invariant W2D).
 pub fn insert_multi(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
@@ -118,7 +119,7 @@ pub fn insert_multi(
             Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
                 {
                     let mut frame = BlobFrame::wrap(guard.as_mut_slice());
-                    spillover_blob(bm, &mut frame)?;
+                    spillover_blob(bm, &mut frame, seq)?;
                 }
                 compact_blob(&mut guard)?;
             }
@@ -402,16 +403,17 @@ fn insert_into_inner(
 /// Insert across a [`NodeType::Blob`] crossing.
 ///
 /// Pins the child blob in the BM, runs the recursive insert in
-/// place (with its own spillover+compact retry loop), then commits
-/// the child blob to disk via [`BufferManager::commit`].
+/// place (with its own spillover+compact retry loop), then stages
+/// the mutation via `bm.mark_dirty(child_guid, seq)` so the
+/// checkpoint round can flush it under invariant W2D.
 ///
-/// Stage 2d phase B' limitation: if the BlobNode's inline prefix
-/// doesn't match the key, this returns [`Error::NotYetImplemented`].
-/// A real engine would split the BlobNode into
-/// Prefix+Node4{old_bn, new_subtree}, similar to
-/// `insert_into_prefix`'s diverged path. Common-case workloads
-/// rarely hit this since spillover always installs a BlobNode with
-/// an empty inline prefix.
+/// **Inline-prefix split limitation**: if the BlobNode's inline
+/// prefix doesn't match the key, this returns
+/// [`Error::NotYetImplemented`]. A full implementation would
+/// split the BlobNode into `Prefix + Node4{old_bn, new_subtree}`,
+/// similar to `insert_into_prefix`'s diverged path. Common-case
+/// workloads rarely hit this since spillover always installs a
+/// BlobNode with an empty inline prefix.
 fn insert_at_blob_node(
     bm: &BufferManager,
     parent_frame: &mut BlobFrame<'_>,
@@ -437,7 +439,7 @@ fn insert_at_blob_node(
     }
     if depth + plen > key.len() || key[depth..depth + plen] != bn.bytes[..plen] {
         return Err(Error::NotYetImplemented(
-            "insert_at_blob_node: BlobNode inline-prefix split — Stage 2d phase B'",
+            "insert_at_blob_node: BlobNode inline-prefix split is not yet implemented",
         ));
     }
 
@@ -468,7 +470,7 @@ fn insert_at_blob_node(
                     {
                         let mut guard = child_pin.write();
                         let mut cf = BlobFrame::wrap(guard.as_mut_slice());
-                        spillover_blob(bm, &mut cf)?;
+                        spillover_blob(bm, &mut cf, seq)?;
                     }
                     {
                         let mut guard = child_pin.write();
@@ -522,7 +524,14 @@ fn insert_at_blob_node(
     }
 
     drop(child_pin);
-    bm.commit(child_guid)?;
+    // Hand the child blob to the unified checkpoint protocol —
+    // it's now dirty at this op's seq. Flushing the bytes to
+    // backend is the checkpoint round's job (and only happens
+    // **after** the WAL record for this op is durable). An inline
+    // `bm.commit(child_guid)` here would let child bytes reach
+    // backend before WAL — invariant W2D-broken; see
+    // `BufferManager` module docs.
+    bm.mark_dirty(child_guid, seq);
 
     Ok(InsertReturn {
         slot_after: bn_slot,

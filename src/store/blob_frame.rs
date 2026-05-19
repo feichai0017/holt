@@ -339,8 +339,8 @@ impl<'a> BlobFrame<'a> {
     /// from `space_used`. Returns `(slot, body_offset, size)` —
     /// caller writes the body via `body_of_slot_mut(slot)`.
     ///
-    /// **Why the cross-type fallback?** Stage 2d spillover allocates
-    /// a `BlobNode` (128 B) at the exact moment the blob is full
+    /// **Why the cross-type fallback?** Spillover allocates a
+    /// `BlobNode` (128 B) at the exact moment the blob is full
     /// — bump-allocation can't satisfy it. But the same spillover
     /// just freed a victim subtree, which typically contains
     /// several `Prefix` nodes (also 128 B). Letting `alloc(Blob)`

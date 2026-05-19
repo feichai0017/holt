@@ -22,7 +22,7 @@ use crate::layout::{
     leaf_extent_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix,
     BLOB_MAX_INLINE, DATA_AREA_START, MAX_SLOTS, PAGE_SIZE, PREFIX_MAX_INLINE,
 };
-use crate::store::backend::{AlignedBlobBuf, Backend};
+use crate::store::backend::AlignedBlobBuf;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
 
 use super::cast;
@@ -162,9 +162,10 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
 ///    child-fits-into-parent-remaining test).
 /// 2. The combined slot-table usage stays under `MAX_SLOTS`.
 /// 3. The child has **no** own `BlobNode` crossings
-///    (`child.num_ext_blobs == 0`) — v0.1 doesn't unfold nested
-///    crossings; a child whose subtree itself spans multiple blobs
-///    needs that handled by a separate pass first.
+///    (`child.num_ext_blobs == 0`) — the merge pass doesn't
+///    unfold nested crossings; a child whose subtree itself
+///    spans multiple blobs needs that handled by a separate
+///    pass first.
 /// 4. The child has no tombstoned leaves (`tombstone_leaf_cnt == 0`).
 ///    Compact the child first if the workload has just churned
 ///    deletes through it; merging tombstone weight is wasted work.
@@ -218,10 +219,18 @@ pub fn is_mergeable(
 /// `true` before this is called. Calling without that check risks
 /// `OutOfSpace` mid-clone on a too-big merge or wasted work on a
 /// merge that violates the no-nested-crossings precondition.
+/// `seq` is stamped on the deferred-delete entry the merged
+/// child generates. Callers from a user op path should pass the
+/// op's WAL seq so the W2D protocol can pair the manifest delete
+/// with a real WAL record. Internal callers (compact, the
+/// checkpoint round's merge pass) pass
+/// [`crate::store::buffer_manager::STRUCTURAL_SEQ`] — the merge
+/// has no WAL record and shouldn't pin the trim watermark.
 pub fn merge_blob(
     bm: &BufferManager,
     parent_frame: &mut BlobFrame<'_>,
     parent_bn_slot: u16,
+    seq: u64,
 ) -> Result<u16> {
     let bn = read_blob_node(parent_frame, parent_bn_slot)?;
     let child_guid = bn.child_blob_guid;
@@ -244,7 +253,15 @@ pub fn merge_blob(
     };
 
     parent_frame.free_node(parent_bn_slot)?;
-    bm.delete_blob(child_guid)?;
+    // Hand the now-orphaned child blob to the deferred-delete
+    // protocol. An inline `bm.delete_blob` here would push the
+    // manifest mutation to in-memory before the caller's WAL
+    // flush (or, for internal callers like compact / merge_pass,
+    // before the next checkpoint round's Sync); on crash that
+    // would leave the parent in cache pointing at no child
+    // while manifest persistence raced ahead through any
+    // unrelated `backend.flush`.
+    bm.mark_for_delete(child_guid, seq);
 
     #[cfg(feature = "tracing")]
     tracing::debug!(
@@ -252,7 +269,7 @@ pub fn merge_blob(
         child_guid = ?&child_guid[..4],
         parent_bn_slot = parent_bn_slot,
         inlined_root = inlined_root,
-        "merge_blob: folded child into parent + deleted",
+        "merge_blob: folded child into parent + queued delete",
     );
 
     Ok(inlined_root)

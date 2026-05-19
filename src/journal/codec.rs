@@ -76,7 +76,7 @@ pub const FILE_HEADER_SIZE: usize = 32;
 ///
 /// - `MAGIC` = [`FILE_MAGIC`] (`"WALA"` LE).
 /// - `VER`   = [`FORMAT_VERSION`].
-/// - `TREE`  = tree owner identifier; `0` for the single-tree v0.1.
+/// - `TREE`  = tree owner identifier; `0` for the single-tree API.
 /// - `CREATED` = unix epoch seconds; `0` when the writer chose
 ///   not to stamp a time (e.g. tests).
 /// - `RSVD`  = reserved for a future version bump, must be `0`.
@@ -168,7 +168,7 @@ const REASON_OUT_OF_BLOB_FRAME: u8 = 2;
 /// and dispatches via function pointer afterwards. On supported
 /// hardware (≈Skylake+, Apple Silicon, recent ARM cores) that's
 /// ≈8-12 GB/s; the fallback `slice-by-16` table-driven path on
-/// older cores is still ≈4× the v0.1 byte-at-a-time loop.
+/// older cores is still well ahead of a byte-at-a-time loop.
 pub fn crc32(bytes: &[u8]) -> u32 {
     crc32fast::hash(bytes)
 }

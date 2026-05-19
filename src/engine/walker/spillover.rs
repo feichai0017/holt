@@ -10,7 +10,6 @@
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType, Prefix};
-use crate::store::backend::Backend;
 use crate::store::{BlobFrame, BufferManager};
 
 use super::cast;
@@ -34,23 +33,39 @@ pub(super) use super::migrate::compact_blob;
 /// iteration.
 ///
 /// Returns the BlobNode slot installed in `frame` so callers /
-/// tests can verify. The new blob is **already written to the
-/// backend** at the time of return.
-pub(super) fn spillover_blob(bm: &BufferManager, frame: &mut BlobFrame<'_>) -> Result<u16> {
+/// tests can verify. The new blob lives in the BM cache + dirty
+/// map; its backend write happens during the next checkpoint round
+/// (after the WAL record for the spillover-triggering op is
+/// durable — invariant W2D).
+///
+/// `seq` is the WAL seq the caller pre-allocated for the op that
+/// triggered spillover (insert / rename / batched put). The new
+/// child blob is tagged `mark_dirty(new_guid, seq)` so the
+/// checkpoint round's truncate gate can't drop the WAL record
+/// before the blob's bytes are durable.
+pub(super) fn spillover_blob(
+    bm: &BufferManager,
+    frame: &mut BlobFrame<'_>,
+    seq: u64,
+) -> Result<u16> {
     let root_slot = frame.header().root_slot;
     let victim = pick_victim_subtree(frame, root_slot)?;
 
     let new_guid = fresh_blob_guid();
     let outcome = make_blob_from_node(frame, victim.victim_slot, new_guid)?;
 
-    // Persist the new blob BEFORE installing the BlobNode in the
-    // source. If we crash between these two writes, the new blob
-    // sits orphaned (recoverable via a future GC pass); we never
-    // end up with a parent BlobNode pointing at a non-existent
-    // child blob. `BufferManager::write_blob` caches the fresh
-    // image and writes through to the inner backend in one call.
-    bm.write_blob(new_guid, &outcome.buf)?;
-    bm.flush()?;
+    // Stage the new blob via the unified `mark_dirty → checkpoint
+    // round` protocol — the bytes stay in cache until the round
+    // flushes WAL **first** and then writes them through. An
+    // inline `bm.write_blob(new_guid, ...) + bm.flush()` here
+    // would violate invariant W2D: a crash between the inline
+    // write and the user's WAL flush would leave an orphan in
+    // backend AND the parent's BlobNode staged only in cache —
+    // and a racing checkpointer could flush the parent's
+    // BlobNode before the user's WAL record was durable,
+    // leaving the on-disk parent pointing at the pre-spillover
+    // orphan position.
+    bm.install_new_blob(new_guid, outcome.buf, seq);
 
     // Free the migrated subtree's slots in the source blob.
     free_subtree(frame, victim.victim_slot)?;
@@ -378,21 +393,96 @@ pub(super) fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
     Ok(())
 }
 
-/// Produce a fresh blob GUID. Process-local uniqueness for v0.1:
-/// monotonic counter + process ID + magic suffix. Tag the high
-/// bytes so a fresh GUID never collides with `ROOT_BLOB_GUID =
-/// [0; 16]`. A full UUID v4 generator can replace this later.
+/// Produce a fresh 128-bit blob GUID with cross-process,
+/// cross-restart uniqueness — UUIDv7-ish layout:
+///
+/// - **bytes 0..8** — `nanos_since_epoch` big-endian: time-orders
+///   GUIDs for debug-friendly manifest dumps.
+/// - **bytes 8..12** — per-process atomic counter big-endian:
+///   resolves ties when many GUIDs are minted in the same
+///   nanosecond.
+/// - **bytes 12..15** — three random bytes from the OS entropy
+///   source (`getrandom` on Linux, `getentropy` on the BSDs).
+///   Closes the cross-process collision class "process A
+///   crashes, process B starts on the same machine, OS reuses
+///   pid, counter resets to 1 → identical GUID; new spillover
+///   overwrites the crashed process's orphan blob in backend".
+/// - **byte 15** — magic tag `0xD4` so a fresh GUID can never
+///   collide with `ROOT_BLOB_GUID = [0; 16]`.
+///
+/// Time-based prefix doesn't compromise privacy here: the GUID
+/// lives inside an internal `manifest.bin` and never escapes the
+/// process.
 pub(super) fn fresh_blob_guid() -> BlobGuid {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let c = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let pid = std::process::id() as u64;
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let c = COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
+
+    let mut tail = [0u8; 3];
+    if !fill_os_entropy(&mut tail) {
+        // Fallback: derive from nanos + counter via a 64-bit
+        // mixer. Deterministic-but-non-colliding even under
+        // sandbox restrictions that block `getrandom`/
+        // `getentropy`. Time prefix still dominates uniqueness
+        // across restarts, so this only ever weakens the
+        // intra-tick tiebreaker.
+        let m = nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ u64::from(c);
+        tail[0] = (m >> 16) as u8;
+        tail[1] = (m >> 24) as u8;
+        tail[2] = (m >> 32) as u8;
+    }
+
     let mut g = [0u8; 16];
-    g[0..8].copy_from_slice(&c.to_le_bytes());
-    g[8..12].copy_from_slice(&(pid as u32).to_le_bytes());
-    g[12] = 0xA1;
-    g[13] = 0xB2;
-    g[14] = 0xC3;
-    g[15] = 0xD4;
+    g[0..8].copy_from_slice(&nanos.to_be_bytes());
+    g[8..12].copy_from_slice(&c.to_be_bytes());
+    g[12] = tail[0];
+    g[13] = tail[1];
+    g[14] = tail[2];
+    g[15] = 0xD4; // tag — see fn doc
     g
+}
+
+/// Best-effort OS entropy read. Returns `true` on full fill.
+///
+/// holt is Unix-only (see project memory). Linux uses
+/// `getrandom(2)`; the BSD family (macOS, FreeBSD, OpenBSD,
+/// NetBSD) uses `getentropy(2)`. Both syscalls are blocking and
+/// return cryptographically-strong bytes; we don't need crypto
+/// strength here, only "different between processes / restarts".
+fn fill_os_entropy(buf: &mut [u8]) -> bool {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let r = libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0);
+        return r >= 0 && (r as usize) == buf.len();
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
+    unsafe {
+        // `getentropy` max is 256 bytes per call; our 3-byte read
+        // is comfortably under.
+        libc::getentropy(buf.as_mut_ptr().cast(), buf.len()) == 0
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    )))]
+    {
+        let _ = buf;
+        false
+    }
 }

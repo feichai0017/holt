@@ -81,7 +81,13 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     let snap_count = snap.len();
     shared.last_dirty_count.store(snap_count, Ordering::Relaxed);
 
-    if snap.is_empty() && merged == 0 {
+    // Early-skip only when nothing at all needs attention. A
+    // pending deferred-delete from a previous round (e.g. one
+    // whose `backend.delete_blob` or trailing Sync failed and
+    // got restored) must keep rounds running so it eventually
+    // drains — otherwise the WAL truncate gate stays closed
+    // forever.
+    if snap.is_empty() && merged == 0 && shared.bm.pending_delete_count() == 0 {
         shared.rounds_succeeded.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "tracing")]
         tracing::trace!(target: "holt::checkpoint", "round skipped — nothing dirty");
@@ -115,6 +121,11 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         let task = IoTask::Flush {
             guid: *guid,
             bytes,
+            // Carry the drained dirty seq so the I/O worker can
+            // tell "no writer raced us" (safe to retire the dirty
+            // entry) from "racer landed" (must leave the new
+            // entry alone for the next round).
+            expected_seq: *txn_id,
             on_done: tx,
         };
         if shared.io_tx.send(task).is_err() {
@@ -181,12 +192,88 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         }
     }
 
-    // 6. Truncate WAL atomically iff every snapshot landed AND no
-    //    racing writer has re-dirtied (under WAL-lock check).
-    if failed.is_empty() {
+    // 6. Apply pending deletes — the erase walker's SubtreeGone
+    //    path queued these via `bm.mark_for_delete(child, seq)`
+    //    so the manifest mutation couldn't race ahead of the WAL.
+    //    Safe to drain now: every dirty Flush above is on disk
+    //    (via Sync at step 5) and the WAL records covering the
+    //    erase ops were durable at step 2. The manifest mutations
+    //    happen in-memory here; the trailing re-Sync at step 7
+    //    persists them.
+    let pending = shared.bm.snapshot_pending_deletes();
+    let pending_count = pending.len();
+    let mut pending_failed: HashMap<BlobGuid, u64> = HashMap::new();
+    for (guid, seq) in &pending {
+        if let Err(e) = shared.bm.execute_pending_delete(*guid) {
+            eprintln!(
+                "holt: checkpoint deferred delete failed for blob {:02x?} (seq={seq}): {e}",
+                &guid[..4]
+            );
+            pending_failed.insert(*guid, *seq);
+        }
+    }
+    if !pending_failed.is_empty() {
+        shared.bm.restore_pending_deletes(pending_failed.clone());
+    }
+
+    // 7. Re-Sync iff we actually deleted anything — the manifest
+    //    mutation at step 6 is in-memory until `backend.flush`
+    //    rewrites the manifest file. Skip the syscall when the
+    //    pending set was empty.
+    let applied_deletes = pending_count - pending_failed.len();
+    // Helper: on Sync failure here the manifest deletions we
+    // already applied at step 6 are stuck in-memory. We can't
+    // re-`execute_pending_delete` them (the slot is already
+    // gone from the manifest map and the call is idempotent),
+    // but we MUST keep them in the pending-delete set so the
+    // truncate gate stays closed and the next round retries the
+    // Sync. Re-registering with the same seq is idempotent
+    // (min-merge in `restore_pending_deletes`).
+    let restore_applied = || -> HashMap<BlobGuid, u64> {
+        pending
+            .iter()
+            .filter(|(g, _)| !pending_failed.contains_key(*g))
+            .map(|(g, s)| (*g, *s))
+            .collect()
+    };
+    if applied_deletes > 0 {
+        let (sync_tx2, sync_rx2) = bounded(1);
+        if shared
+            .io_tx
+            .send(IoTask::Sync { on_done: sync_tx2 })
+            .is_err()
+        {
+            shared.bm.restore_pending_deletes(restore_applied());
+            return Err(Error::NotYetImplemented(
+                "checkpoint: I/O worker channel closed before Sync (deletes)",
+            ));
+        }
+        match sync_rx2.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("holt: checkpoint backend Sync (deletes) failed: {e}");
+                shared.bm.restore_pending_deletes(restore_applied());
+                return Err(e);
+            }
+            Err(_) => {
+                shared.bm.restore_pending_deletes(restore_applied());
+                return Err(Error::NotYetImplemented(
+                    "checkpoint: I/O worker dropped Sync (deletes) completion",
+                ));
+            }
+        }
+    }
+
+    // 8. Truncate WAL atomically iff every snapshot landed AND no
+    //    racing writer has re-dirtied (under WAL-lock check), AND
+    //    no deferred deletes are still queued. The pending-delete
+    //    gate is essential: a queued delete means a WAL record
+    //    "this blob is unlinked" hasn't yet propagated to the
+    //    manifest, so truncating would orphan the unlink.
+    if failed.is_empty() && pending_failed.is_empty() {
         if let Some(wal) = &shared.wal {
             let mut w = wal.lock().unwrap();
-            if shared.bm.dirty_count() == 0 {
+            if shared.bm.dirty_count() == 0 && shared.bm.pending_delete_count() == 0 {
                 w.truncate()?;
                 shared.truncates.fetch_add(1, Ordering::Relaxed);
             }
@@ -198,12 +285,17 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     #[cfg(feature = "tracing")]
     {
         let elapsed = round_start.elapsed();
-        let truncated = failed.is_empty() && shared.wal.is_some() && shared.bm.dirty_count() == 0;
+        let truncated = failed.is_empty()
+            && pending_failed.is_empty()
+            && shared.wal.is_some()
+            && shared.bm.dirty_count() == 0
+            && shared.bm.pending_delete_count() == 0;
         tracing::info!(
             target: "holt::checkpoint",
             dirty_snapshot = snap_count,
             blobs_flushed = snap_count - failed.len(),
             blobs_failed = failed.len(),
+            blobs_deleted = applied_deletes,
             merged = merged,
             truncated_wal = truncated,
             elapsed_us = elapsed.as_micros() as u64,
@@ -215,21 +307,26 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
 }
 
 /// Tree-wide merge pass — fold every mergeable `BlobNode` child
-/// back into its parent and synchronously commit the parent.
+/// back into its parent. Stages the mutations via the unified
+/// `mark_dirty` + `mark_for_delete` protocol so the round's
+/// later phases (WAL flush → Flush tasks → Sync → pending
+/// deletes → re-Sync → truncate) handle persistence under W2D.
 ///
 /// Returns the cumulative count of children folded.
 ///
-/// Per-blob `bm.commit` runs inline (rather than going through the
-/// I/O queue) because:
-/// - Merges are rare relative to user writes; the throughput cost
-///   is amortised.
-/// - `merge_blob` calls `bm.delete_blob` for the child, which
-///   updates the manifest in-memory. Persisting that update needs
-///   to happen before the round's `Sync` — keeping it inline lets
-///   the existing `bm.commit → backend.write_blob` path drive both
-///   the parent's new bytes AND the deferred manifest write at
-///   step 5.
+/// An inline `bm.commit(parent)` + `bm.delete_blob(child)` would
+/// be wrong here — both happen pre-Sync, pre-WAL. `bm.commit`
+/// would push cache bytes (potentially including user mutations
+/// whose WAL records aren't yet durable) directly to backend, and
+/// `bm.delete_blob` would mutate the manifest in-memory which a
+/// later `backend.flush` could persist while the corresponding
+/// user WAL records still hadn't reached disk. Staging through
+/// dirty / pending-delete avoids both: the only flush path is
+/// the round's own `IoTask::Flush`, which runs strictly after
+/// step 2's WAL flush.
 fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
+    use crate::store::buffer_manager::STRUCTURAL_SEQ;
+
     let parents = engine::collect_blob_guids(shared.bm.as_ref(), shared.root_guid)?;
     let mut merged_total = 0u64;
     for guid in parents {
@@ -240,11 +337,11 @@ fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
         let stats = {
             let mut guard = pin.write();
             let mut frame = BlobFrame::wrap(guard.as_mut_slice());
-            engine::try_merge_children(shared.bm.as_ref(), &mut frame)?
+            engine::try_merge_children(shared.bm.as_ref(), &mut frame, STRUCTURAL_SEQ)?
         };
         drop(pin);
         if stats.merged > 0 {
-            shared.bm.commit(guid)?;
+            shared.bm.mark_dirty(guid, STRUCTURAL_SEQ);
             merged_total += u64::from(stats.merged);
         }
     }

@@ -201,24 +201,6 @@ See [`examples/`](examples/) for full programs:
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│ Public API: Tree, TreeBuilder, TxnBatch, RangeIter           │
-├──────────────────────────────────────────────────────────────┤
-│ Engine: insert / lookup / erase / range / merge / migrate    │
-├──────────────────────────────────────────────────────────────┤
-│ Concurrency: HybridLatch (3-mode optimistic / shared / excl) │
-├──────────────────────────────────────────────────────────────┤
-│ Journal: physiological WAL (11 TxnOp variants) + replay      │
-├──────────────────────────────────────────────────────────────┤
-│ Store: BufferManager (LRU pin/commit) + BlobFrame (512 KB)   │
-├──────────────────────────────────────────────────────────────┤
-│ Layout: 9 NodeType variants + bit-packed SlotEntry + Header  │
-├──────────────────────────────────────────────────────────────┤
-│ Backend: MemoryBackend + PersistentBackend (O_DIRECT / NOCACHE) │
-└──────────────────────────────────────────────────────────────┘
-```
-
 See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the deep dive.
 The design draws on Leis et al.'s ART paper (ICDE 2013) for the
 four-node-size scheme and LeanStore (ICDE 2018) for the HybridLatch
