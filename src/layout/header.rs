@@ -63,7 +63,7 @@ pub struct BlobHeader {
     pub field_5e: u16,
     /// Number of times [`compact_blob`](crate::engine::compact_blob)
     /// has rebuilt this blob in place. Bumped at the end of every
-    /// successful compaction. Surfaced via [`Tree::stats`](crate::api::Tree::stats).
+    /// successful compaction. Surfaced via [`Tree::stats`](crate::Tree::stats).
     pub compact_times: u32,
     _pad_64: [u8; 4],
     /// Cumulative count of size-table bytes ever allocated for

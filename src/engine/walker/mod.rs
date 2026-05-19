@@ -24,9 +24,8 @@
 //!   (spillover) + [`compact_blob`] (in-place repack). Share the
 //!   internal `clone_subtree` machinery.
 //! - `scan` — tree-wide BFS over reachable blobs ([`collect_blob_guids`]).
-//!   Used by [`crate::api::Tree::stats`] and
-//!   [`crate::api::Tree::compact`] to fan out across the whole
-//!   on-disk tree.
+//!   Used by [`crate::Tree::stats`] and [`crate::Tree::compact`] to
+//!   fan out across the whole on-disk tree.
 
 use std::mem::size_of;
 
