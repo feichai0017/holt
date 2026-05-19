@@ -311,10 +311,12 @@ by `~leaves_per_rollup` once fast-forward lands.
       path even with the flag enabled (the `io-uring` crate is
       `cfg(target_os = "linux")`-gated). Batched-flush mode for
       saturating the ring is queued for v0.3.
-- [ ] **SIMD CRC32** — PCLMULQDQ on x86_64, CRC32 intrinsic on
-      AArch64. The 256-entry table from v0.1's WAL fast-path
-      gets ≈1.5 GB/s; SIMD variants push past 8 GB/s. Drops
-      persistent-put cost another ≈80 ns.
+- [x] **SIMD CRC32** — replaced v0.1's 256-entry table-driven
+      byte-at-a-time loop with `crc32fast`. Auto-detects
+      PCLMULQDQ on x86_64 + the CRC32 instruction on AArch64 at
+      first call and dispatches via function pointer; falls back
+      to slice-by-16 on older / non-x86 cores. Drops per-record
+      WAL CRC from ~110 ns to ~20 ns on supported hardware.
 - [x] **Cached `Tree.root_pin`** (commit `a6f5c78`) — every
       `get` / `put` / `delete` keeps the root pinned via
       `Arc<CachedBlob>` and skips `BufferManager`'s

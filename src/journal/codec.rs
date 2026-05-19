@@ -159,44 +159,18 @@ const REASON_OUT_OF_BLOB_FRAME: u8 = 2;
 
 // ---------- CRC32 (IEEE 802.3) ----------
 
-/// 256-entry CRC32 lookup table for the IEEE 802.3 reflected
-/// polynomial `0xEDB8_8320`. Built once at compile time via
-/// [`build_crc32_table`]; ships zero runtime initialisation cost.
-const CRC32_TABLE: [u32; 256] = build_crc32_table();
-
-const fn build_crc32_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
-    let mut i = 0usize;
-    while i < 256 {
-        let mut crc = i as u32;
-        let mut j = 0;
-        while j < 8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-            j += 1;
-        }
-        table[i] = crc;
-        i += 1;
-    }
-    table
-}
-
 /// CRC32 — IEEE 802.3 polynomial `0xEDB8_8320`, reflected
 /// (i.e. the variant `gzip` / `PNG` / RocksDB block-checksum
 /// use). Used as the record-level `sanity_info`.
 ///
-/// Table-driven byte-at-a-time impl: ≈1.5 GB/s on a modern core.
-/// For a typical 175-byte WAL record that's ~110 ns of per-record
-/// overhead; SIMD-accelerated variants (PCLMULQDQ on x86,
-/// CRC32 intrinsic on AArch64) would push that under 30 ns but
-/// are out of scope for v0.1.
+/// Routes to [`crc32fast`], which auto-detects PCLMULQDQ on
+/// x86_64 and the `CRC32` instruction on AArch64 at first call
+/// and dispatches via function pointer afterwards. On supported
+/// hardware (≈Skylake+, Apple Silicon, recent ARM cores) that's
+/// ≈8-12 GB/s; the fallback `slice-by-16` table-driven path on
+/// older cores is still ≈4× the v0.1 byte-at-a-time loop.
 pub fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in bytes {
-        let idx = ((crc ^ u32::from(b)) & 0xFF) as usize;
-        crc = (crc >> 8) ^ CRC32_TABLE[idx];
-    }
-    !crc
+    crc32fast::hash(bytes)
 }
 
 // ---------- encode ----------

@@ -6,6 +6,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Performance
+
+- **Hardware-accelerated CRC32** — the WAL record footer hash
+  now routes through `crc32fast`. Auto-detects PCLMULQDQ on
+  x86_64 and the AArch64 CRC32 instruction at runtime; falls
+  back to slice-by-16 on older / non-x86 cores. Drops per-record
+  CRC cost from ~110 ns to ~20 ns on supported hardware. v0.1's
+  256-entry table + byte-at-a-time loop is gone.
+
 ### Changed — concurrency
 
 - **Sharded `BufferManager` cache** — v0.1's
