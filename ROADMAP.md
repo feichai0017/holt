@@ -2,546 +2,144 @@
 
 ## Where things stand
 
-The algorithm core, the storage cache, and the WAL record codec
-are all done. The tree walks insert / lookup / erase / rename
-across arbitrarily many 512 KB blobs, auto-splits when any blob
-fills, has SIMD-accelerated Node16 byte search and Node48 /
-Node256 range scans, runs an asynchronous 3-thread background
-checkpointer (planner + I/O worker + cold-blob eviction) under
-a W2D-strict protocol, and exports its observability via
-`Tree::stats` + the `holt::metrics` Prometheus renderer (behind
-the `metrics` feature flag).
+holt is a single-node, Unix-only ART-over-blobs metadata engine.
+The algorithm core, persistent backend, WAL + replay, sharded
+buffer manager, 3-thread background checkpointer, and the curated
+public API are all in place. 251 tests (unit + property + crash +
+failpoint + multi-reader stress); zero clippy / rustdoc warnings
+under `-D warnings`; ubuntu + macOS CI; `cargo deny` supply-chain
+job.
 
-Concurrency model: per-blob `HybridLatch` (LeanStore 3-mode)
-gives wait-free optimistic reads. Persistent-tree writers
-serialise on `wal.lock` — the same lock the checkpoint round
-takes when it snapshots dirty + pending-delete and flushes WAL,
-which is the load-bearing piece of the W2D-strict ordering.
-No Tree-wide writer mutex. 240+ tests (including a property-based
-suite, multi-reader stress bench, failpoint-driven checkpoint
-round tests, and crash-and-replay coverage) all green; zero
-clippy / rustdoc warnings under `-D warnings`; CI matrix
-(ubuntu + macOS) plus a `cargo deny check` supply-chain job.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and
+[CHANGELOG.md](CHANGELOG.md) for what changed when. The fine-
+grained shipping log lives in `git log`; this file tracks
+milestones, not individual features.
 
-The sections below are the per-feature live status — see
-[ARCHITECTURE.md](ARCHITECTURE.md) for design and `git log` for
-what changed when.
+## v0.1 — Usable embedded library (shipped, 2026-05-19)
 
-The goal of v0.1 + v0.2 was **a usable embedded library** for
-path-shaped metadata, single-node + persistent + crash-safe.
-v0.3 extends concurrency primitives (per-node latch, cross-blob
-lock-coupling), MVCC snapshots, and online compaction.
+Goal: build the engine end-to-end so a path-shaped-metadata
+workload can use it on a single node.
 
-## v0.1 — Usable embedded library
+Delivered: 9-NodeType ART layout pinned at compile time, recursive
+walker (insert / lookup / erase / rename), cross-blob `splitBlob`
+/ `mergeBlob` / `compactBlob`, `PersistentBackend` (`O_DIRECT`
+Linux + `F_NOCACHE` macOS), physiological WAL with replay,
+`Tree::range` iterator with prefix + start-after + S3-style
+delimiter rollup, `Tree::txn` batch transactions under one WAL
+record, four examples (`basic_kv` / `filesystem_meta` /
+`session_store` / `s3_metadata`), property-based tests against a
+`HashMap` oracle, criterion benches vs RocksDB + SQLite.
 
-Required for the v0.1 tag:
+## v0.2 — Performance + concurrency upgrades (shipped)
 
-### Core engine
+Goal: scope the metadata-engine core for production-shaped
+workloads — no new public API surface, the bench numbers from v0.1
+are the success criteria.
 
-- [x] `NodeType` enum + all per-NodeType struct layouts
-      (Leaf 16 B, Prefix 128 B, Blob 128 B, Node{4,16,48,256},
-      EmptyRoot 8 B)
-- [x] 4096-byte `BlobHeader` with compile-time-asserted field
-      offsets (num_slots, root_slot, space_used, gap_space,
-      free_list_head, blob_guid)
-- [x] Bit-packed `SlotEntry` (`ntype << 17 | offset / 8`)
-- [x] `BlobFrame` bump allocator with per-NodeType free list
-- [x] Cross-type free-list fallback (Prefix ↔ Blob, both 128 B)
-      so spillover can install its own BlobNode without bump room
-- [x] 3-mode `HybridLatch` (optimistic / shared / exclusive)
-- [x] Recursive walker: insert / lookup / erase / rename
-  - [x] Leaf + EmptyRoot arms
-  - [x] Node4 arm + promotion to Node16
-  - [x] Node16 + promotion to Node48
-  - [x] Node48 + promotion to Node256
-  - [x] Prefix arm (full-match descent + mismatch split)
-  - [x] BlobNode lookup arm (Stage 2d phase A)
-  - [x] BlobNode insert arm with auto-spillover (Stage 2d phase B)
-  - [x] BlobNode erase arm + child-blob delete-on-empty
-        (Stage 2d phase C)
-  - [x] **Shrink chain on erase** (Node256 → 48 → 16 → 4) —
-        thresholds 37 / 12 / 3 give hysteresis vs the grow
-        thresholds 48 / 16 / 4. Below the shrink point the
-        smaller variant is allocated, the surviving children
-        are copied across, the old slot freed, and the parent's
-        child pointer rewired via `EraseSignal::Replaced`. The
-        terminal `Node4 → Prefix([byte])` lone-child collapse
-        is unchanged.
-  - [ ] Tombstone + lazy reclaim
-- [x] `make_blob_from_node` deep-clone primitive
-- [x] `splitBlob` automatic spillover trigger (in-band on OOM)
-- [x] `free_subtree` (recursive slot reclaim post-migration)
-- [x] `compactBlob` — in-place reclaim of leaf-extent leaks via
-      clone-into-scratch + memcpy-back. Wired into the multi-blob
-      insert OOM recovery loop alongside `splitBlob` (the two run
-      back-to-back so spillover frees a subtree and compact then
-      reclaims its bump-area bytes).
-- [x] `SPILLOVER_RESERVATION` (128 B bump headroom) — walker
-      `alloc_node`/`alloc_extent` (non-Blob) leave one BlobNode's
-      worth of bump area for spillover's emergency placeholder
-- [x] **`mergeBlob`** (compaction inverse — child blob → parent) —
-      [`engine::merge_blob`](src/engine/walker/migrate.rs) inlines
-      a child's subtree back into its parent at the `BlobNode`
-      slot (preserving the inline-prefix wrap), then deletes the
-      child blob. Guarded by `engine::is_mergeable` (combined
-      space + slots fit, child has no own crossings, no
-      tombstones). [`engine::try_merge_children`](src/engine/walker/merge.rs)
-      is the tree-walker fold: [`Tree::compact`](src/api/tree.rs)
-      runs `compact_blob` per blob, then
-      `refresh_blob_node_pointers` repairs the
-      `BlobNode.child_entry_ptr == child.header.root_slot`
-      invariant `compact_blob` couldn't keep in lock-step, then a
-      single-pass merge sweep folds every direct mergeable
-      `BlobNode` child. Nested crossings (mergeable-child-of-
-      mergeable-child) are deferred to a second `Tree::compact`
-      pass.
-- [x] In-place leaf-value update when new value fits existing
-      extent footprint (zero alloc, zero extent leak)
-- [x] SIMD Node16 byte search (SSE2 / NEON / scalar fallback)
-- [x] SIMD `longest_common_prefix` for leaf-split / prefix-split
-      hot paths
-- [x] Single-Mutex Tree write lock (Stage 5 swaps for per-blob
-      HybridLatch)
-- [x] Strict-prefix support via Tree-layer terminator byte
-- [x] Atomic rename (single-blob and cross-blob; both flavours
-      run erase_multi + insert_multi under the write_lock;
-      Stage 5 will swap for a dedicated RenameTxnOp so the
-      child-blob writes between erase and insert commit as one
-      WAL record)
-- [x] Stateful iterator with prefix + start_after + delimiter
-      (`Tree::range()` — see the v0.1 Public API section below)
+Delivered: `io_uring` persistent-backend fast path (Linux,
+feature-gated), `crc32fast` SIMD CRC32, sharded `BufferManager`
+(`DashMap` replacing the v0.1 `Mutex<HashMap>` + `VecDeque` LRU),
+cached `Tree.root_pin`, range-iter fast-forward in delimiter
+mode, 3-thread background checkpointer (planner + I/O worker +
+eviction) under a W2D-strict protocol, adaptive tick-based
+eviction, observability (`Tree::stats`, structured `tracing`,
+Prometheus text-format renderer behind the `metrics` feature,
+silent-pin reads so scrapes don't pollute cache counters),
+diagnostics (`Tree::scan_prefix`, range-iter tombstone fix,
+structured `Error::NodeCorrupt`), PGO docs, `cargo deny check`
+in CI, scale-curve + p95/p99 contention benches.
 
-### Persistence + crash safety
+Concurrency primitives: per-blob `HybridLatch` (LeanStore 3-mode,
+wait-free optimistic reads) inside one `wal.lock` critical section
+per write. Cross-blob lock-coupling and per-node `HybridLatch`
+were considered for v0.2 but deferred to v0.3 — they need
+structural changes the v0.2 scope didn't budget for, and the
+per-slot version array they require is best designed alongside
+the cross-blob descent flattening rather than retro-fitted.
 
-- [x] 10 `TxnOp` variants enumerated (`Insert`, `Erase`, `Split`,
-      `Merge`, `Compact`, `RenameObject`, `Rename`, `NewTree`,
-      `RmTree`, `MemMarker`)
-- [x] **Binary record codec** (Stage 5a) — fixed header
-      (`MAGIC | LEN | SEQ | TY`) + variant body + CRC32 footer.
-      All variants round-trip; corruption (CRC, magic, truncation,
-      unknown tag) surfaces as `Error::ReplaySanityFailed`. See
-      [`journal::codec`](src/journal/codec.rs).
-- [x] **`WalWriter`** (Stage 5b) — append-only file with
-      buffered I/O and `sync_data`-on-flush; explicit `flush()` is
-      the durability boundary. `discard_pending()` for bail-out
-      paths. `open_or_create()` validates the `tree_id` of an
-      existing log.
-- [x] **`replay()` forward scanner** (Stage 5b) — yields every
-      record to a callback in order; stops cleanly at a torn tail
-      and reports its byte offset in `ReplayStats`. Real
-      corruption mid-file (CRC mismatch, magic mismatch, unknown
-      variant tag) surfaces as `Error::ReplaySanityFailed` with
-      the bad record's offset patched in.
-- [x] **Tree integration** (Stage 5c) — every `put` / `delete` /
-      `rename` emits a `TxnOp` to the WAL. Per-op `sync_data`
-      is opt-in via `TreeConfig::wal_sync_on_commit` (default
-      `false`, matching RocksDB's `sync=false` default — high
-      throughput, durable past a process crash but not a power
-      loss until `Tree::checkpoint`). `Tree::open` replays the
-      durable WAL onto the BM-cached blob and resumes `next_seq`
-      past every replayed record. `Tree::checkpoint` writes the
-      BM root through to the backend, flushes, then atomically
-      truncates the WAL to header-only.
-- [x] **Group-commit auto-flush** (Stage 5d) — once the
-      `WalWriter`'s pending buffer crosses 64 KB the bytes
-      drain to the OS page cache via `write_all` (no `sync_data`).
-      Bounds the in-memory buffer regardless of how long the
-      caller waits between `checkpoint()` calls; `flush()` is
-      still the durability boundary for `sync_data`.
-- [x] **WAL encode fast path** (Stage 5e) — 256-entry
-      compile-time CRC32 table (≈3× faster than the bitwise
-      reference impl) + reference-based
-      `WalWriter::append_insert / append_erase /
-      append_rename_object` methods that skip the `TxnOp` enum's
-      three `Vec` clones. Persistent put latency:
-      ≈1.74 µs → ≈735 ns (kv) on the bench microcase.
+Public API surface closed before crates.io publication: the
+v0.1 `pub mod layout / journal / store` exposure shipped the
+on-disk layout, WAL codec, and buffer-manager guards as part of
+SemVer; v0.2 tightened those to `pub(crate)` so the engine is
+free to evolve internally without minor-version breaks. See
+[CHANGELOG.md](CHANGELOG.md) for the supported user surface.
 
-### Storage backends
+## v0.3 — Concurrency + advanced features
 
-- [x] `Backend` trait (blob-granular I/O, 4 KB-aligned via
-      `AlignedBlobBuf`)
-- [x] `MemoryBackend` — `RwLock<HashMap<_, AlignedBlobBuf>>`
-- [x] `PersistentBackend` (cross-platform) — `O_DIRECT` on Linux,
-      `F_NOCACHE` on macOS, single packed `blobs.dat` + atomic-
-      rename `manifest.bin` + `fdatasync` on flush
-- [x] `io_uring` submission/completion hot path on Linux —
-      delivered in the v0.2 section below behind the `io-uring`
-      feature flag
-- [x] `TreeBuilder` + single `Tree::open(TreeConfig)` entry
+The load-bearing v0.3 work is the concurrency primitive upgrade
+that v0.2 deferred:
 
-### Concurrency
+- **Per-node `HybridLatch`** — out-of-line
+  `slot_versions: [AtomicU64; MAX_SLOTS]` on each `CachedBlob`
+  (~80 KB per cached blob, in-memory only — no disk-format
+  break). Walker readers capture + validate per-slot versions
+  across the entire descent; walker writers bump
+  `slot_versions[slot]` begin/end. Doubles as the cross-blob
+  re-acquire verification token.
+- **Cross-blob lock-coupling** — flatten the recursive walker
+  into an iterative blob-by-blob loop so parent guards release
+  before pinning the child, and only re-acquire if the parent's
+  `BlobNode` needs an update. The re-acquire verifies the slot
+  hasn't been freed + reused via the per-slot version.
 
-- [x] `HybridLatch` 3-mode primitive (LeanStore-style: optimistic
-      / shared / exclusive)
-- [x] `BufferManager` — LRU-bounded cache wrapping any Backend.
-      Implements Backend itself (transparent drop-in).
-- [x] `BlobFrameRef<'a>` + `BufferManager::pin(guid)` —
-      pin-and-operate read path. `Tree::get` walks each blob via
-      a shared read-guard with **no 512 KB memcpy per hop**
-      (Stage 6 phase 2a).
-- [x] Walker insert/erase use `pin` + `BufferManager::commit`
-      throughout — `Tree::state.root_buf` removed, root + every
-      cross-blob hop operate in place against the BM-owned buffer
-      (Stage 6 phase 2c).
-- [x] **`HybridLatch` wired into `CachedBlob`** —
-      `RwLock<AlignedBlobBuf>` replaced by `HybridLatch +
-      UnsafeCell<AlignedBlobBuf>`. Three guards exposed:
-      `read_optimistic()` (wait-free snapshot+validate),
-      `read()` (shared), `write()` (exclusive).
-      `Tree::get`'s walker runs in optimistic mode and restarts
-      from the root on a torn read; `put` / `delete` never take
-      a Tree-wide mutex (per-blob exclusive on the root
-      serialises them) — Stage 6 phase 2b.
-- [→v0.3] Cross-blob lock-coupling (`BlobNode` descent acquires
-      the target blob's latch) — see "Concurrency primitive
-      upgrades" in the v0.2 section for the v0.3 plan
-- [x] MVCC seq counter bumped on writes (carried in Leaf body;
-      not yet read by lookup)
-- [→v0.3] Per-blob `ext_bfs_latch` (second-tier latch for the
-      ext-blob cache) — folded into the v0.3 per-node latch
-      milestone; the slot-version arrays already give us
-      finer-grained synchronisation than a second blob-wide
-      latch would
+Beyond concurrency, v0.3 collects the deferred feature work:
 
-### Public API
+- **Full MVCC snapshots** — read at a specific seq; snapshot
+  iteration that doesn't see writes after the snapshot point.
+- **Online compaction** — `Tree::compact` that doesn't pause
+  user traffic (today's implementation is documented quiescent-
+  only, gated behind the v0.3 maintenance latch).
+- **Change feed / subscription API** — consumers subscribe to a
+  stream of `TxnOp`s; useful for index materialization,
+  replication hooks, audit logs.
+- **Column families** — multiple independent ARTs in one Tree,
+  sharing the WAL + BM but with independent root + manifest.
 
-- [x] `Tree::open(TreeConfig)` — single entry; `TreeConfig::new(dir)`
-      = persistent (default), `TreeConfig::memory()` = volatile
-- [x] `Tree::put / get / delete / rename` (with cross-blob lookup
-      + auto-spillover insert; delete + rename cross-blob queued)
-- [x] **`Tree::range()` stateful iterator** —
-      [`engine::RangeBuilder`](src/engine/walker/range.rs) /
-      [`engine::RangeIter`](src/engine/walker/range.rs) /
-      [`engine::RangeEntry`](src/engine/walker/range.rs).
-      Modelled on the upstream `fa_iter` shape (8 log strings give
-      the contract: `path` stack of `(blob_guid, slot)`, materialised
-      `curr_key`, exclusive `marker`, char `delimiter`, per-node
-      resume cursor `start_index_in_node`). Builder chains
-      `.prefix(p)` (anchored descent — no full-tree scan),
-      `.start_after(k)` (strict-greater lower bound), `.delimiter(b)`
-      (S3-style rollup with dedup of `CommonPrefix` emits). Walks
-      transparently across `BlobNode` crossings, holding one shared
-      read guard per stack frame. Forward-only — no `findPrev`.
-      Best-effort snapshot: between `next()` calls writers can
-      interleave (same failure mode as the upstream's
-      "invalid iterator(#1)" warning); for strict snapshot, pause
-      writes externally. Caller can stop via `.take(n)` /
-      collect-with-limit on the `Iterator` trait. Returns
-      `Iterator<Item = Result<RangeEntry>>`, where `RangeEntry::Key`
-      / `RangeEntry::CommonPrefix` distinguish leaf vs rollup
-      emissions.
-- [x] **`Tree::txn(|b| { ... })` for batch ops under one WAL record** —
-      [`api::TxnBatch`](src/api/txn.rs) buffers `put` / `delete` /
-      `rename`; on closure return,
-      [`Tree::txn`](src/api/tree.rs) takes `rename_lock`, applies
-      each op in order, and emits one [`TxnOp::Batch`](src/journal/txn_op.rs)
-      record (new `TY_BATCH = 10` tag). Inner ops carry derived
-      seqs (`base + i`) via a contiguous reservation, so neither
-      encoder nor decoder needs per-inner seq bytes. Replay
-      transparently flattens the batch into per-inner callbacks
-      ([`journal::reader::replay_bytes`](src/journal/reader.rs)).
-      Crash atomicity: all-or-nothing across restarts. Runtime
-      isolation: best-effort — see the contract on
-      [`Tree::txn`](src/api/tree.rs).
-- [x] `Tree::checkpoint()` (flushes cached root + backend flush)
-- [x] `Tree::stats()` — per-blob `compact_times`, `tombstone_leaf_cnt`,
-      `space_used` / `gap_space` / `num_slots`, plus aggregate
-      `bm_dirty_count`, `bm_pending_delete_count`,
-      `bm_cache_hits`, `bm_cache_misses`,
-      `bm_optimistic_restarts`, and an `Option<CheckpointerStats>`
-- [x] `TreeBuilder` (chainable: `.memory()`, `.buffer_pool_size(n)`,
-      `.wal_sync_on_commit(bool)`, `.checkpoint_byte_interval(b)`)
-- [x] Typed errors (`Error::{BackendIo, Alloc, Free, KeyTooLong,
-      ValueTooLong, NotYetImplemented, NodeCorrupt,
-      ReplaySanityFailed, NotFound, DstExists}`)
+Following v0.3's hard work, the "ecosystem layer" items become
+fundable:
 
-### Testing + benchmarks
-
-- [x] Unit tests for every NodeType arm of the walker
-- [x] Multi-blob auto-spillover end-to-end test (~2000 keys ×
-      200 B values forces spillover, every key still readable)
-- [x] Concurrent stress test (8 threads × 25 puts each, all
-      readable after; single-Mutex so writes serialise)
-- [x] Optimistic-readers-vs-writer stress test
-      (4 readers × 500 gets + 1 writer × 200 puts, no torn data)
-- [x] Property-based tests (`proptest`) — random put / delete /
-      rename traces cross-checked against a `HashMap` oracle,
-      both memory and persistent (drop-without-checkpoint +
-      reopen via WAL replay) modes
-- [x] Criterion benchmarks: KV / objstore-metadata / fs-metadata
-      shapes × get / put / mixed × memory / persistent, comparing
-      against RocksDB **and** SQLite. See
-      [benches/README.md](benches/README.md) for methodology +
-      how-to-read-the-numbers.
-
-### Docs + examples
-
-- [x] `examples/basic_kv.rs` — minimal "open, put, get, close"
-- [x] `examples/filesystem_meta.rs` — holt as the metadata layer
-      for a toy POSIX filesystem
-- [x] `examples/session_store.rs` — multi-tenant chat session storage
-- [x] `examples/s3_metadata.rs` — holt as an S3-compatible object
-      metadata backend
-- [x] `cargo doc` renders with zero warnings under `-D warnings`
-- [x] `benches/README.md` rollup of the criterion methodology +
-      how-to-read (kv = ART anti-pattern; objstore / fs = design
-      target). LMDB comparison queued (needs a separate dev-dep
-      wiring); Sled skipped (largely unmaintained).
-
-### Polish
-
-- [x] **CI** — GitHub Actions matrix (ubuntu + macOS) × build /
-      test / doctest + lint (`cargo fmt --check`, `cargo clippy
-      -- -D warnings`) + docs (`cargo doc -- -D warnings`) +
-      MSRV (Rust 1.82). See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
-- [x] **Zero clippy warnings** under `-D warnings`. The vetted
-      `#![allow]` block in `src/lib.rs` documents the categories
-      where `clippy::pedantic` fires for intentional design
-      choices.
-- [x] **MSRV policy** — Rust 1.82, gated by the `msrv` CI job
-      (library-only build; dev-dependencies routinely require a
-      newer toolchain than the library surface itself does)
-- [x] Versioning policy — semver from v0.1.0 onwards; new
-      `Error` variants land behind `#[non_exhaustive]` so adding
-      one is a non-breaking change in minor releases
-- [x] **CHANGELOG.md** (this release)
-- [x] **CONTRIBUTING.md** (build / test / commit-style guide)
-- [x] **CODE_OF_CONDUCT.md** (Contributor Covenant 2.1)
-
-## v0.2 — Performance + concurrency upgrades
-
-v0.2 is **scoped to the metadata-engine core**. No new public API
-surface (those land in v0.3). The bench surfaces from v0.1 are
-the success criteria — `objstore_get` should stay sub-200 ns,
-`*_list` should drop another 30-50 %, `*_list_dir` should drop
-by `~leaves_per_rollup` once fast-forward lands.
-
-### Hot-path performance
-
-- [x] **`io_uring` persistent-backend submission/completion**
-      (Linux, behind `feature = "io-uring"`). When enabled,
-      `PersistentBackend::{read_blob, write_blob}` route through a
-      single per-backend ring (8 SQEs deep) instead of `pread`/
-      `pwrite`. macOS / non-Linux builds remain on the syscall
-      path even with the flag enabled (the `io-uring` crate is
-      `cfg(target_os = "linux")`-gated). Batched-flush mode for
-      saturating the ring is queued for v0.3.
-- [x] **SIMD CRC32** — replaced v0.1's 256-entry table-driven
-      byte-at-a-time loop with `crc32fast`. Auto-detects
-      PCLMULQDQ on x86_64 + the CRC32 instruction on AArch64 at
-      first call and dispatches via function pointer; falls back
-      to slice-by-16 on older / non-x86 cores. Drops per-record
-      WAL CRC from ~110 ns to ~20 ns on supported hardware.
-- [x] **Cached `Tree.root_pin`** (commit `a6f5c78`) — every
-      `get` / `put` / `delete` keeps the root pinned via
-      `Arc<CachedBlob>` and skips `BufferManager`'s
-      `Mutex<HashMap>` lookup on the root hop. ≈300 ns / op
-      saving on the hot path.
-- [x] **`RangeIter` fast-forward in delimiter mode** (commit
-      `861dba9`) — after emitting a `CommonPrefix(C)`, ascend the
-      descent stack past `C`'s subtree instead of scanning every
-      leaf under it to dedup. `*_list_dir` is now
-      `O(distinct_rollups)` instead of `O(leaves_under_prefix)`.
-- [x] **Sharded `BufferManager` state** — the v0.1
-      `Mutex<HashMap<BlobGuid, _>>` + `VecDeque<BlobGuid>` LRU is
-      replaced by `DashMap<BlobGuid, Arc<CachedBlob>>`.
-      Concurrent `pin` / `get_cached` on different blobs hit
-      different shards instead of contending on a single mutex.
-      Inline overflow eviction (`try_evict_lru`) now picks the
-      oldest `last_touched` tick whose `Arc::strong_count == 1`,
-      using the same clock that drives the bg eviction sweep.
-
-### Concurrency primitive upgrades
-
-Both items in this subsection are **deferred to v0.3** because
-the realistic implementations need structural changes the v0.2
-scope didn't budget for:
-
-- [→v0.3] **Per-node `HybridLatch`** — every `NodeType` body
-  needs an embedded `version: AtomicU64` (or an out-of-line
-  `slot_versions: [AtomicU64; MAX_SLOTS]` in `CachedBlob`).
-  Either choice requires the lookup walker to capture +
-  validate per-slot versions across the entire descent
-  (currently does one `HybridLatch::validate` at the end), and
-  every walker writer site (`write_struct_to_slot`,
-  `alloc_node`, `free_node`) needs `bump_slot_version`
-  bracketing. The in-memory `CachedBlob` variant avoids an
-  on-disk format break but still touches ~12 walker functions
-  + buffer-manager glue. Planned as a single v0.3 milestone.
-
-- [→v0.3] **Cross-blob lock-coupling** — `insert_multi` /
-  `erase_multi` currently hold the root blob's exclusive guard
-  for the entire descent (including all child-blob work). The
-  fix is to flatten the recursive walker into an iterative
-  blob-by-blob loop so the parent's guard releases before
-  pinning the child and re-acquires only if the parent's
-  `BlobNode` needs an update — but the re-acquire path needs
-  an optimistic verification protocol (the parent's `bn_slot`
-  may have been freed + reused while we were gone). Couples
-  cleanly with the per-node latch design (per-slot version
-  doubles as the verification token), so the two land
-  together in v0.3.
-
-- [x] **Multi-reader stress bench** —
-      `tests/bench_multi_reader.rs` spawns N reader threads
-      against a populated tree and measures aggregate
-      throughput. Sample numbers (Apple M-series, release,
-      10000-key tree):
-      `1 → 5.67 M ops/s`, `2 → 7.36 M (1.30×)`,
-      `4 → 14.73 M (2.60×)`, `8 → 18.14 M (3.20×)`,
-      `16 → 19.06 M (3.36×)`. Wait-free read path verified;
-      sub-linear scaling beyond 4 threads is from `DashMap`
-      shard atomics + the BM `clock_tick` global counter, both
-      identified as v0.3 follow-ups.
-- [x] **Multi-reader stress bench** —
-      `tests/bench_multi_reader.rs` spawns N reader threads
-      against a populated tree and measures aggregate
-      throughput. Sample numbers (Apple M-series, release,
-      10000-key tree):
-      `1 → 5.67 M ops/s`, `2 → 7.36 M (1.30×)`,
-      `4 → 14.73 M (2.60×)`, `8 → 18.14 M (3.20×)`,
-      `16 → 19.06 M (3.36×)`. Wait-free read path verified;
-      sub-linear scaling beyond 4 threads is from `DashMap`
-      shard atomics + the BM `clock_tick` global counter, both
-      identified as v0.3 follow-ups.
-
-### Durability + background work
-
-- [x] **3-thread background checkpointer** — round-driven planner
-      + dedicated I/O worker + cold-blob eviction, plus a
-      bounded `crossbeam-channel` queue between planner and I/O.
-      Each planner round (1) folds mergeable child blobs back
-      into parents, (2) snapshots the BM dirty set + flushes
-      WAL, (3) submits `IoTask::Flush` per dirty blob to the I/O
-      thread + waits completions, (4) submits `IoTask::Sync`,
-      (5) atomically truncates the WAL when no racing writer
-      re-dirtied. Eviction thread runs independently against a
-      `clock_tick` / `last_touched` cold-entry detector. Default
-      `enabled = false` (opt-in until v0.3 promotes it on by
-      default). Final synchronous round runs in
-      `Checkpointer::Drop` so the window between the last bg
-      round and Tree shutdown doesn't lose dirty cache state.
-      `idle_interval` default is 100 ms, tuned via
-      `tests/bench_checkpoint_sweep.rs`.
-- [~] **Free-list retry/backoff subsystem** — partial. Cache-
-      overflow eviction (`insert_into_cache`) now retries with
-      `thread::yield_now()` when every cache entry is pinned, so
-      transient pin pressure no longer overflows the cache
-      immediately. The per-NodeType in-blob alloc path still
-      fail-fasts on `OutOfSpace` — meaningful retry there needs
-      cross-thread coordination that the single-writer-per-blob
-      model doesn't expose.
-- [x] **Adaptive buffer-pool eviction** — both paths (inline
-      overflow + bg sweep) are driven by the same
-      `clock_tick` / `last_touched` tick mechanism. Inline
-      overflow walks the `DashMap` for the entry with the oldest
-      tick whose `Arc::strong_count == 1`; bg sweep uses the
-      configurable `eviction_idle_ticks` threshold. The v0.1
-      `VecDeque<BlobGuid>` is gone.
-
-### Observability
-
-- [~] **Metrics export** — Prometheus side done. The
-      `holt::metrics` module (feature = "metrics", zero cost
-      when off) renders `TreeStats` into Prometheus text format
-      via `render_prometheus(&stats) -> String`; covers blob /
-      space / dirty / pending-delete / cache hit-miss /
-      optimistic-restart / checkpointer counters. OpenTelemetry
-      span / trace export is still TODO — most of the
-      instrumentation points already emit `tracing` events on
-      `feature = "tracing"`, so an OTel `tracing-opentelemetry`
-      bridge could land as a follow-up without engine changes.
-- [x] **Tracing events** — `feature = "tracing"` (off by default)
-      gates structured `tracing::info!` / `debug!` calls on
-      `spillover`, `merge_blob`, `compact_blob`, WAL truncate,
-      checkpoint round summary, and eviction sweeps. Cost-free
-      when the feature is off (cfg-gated).
-- [~] **Extended `Tree::stats`** — mostly done. `TreeStats` now
-      carries `bm_dirty_count`, `bm_pending_delete_count`,
-      `bm_cache_hits`, `bm_cache_misses`, `bm_optimistic_restarts`,
-      and an `Option<CheckpointerStats>` with the 6 background
-      counters. Latch-contention and per-NodeType free-list
-      health counters are still TODO.
-
-### Ergonomics + diagnostics
-
-- [x] **Richer `Error::NodeCorrupt`** — `Error::NodeCorrupt` now
-      carries optional `blob_guid` + `slot` fields. Construct via
-      `Error::node_corrupt(ctx)` and enrich via
-      `.with_blob_guid(g)` / `.with_slot(s)`; the buffer manager
-      and walker cross-blob arms attach the GUID automatically.
-- [x] **`Tree::scan_prefix(p)` shorthand** — one-line wrapper
-      delegating to `tree.range().prefix(p)`.
-- [x] **Property tests for `txn` + `range` semantics** —
-      `tests/properties.rs` now covers batch transactions, full
-      `range()` enumeration, and `scan_prefix(p)`, each
-      cross-checked against a `BTreeMap` oracle. Caught the
-      tombstone-leaf range-iteration bug that's also fixed.
-
-### Polish
-
-- [x] **`cargo deny check` in CI** — the `deny` job runs
-      `cargo deny check --all-features --locked` via the
-      `EmbarkStudios/cargo-deny-action` GitHub action.
-- [x] **PGO build profile docs** — `PGO.md` at the repo root
-      walks through the two-stage `cargo pgo build` →
-      `cargo pgo optimize build` flow, the criterion training
-      run, measured gains (`objstore_get` -15 %,
-      `objstore_list` -12 %, `objstore_put` -7 % on M3 Max),
-      and when PGO doesn't help (WAL-fsync-bound or blob-
-      memcpy-bound workloads).
-
-## v0.3 — Advanced features
-
-- Full MVCC snapshots (read at a specific seq, snapshot iteration)
-- Online compaction (background, doesn't block writers)
-- Change feed / subscription API (consumers receive a stream of
-  TxnOps)
-- Column families (multiple independent ARTs in one Tree)
-- Encryption-at-rest (per-blob AES-GCM)
-- Compression (per-blob Zstd, transparent)
+- Encryption-at-rest (per-blob AES-GCM).
+- Compression (per-blob Zstd, transparent).
+- OpenTelemetry bridge for the existing `tracing` events.
 
 ## v1.0 — Production-ready
 
-- Comprehensive feature set covered.
-- Multi-platform stability across the supported Unix targets
-  (Linux + macOS, optional BSDs).
+- v0.3 feature set covered.
+- Multi-platform stability across Linux + macOS (optional BSDs
+  if anyone needs them).
 - Real production deployments + case studies.
-- Long-term API stability commitment.
+- Long-term API stability commitment — `holt::*` surface frozen,
+  `#[non_exhaustive]` markers in place so additive changes stay
+  non-breaking.
 
 ## Not on the roadmap
 
-The library is **a metadata engine**, period. Single-node, embed-in-
-your-process, Unix-only. Out of scope:
+The library is **a metadata engine**, period. Single-node,
+embed-in-your-process, Unix-only. Out of scope:
 
-- **Windows support**: holt is Unix-only by design — the persistent
-  backend rides `O_DIRECT` on Linux and `F_NOCACHE` on macOS, and
-  there is no Windows analog this project wants to maintain. The
+- **Windows support** — `O_DIRECT` (Linux) and `F_NOCACHE` (macOS)
+  have no Windows analog this project wants to maintain. The
   crate `compile_error!`s on Windows targets.
-- **Object-storage frontend / S3 layer**: the upstream that
+- **Object-storage frontend / S3 layer** — the upstream that
   inspired holt's algorithm core wrapped its ART in an S3-style
   RPC server (PUT/GET/LIST inode handlers, multi-tenant bucket
-  registry, RPC worker pool, distributed checkpointer with a BSS
-  client). holt does **not** reproduce any of that. The
-  alignment-with-upstream effort is bounded to the **metadata
-  engine** (ART core, blob layout, WAL, latching, range iterator).
-  TxnOp variants holt journals (`NewTree`, `RmTree`,
-  `RenameObject`, `Rename`, `MemMarker`) carry the same wire
-  shape as the upstream so a future RPC layer could re-use the
-  format, but holt itself ships no multi-root registry, no
-  bucket namespace, no RPC dispatcher, no `SplitMemOp` /
-  `MergeMemOp` post-replay-ack reconciliation twins.
-- **Replication / consensus**: build it above this. We expose hooks
-  (change feed, snapshot transfer) but don't implement Raft.
-- **Network server**: this is a library. Wrap it in your gRPC /
+  registry, RPC worker pool). holt does not reproduce any of
+  that. The alignment is bounded to the **metadata engine**: ART
+  core, blob layout, WAL, latching, range iterator. `TxnOp`
+  variants holt journals share wire shape with the upstream so a
+  future RPC layer could re-use the format, but holt itself ships
+  no multi-root registry, no bucket namespace, no RPC dispatcher.
+- **Replication / consensus** — build it above this. We expose
+  hooks (change feed in v0.3) but don't implement Raft.
+- **Network server** — this is a library. Wrap it in your gRPC /
   HTTP / whatever.
-- **SQL**: not the right abstraction for this data shape.
-- **Vector search**: combine with a dedicated vector DB.
-- **Full-text search**: combine with Tantivy / Lucene-rs.
+- **SQL** — not the right abstraction for this data shape.
+- **Vector search** — combine with a dedicated vector DB.
+- **Full-text search** — combine with Tantivy / Lucene-rs.
 
 ## Contributing
 
-We're at very early stage; ideas + design feedback most welcome.
-PRs welcome too, but please open an issue first for non-trivial
-changes — the architecture is being shaped and we want to avoid
+Early-stage project; design feedback most welcome. PRs welcome
+too, but please open an issue first for non-trivial changes —
+the architecture is still being shaped and we want to avoid
 churn.
