@@ -7,9 +7,11 @@
 use crate::api::errors::{Error, Result};
 use crate::engine::simd;
 use crate::layout::{
-    BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
+    BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
 };
-use crate::store::{BlobFrameRef, BufferManager};
+use std::sync::Arc;
+
+use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
 use super::readers::{leaf_extent, resolve_typed};
@@ -57,14 +59,15 @@ pub fn lookup_at<'a>(
 /// drop; on `NotFound` returns `Ok(None)`.
 pub fn lookup_multi(
     bm: &BufferManager,
-    root_guid: BlobGuid,
+    root_pin: &Arc<CachedBlob>,
     key: &[u8],
 ) -> Result<Option<Vec<u8>>> {
     // Outer loop: each iteration is one full attempt; we restart
     // here when an optimistic snapshot is invalidated.
     'restart: loop {
-        // Hop 0: the root blob.
-        let root_pin = bm.pin(root_guid)?;
+        // Hop 0: the cached root blob — `Tree` keeps this pinned
+        // for its lifetime so we skip BM's pin-Mutex on the
+        // common case where every op starts at the root.
         let crossing = {
             let guard = root_pin.read_optimistic();
             let frame = BlobFrameRef::wrap(guard.as_slice());
@@ -83,7 +86,8 @@ pub fn lookup_multi(
                 Ok(LookupResult::Crossing(c)) => c,
             }
         };
-        drop(root_pin);
+        // (No drop needed for `root_pin`: it's a borrow held by
+        // the caller, not an owned `Arc` we'd be releasing here.)
 
         // Cross-blob hops. Same pattern; on a torn read we restart
         // the whole walk from the root (the parent BlobNode that

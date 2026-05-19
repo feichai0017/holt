@@ -3,9 +3,11 @@
 //! + `erase_at_blob_node` cross-blob arm.
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
+use crate::layout::{BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
 use crate::store::backend::Backend;
-use crate::store::{BlobFrame, BufferManager};
+use std::sync::Arc;
+
+use crate::store::{BlobFrame, BufferManager, CachedBlob};
 
 use super::cast;
 use super::readers::{
@@ -42,8 +44,15 @@ pub fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<Er
 /// becomes empty (signal = `SubtreeGone`) the parent's `BlobNode`
 /// is freed and the orphaned child blob is dropped from the BM
 /// cache + the inner backend in the same step — no GC pass needed.
-pub fn erase_multi(bm: &BufferManager, root_guid: BlobGuid, key: &[u8]) -> Result<EraseOutcome> {
-    let root_pin = bm.pin(root_guid)?;
+pub fn erase_multi(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    key: &[u8],
+) -> Result<EraseOutcome> {
+    // The caller (typically `Tree`) keeps `root_pin` alive across
+    // every op so we skip `BufferManager`'s pin-Mutex on the hot
+    // path. Cross-blob descents still pin children through `bm`.
+    //
     // One continuous exclusive critical section — see
     // `insert_multi` for why per-phase guard drops would race.
     let mut guard = root_pin.write();

@@ -42,7 +42,7 @@ use crate::journal::txn_op::TxnOp;
 use crate::journal::writer::WalWriter;
 use crate::layout::{BlobGuid, PAGE_SIZE};
 use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
-use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
+use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 use super::txn::{BatchOp, TxnBatch};
 
@@ -59,6 +59,12 @@ pub struct Tree {
     /// sentinel; multi-tenant trees (post-v0.1) will allocate
     /// per-tree root GUIDs from a manifest.
     root_guid: BlobGuid,
+    /// Cached pin on the root blob — held for the life of this
+    /// `Tree` handle so every `get` / `put` / `delete` / `rename`
+    /// skips the `BufferManager`'s `Mutex<HashMap>` lookup on
+    /// the root hop. Cross-blob descents still pin children
+    /// through the BM as normal.
+    root_pin: Arc<CachedBlob>,
     /// Serialises **only `rename`** — the multi-step
     /// `lookup_multi(src)` + `erase_multi(src)` + `insert_multi(dst)`
     /// must appear atomic to other writers. `put` / `delete` /
@@ -226,10 +232,18 @@ impl Tree {
             (None, 1u64)
         };
 
+        // Hot-path: pin the root blob once for the lifetime of
+        // this `Tree` handle so every subsequent `get` / `put` /
+        // `delete` / `rename` skips the BufferManager's per-pin
+        // `Mutex<HashMap>` lookup on the root hop. `Tree::clone`
+        // shares the pin via `Arc::clone`.
+        let root_pin = bm.pin(root_guid)?;
+
         Ok(Self {
             cfg,
             backend: bm,
             root_guid,
+            root_pin,
             rename_lock: Arc::new(Mutex::new(())),
             next_seq: Arc::new(AtomicU64::new(next_seq)),
             wal,
@@ -250,7 +264,7 @@ impl Tree {
     /// spillover.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         let padded = pad_key(key);
-        engine::lookup_multi(&self.backend, self.root_guid, &padded)
+        engine::lookup_multi(&self.backend, &self.root_pin, &padded)
     }
 
     /// Insert or replace `(key, value)`. Returns the previous value
@@ -277,7 +291,7 @@ impl Tree {
         // Concurrent writers are serialised by the per-blob
         // `HybridLatch` (root blob always taken exclusive); no
         // Tree-wide writer mutex needed.
-        let outcome = engine::insert_multi(&self.backend, self.root_guid, &padded, value, seq)?;
+        let outcome = engine::insert_multi(&self.backend, &self.root_pin, &padded, value, seq)?;
 
         // Durability model: the WAL flush is the **per-op
         // boundary**. The BM-cached blob image stays in memory
@@ -322,7 +336,7 @@ impl Tree {
         let padded = pad_key(key);
         // No Tree-wide lock — per-blob `HybridLatch` exclusive on
         // the root serialises concurrent `delete` / `put` calls.
-        let outcome = engine::erase_multi(&self.backend, self.root_guid, &padded)?;
+        let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded)?;
 
         if let Some(wal) = &self.wal {
             if let Some(prev) = &outcome.previous {
@@ -364,7 +378,7 @@ impl Tree {
         let _r = self.rename_lock.lock().unwrap();
 
         // Probe src across all blobs — zero-copy via BM pin.
-        let Some(value) = engine::lookup_multi(&self.backend, self.root_guid, &src_padded)? else {
+        let Some(value) = engine::lookup_multi(&self.backend, &self.root_pin, &src_padded)? else {
             return Err(Error::NotFound);
         };
 
@@ -374,14 +388,14 @@ impl Tree {
         }
 
         // Probe dst across all blobs unless overwrite is allowed.
-        if !force && engine::lookup_multi(&self.backend, self.root_guid, &dst_padded)?.is_some() {
+        if !force && engine::lookup_multi(&self.backend, &self.root_pin, &dst_padded)?.is_some() {
             return Err(Error::DstExists);
         }
 
         // erase(src) + insert(dst, value). Both walk through
         // `BlobNode` crossings and commit any touched child blobs.
-        engine::erase_multi(&self.backend, self.root_guid, &src_padded)?;
-        engine::insert_multi(&self.backend, self.root_guid, &dst_padded, &value, seq)?;
+        engine::erase_multi(&self.backend, &self.root_pin, &src_padded)?;
+        engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq)?;
 
         if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
@@ -524,7 +538,7 @@ impl Tree {
 
     fn apply_put_inner(&self, key: &[u8], value: &[u8], seq: u64) -> Result<TxnOp> {
         let padded = pad_key(key);
-        let outcome = engine::insert_multi(&self.backend, self.root_guid, &padded, value, seq)?;
+        let outcome = engine::insert_multi(&self.backend, &self.root_pin, &padded, value, seq)?;
         Ok(TxnOp::Insert {
             tree_id: 0,
             seq,
@@ -536,7 +550,7 @@ impl Tree {
 
     fn apply_delete_inner(&self, key: &[u8], seq: u64) -> Result<Option<TxnOp>> {
         let padded = pad_key(key);
-        let outcome = engine::erase_multi(&self.backend, self.root_guid, &padded)?;
+        let outcome = engine::erase_multi(&self.backend, &self.root_pin, &padded)?;
         Ok(outcome.previous.map(|prev| TxnOp::Erase {
             tree_id: 0,
             seq,
@@ -548,16 +562,16 @@ impl Tree {
     fn apply_rename_inner(&self, src: &[u8], dst: &[u8], force: bool, seq: u64) -> Result<TxnOp> {
         let src_padded = pad_key(src);
         let dst_padded = pad_key(dst);
-        let Some(value) = engine::lookup_multi(&self.backend, self.root_guid, &src_padded)? else {
+        let Some(value) = engine::lookup_multi(&self.backend, &self.root_pin, &src_padded)? else {
             return Err(Error::NotFound);
         };
         if src != dst {
-            if !force && engine::lookup_multi(&self.backend, self.root_guid, &dst_padded)?.is_some()
+            if !force && engine::lookup_multi(&self.backend, &self.root_pin, &dst_padded)?.is_some()
             {
                 return Err(Error::DstExists);
             }
-            engine::erase_multi(&self.backend, self.root_guid, &src_padded)?;
-            engine::insert_multi(&self.backend, self.root_guid, &dst_padded, &value, seq)?;
+            engine::erase_multi(&self.backend, &self.root_pin, &src_padded)?;
+            engine::insert_multi(&self.backend, &self.root_pin, &dst_padded, &value, seq)?;
         }
         Ok(TxnOp::RenameObject {
             tree_id: 0,
@@ -749,16 +763,20 @@ impl Tree {
 /// single-tree v0.1 surface and is rejected. `NewTree` / `RmTree`
 /// are also future-multi-tenant ops, ignored here.
 fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<u64> {
+    // Pin the root once for the entire replay loop; saves a
+    // BM-Mutex per op (replays can be thousands of ops on a
+    // dirty WAL).
+    let root_pin = bm.pin(root_guid)?;
     let mut highest = 0u64;
     let _ = replay(path, |op, seq, _off| {
         match op {
             TxnOp::Insert { key, value, .. } => {
                 let padded = pad_key(key);
-                engine::insert_multi(bm, root_guid, &padded, value, seq)?;
+                engine::insert_multi(bm, &root_pin, &padded, value, seq)?;
             }
             TxnOp::Erase { key, .. } => {
                 let padded = pad_key(key);
-                engine::erase_multi(bm, root_guid, &padded)?;
+                engine::erase_multi(bm, &root_pin, &padded)?;
             }
             TxnOp::RenameObject {
                 src_key,
@@ -768,17 +786,17 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
             } => {
                 let src_padded = pad_key(src_key);
                 let dst_padded = pad_key(dst_key);
-                if engine::lookup_multi(bm, root_guid, &src_padded)?.is_none() {
+                if engine::lookup_multi(bm, &root_pin, &src_padded)?.is_none() {
                     // Already reconciled in a prior replay pass —
                     // skip.
                     return Ok(());
                 }
-                if !force && engine::lookup_multi(bm, root_guid, &dst_padded)?.is_some() {
+                if !force && engine::lookup_multi(bm, &root_pin, &dst_padded)?.is_some() {
                     return Ok(());
                 }
-                let value = engine::lookup_multi(bm, root_guid, &src_padded)?.unwrap_or_default();
-                engine::erase_multi(bm, root_guid, &src_padded)?;
-                engine::insert_multi(bm, root_guid, &dst_padded, &value, seq)?;
+                let value = engine::lookup_multi(bm, &root_pin, &src_padded)?.unwrap_or_default();
+                engine::erase_multi(bm, &root_pin, &src_padded)?;
+                engine::insert_multi(bm, &root_pin, &dst_padded, &value, seq)?;
             }
             // Structural / multi-tenant / marker variants don't
             // affect logical state at v0.1's single-tree surface.

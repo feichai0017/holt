@@ -3,8 +3,10 @@
 //! `insert_at_blob_node` cross-blob arm.
 
 use crate::api::errors::{Error, Result};
-use crate::layout::{leaf_extent_size, BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
-use crate::store::{BlobFrame, BlobFrameRef, BufferManager};
+use crate::layout::{leaf_extent_size, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
+use std::sync::Arc;
+
+use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
 use super::readers::{longest_common, ntype_of, read_leaf_kv, read_prefix};
@@ -57,7 +59,7 @@ pub fn insert(
 /// of each cross-blob recursion.
 pub fn insert_multi(
     bm: &BufferManager,
-    root_guid: BlobGuid,
+    root_pin: &Arc<CachedBlob>,
     key: &[u8],
     value: &[u8],
     seq: u64,
@@ -69,7 +71,9 @@ pub fn insert_multi(
         return Err(Error::ValueTooLong { len: value.len() });
     }
 
-    let root_pin = bm.pin(root_guid)?;
+    // The caller (typically `Tree`) keeps `root_pin` alive across
+    // every op so we skip `BufferManager`'s pin-Mutex on the hot
+    // path. Cross-blob writes still pin children through `bm`.
     // Hold the exclusive guard for the **entire** insert. Every
     // observable mutation (walker descent, header.root_slot bump,
     // spillover, compact) happens inside one continuous critical

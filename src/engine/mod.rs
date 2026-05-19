@@ -11,7 +11,6 @@
 //! [`BlobFrameRef`]: crate::store::BlobFrameRef
 
 pub mod compact;
-pub mod iter;
 pub mod simd;
 pub mod walker;
 
