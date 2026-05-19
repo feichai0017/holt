@@ -84,10 +84,10 @@ holt = "0.1"
 
 ### Open a tree
 
-Two storage modes; pick at open time:
+Two storage modes; same `TreeBuilder`, one knob switches between them:
 
 ```rust
-use holt::{Tree, TreeBuilder, TreeConfig};
+use holt::TreeBuilder;
 
 // Persistent (production), Unix-only — Linux `O_DIRECT`,
 // macOS `F_NOCACHE`. The directory is created if missing.
@@ -96,9 +96,10 @@ let tree = TreeBuilder::new("/var/lib/myapp/meta.holt")
     .wal_sync_on_commit(false)    // see "Durability" below
     .open()?;
 
-// In-memory — volatile, dies with the last handle. Good for
-// tests, sidecar caches, ephemeral session stores.
-let tree = Tree::open(TreeConfig::memory())?;
+// In-memory — volatile, dies with the last handle. The path
+// argument becomes informational once `.memory()` flips the
+// mode. Good for tests, sidecar caches, ephemeral session stores.
+let tree = TreeBuilder::new("scratch").memory().open()?;
 ```
 
 ### Single-key CRUD
