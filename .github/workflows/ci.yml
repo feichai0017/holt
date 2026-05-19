@@ -23,7 +23,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # `rocksdb` is a dev-dependency (criterion bench harness pulls
       # it in for the apples-to-apples comparison). Its C++ build
@@ -74,7 +74,7 @@ jobs:
     name: lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install LLVM
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
@@ -103,7 +103,7 @@ jobs:
     name: docs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install LLVM
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
@@ -127,7 +127,7 @@ jobs:
     name: msrv (rust 1.82)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.82
       - uses: Swatinem/rust-cache@v2
 
