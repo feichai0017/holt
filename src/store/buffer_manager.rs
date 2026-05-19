@@ -407,14 +407,10 @@ impl BufferManager {
             .is_some()
     }
 
-    /// Maximum number of blobs the cache will retain before
-    /// evicting LRU entries.
-    #[must_use]
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    /// Current number of cached blobs.
+    /// Current number of cached blobs. Exercised by the
+    /// checkpointer unit tests; not consumed by production code
+    /// directly.
+    #[allow(dead_code)]
     #[must_use]
     pub fn cached_count(&self) -> usize {
         self.cache.len()
@@ -448,14 +444,6 @@ impl BufferManager {
     /// lookup walker on `validate()` failure.
     pub(crate) fn note_optimistic_restart(&self) {
         self.optimistic_restarts.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Drop every cached entry. The inner backend is untouched.
-    /// Useful for tests and to release memory under pressure.
-    pub fn clear(&self) {
-        self.cache.clear();
-        self.dirty.lock().unwrap().clear();
-        self.pending_deletes.lock().unwrap().clear();
     }
 
     /// Internal: look up `guid` in the cache. On a hit, stamps
@@ -684,6 +672,10 @@ impl BufferManager {
     /// we're about to clear. On write failure the drained entry is
     /// restored (taking `min` with anything the racing writer
     /// added in the meantime); on success it stays removed.
+    ///
+    /// Exercised by the buffer-manager unit tests; production
+    /// checkpoint paths use `write_through` (CAS-on-seq) instead.
+    #[allow(dead_code)]
     pub fn commit(&self, guid: BlobGuid) -> Result<()> {
         let drained = {
             let mut d = self.dirty.lock().unwrap();
@@ -771,6 +763,12 @@ impl BufferManager {
     /// be discarded because their effects are already in the
     /// backend. If the dirty map is empty, every seq up to
     /// `next_seq - 1` is durable.
+    ///
+    /// Exercised by the buffer-manager unit tests; the conditional
+    /// truncate gate in `Tree::checkpoint` / the bg round uses
+    /// `dirty_count()` + `pending_delete_count()` instead, so this
+    /// accessor is currently test-only.
+    #[allow(dead_code)]
     #[must_use]
     pub fn min_unflushed_txn(&self) -> Option<u64> {
         let d = self.dirty.lock().unwrap();

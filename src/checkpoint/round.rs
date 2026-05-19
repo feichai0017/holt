@@ -158,12 +158,18 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         };
         if shared.io_tx.send(task).is_err() {
             // I/O thread is gone (Drop is mid-sequence on another
-            // path) — fall back to restoring everything for the
-            // next round.
+            // path) — restore EVERYTHING we drained at step 1 so
+            // the next round retries:
+            //  - dirty entries we haven't yet handed off to the
+            //    worker, AND those still in-flight as completions
+            //    we'll never collect;
+            //  - the whole `pending` snapshot — we never reached
+            //    phase 6, and dropping it would lose unlink intent.
             for (g, t) in &snap {
                 failed.entry(*g).or_insert(*t);
             }
             shared.bm.restore_dirty(failed);
+            shared.bm.restore_pending_deletes(pending);
             return Err(Error::Internal("checkpoint: I/O worker channel closed mid-round",
             ));
         }
@@ -190,18 +196,23 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         }
     }
 
-    if !failed.is_empty() {
+    let had_dirty_failure = !failed.is_empty();
+    if had_dirty_failure {
         shared.bm.restore_dirty(failed.clone());
     }
 
-    // 5. Sync the backend so every Flush above is on stable
-    //    storage before we drop WAL records.
+    // 5. Pre-delete Sync — every successful Flush above retired
+    //    its dirty entry via write_through CAS; we must still
+    //    fsync so those bytes are stable on disk before phase 6
+    //    mutates the manifest. Each early-return path restores
+    //    `pending` because phase 6 won't run.
     let (sync_tx, sync_rx) = bounded(1);
     if shared
         .io_tx
         .send(IoTask::Sync { on_done: sync_tx })
         .is_err()
     {
+        shared.bm.restore_pending_deletes(pending);
         return Err(Error::Internal("checkpoint: I/O worker channel closed before Sync",
         ));
     }
@@ -209,19 +220,36 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             eprintln!("holt: checkpoint backend Sync failed: {e}");
+            shared.bm.restore_pending_deletes(pending);
             return Err(e);
         }
         Err(_) => {
+            shared.bm.restore_pending_deletes(pending);
             return Err(Error::Internal("checkpoint: I/O worker dropped Sync completion",
             ));
         }
     }
 
+    // 5.5. Abort-on-dirty-failure gate. A failed parent write must
+    //      NOT propagate to a manifest delete of its dependent
+    //      child — that would orphan the parent's `BlobNode`
+    //      pointer (parent on-disk still points to the child;
+    //      manifest no longer has the child; WAL replay's walker
+    //      descent would fail to read the deleted child). Restore
+    //      `pending` and bail; the next round retries the parent
+    //      write and only then processes its child's deletion.
+    if had_dirty_failure {
+        shared.bm.restore_pending_deletes(pending);
+        return Err(Error::Internal("checkpoint: dirty write failed — pending deletes deferred to next round"));
+    }
+
     // 6. Apply pending deletes — `pending` was already drained in
     //    step 1 under the wal.lock, so the writer-side WAL records
     //    covering each unlink op are durable on disk (via the
-    //    step-2 wal.flush). Safe to mutate the manifest now; the
-    //    trailing re-Sync at step 7 persists it.
+    //    step-2 wal.flush). Phase 5 has fsync'd the per-blob writes
+    //    that the manifest delete is allowed to follow. Safe to
+    //    mutate the manifest now; the trailing re-Sync at step 7
+    //    persists it.
     let pending_count = pending.len();
     let mut pending_failed: HashMap<BlobGuid, u64> = HashMap::new();
     for (guid, seq) in &pending {

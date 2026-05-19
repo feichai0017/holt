@@ -63,10 +63,4 @@ impl Prefix {
         p.bytes[..prefix_bytes.len()].copy_from_slice(prefix_bytes);
         p
     }
-
-    /// View of the valid prefix bytes.
-    #[must_use]
-    pub fn prefix(&self) -> &[u8] {
-        &self.bytes[..self.prefix_len as usize]
-    }
 }

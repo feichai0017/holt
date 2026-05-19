@@ -1,18 +1,21 @@
-//! End-to-end integration tests for the Stage 5b WAL writer +
-//! replay scanner: write some records, flush, scan, verify what
-//! comes back matches what went in.
+//! End-to-end unit tests for the WAL writer + replay scanner —
+//! write some records, flush, scan, verify what comes back
+//! matches what went in.
+//!
+//! Previously lived as `tests/wal_round_trip.rs`. Moved inward
+//! when the `journal` module became `pub(crate)`.
 
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-use holt::Error;
 use tempfile::tempdir;
 
-use holt::journal::codec::{FILE_HEADER_SIZE, FORMAT_VERSION};
-use holt::journal::reader::replay;
-use holt::journal::txn_op::TxnOp;
-use holt::journal::writer::{WalWriter, AUTO_FLUSH_THRESHOLD};
+use super::codec::{FILE_HEADER_SIZE, FORMAT_VERSION};
+use super::reader::replay;
+use super::txn_op::TxnOp;
+use super::writer::{WalWriter, AUTO_FLUSH_THRESHOLD};
+use crate::api::errors::Error;
 
 fn wal_path(dir: &tempfile::TempDir) -> PathBuf {
     dir.path().join("test.wal")
@@ -343,7 +346,7 @@ fn rejected_file_with_unsupported_version() {
     let path = wal_path(&dir);
 
     let mut bogus = vec![0u8; FILE_HEADER_SIZE];
-    bogus[0..4].copy_from_slice(&holt::journal::codec::FILE_MAGIC.to_le_bytes());
+    bogus[0..4].copy_from_slice(&super::codec::FILE_MAGIC.to_le_bytes());
     bogus[4..8].copy_from_slice(&999u32.to_le_bytes());
     fs::write(&path, &bogus).unwrap();
 

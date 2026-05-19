@@ -72,8 +72,10 @@ pub struct RangeBuilder {
 
 impl RangeBuilder {
     /// Construct a builder anchored at `root_guid` of the BM-backed
-    /// tree. Public surface: [`crate::Tree::range`].
-    pub fn new(bm: Arc<BufferManager>, root_guid: BlobGuid) -> Self {
+    /// tree. Internal — user surface is [`crate::Tree::range`] /
+    /// [`crate::Tree::scan_prefix`]; both signature dependencies
+    /// (`BufferManager`, `BlobGuid`) live in crate-private modules.
+    pub(crate) fn new(bm: Arc<BufferManager>, root_guid: BlobGuid) -> Self {
         Self {
             bm,
             root_guid,

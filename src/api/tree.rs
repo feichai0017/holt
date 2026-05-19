@@ -764,39 +764,65 @@ impl Tree {
     ///
     /// Mirrors the background checkpoint round's protocol so a
     /// manual checkpoint is just as concurrency-safe against
-    /// in-flight writers as the background path:
+    /// in-flight writers as the background path. Phases are kept
+    /// strictly ordered around the W2D invariant; every error
+    /// path restores any snapshot it drained so the next round
+    /// retries.
     ///
-    /// 1. Under `wal.lock`: snapshot the BM dirty + pending-delete
-    ///    sets, then `wal.flush` so every WAL record covering a
-    ///    snapshotted dirty entry is durable before any data byte
-    ///    or manifest mutation reaches backend (invariant **W2D**).
-    /// 2. `write_through(guid, bytes, expected_seq)` per snapshot
-    ///    dirty entry — the CAS-on-seq retires the entry only if
-    ///    no racing writer bumped it. Failed writes are restored
-    ///    so the next checkpoint retries.
-    /// 3. `backend.flush` (`sync_data` on the data file + persist
-    ///    the manifest) so step 2's writes hit stable storage.
-    /// 4. Execute each `backend.delete_blob` from the pending-
-    ///    delete snapshot — mutates manifest in-memory.
-    /// 5. Re-`backend.flush` if any delete actually applied, so
-    ///    the manifest's delete entries reach disk too.
-    /// 6. Truncate the WAL — only if `dirty_count == 0` and
-    ///    `pending_delete_count == 0` (a racing writer may have
-    ///    re-marked something between our snapshot and now; their
-    ///    entry must keep the WAL alive until a future flush).
+    /// 1. **Snapshot + WAL flush** (under `wal.lock`): drain BM
+    ///    dirty + pending-delete sets, then `wal.flush` so every
+    ///    record covering a drained entry is durable before any
+    ///    data byte or manifest mutation reaches backend
+    ///    (invariant **W2D**). WAL flush failure → restore
+    ///    both snapshots, return.
+    /// 2. **Per-blob write-through** with CAS-on-seq. The CAS
+    ///    retires the dirty entry only if no racing writer bumped
+    ///    it; failures stay in `dirty` for the next round.
+    /// 3. **Pre-delete sync** — `backend.flush` (`sync_data` on
+    ///    the data file + persist the manifest) so step 2's
+    ///    writes hit stable storage *before* any manifest delete
+    ///    runs. Sync failure → restore pending, return.
+    /// 4. **Abort-on-dirty-failure gate**. If any write_through
+    ///    at step 2 failed, the round must NOT apply pending
+    ///    deletes: a parent that didn't flush might still
+    ///    reference a child that's about to be removed from the
+    ///    manifest, leaving the on-disk parent pointing into a
+    ///    deleted slot. Restore pending and return the dirty
+    ///    error. The next round will retry the parent write and
+    ///    only then process its child's deletion.
+    /// 5. **Apply pending deletes** (manifest mutation
+    ///    in-memory). Each `execute_pending_delete` is idempotent
+    ///    against a missing entry; failures are restored.
+    /// 6. **Post-delete sync** — re-`backend.flush` iff any delete
+    ///    actually applied. Failure → restore the
+    ///    already-applied entries so the truncate gate stays
+    ///    closed and the next round retries the sync (the manifest
+    ///    delete is idempotent on the second pass).
+    /// 7. **Conditional WAL truncate** — only if
+    ///    `dirty_count == 0` AND `pending_delete_count == 0`
+    ///    *now*. A racing writer or a restored failure must keep
+    ///    the WAL alive until a future flush.
     ///
     /// `memory_flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
     pub fn checkpoint(&self) -> Result<()> {
         use std::collections::HashMap;
 
-        // 1. Snapshot under wal.lock so racing writers can't slip
-        //    in a not-yet-WAL-durable dirty entry past us.
+        // Phase 1: snapshot under wal.lock so racing writers can't
+        // slip a not-yet-WAL-durable dirty entry past us. WAL flush
+        // failure must restore both snapshots — otherwise the next
+        // checkpoint sees `dirty == 0 && pending == 0` and may
+        // truncate the WAL, losing the cache mutations the failed
+        // flush had just drained from `dirty`.
         let (snap_dirty, snap_pending) = if let Some(wal) = &self.wal {
             let mut w = wal.lock().unwrap();
             let snap_dirty = self.backend.snapshot_dirty();
             let snap_pending = self.backend.snapshot_pending_deletes();
-            w.flush()?;
+            if let Err(e) = w.flush() {
+                self.backend.restore_dirty(snap_dirty);
+                self.backend.restore_pending_deletes(snap_pending);
+                return Err(e);
+            }
             (snap_dirty, snap_pending)
         } else {
             (
@@ -805,39 +831,56 @@ impl Tree {
             )
         };
 
-        // 2. Write each dirty blob through the inner backend with
-        //    CAS-on-seq.
+        // Phase 2: per-blob write_through with CAS-on-seq.
         let mut dirty_failed: HashMap<BlobGuid, u64> = HashMap::new();
-        let mut first_err: Option<Error> = None;
+        let mut first_dirty_err: Option<Error> = None;
         for (guid, expected_seq) in &snap_dirty {
             if let Some(bytes) = self.backend.snapshot_bytes(*guid) {
                 if let Err(e) = self.backend.write_through(*guid, &bytes, *expected_seq) {
                     dirty_failed.insert(*guid, *expected_seq);
-                    if first_err.is_none() {
-                        first_err = Some(e);
+                    if first_dirty_err.is_none() {
+                        first_dirty_err = Some(e);
                     }
                 }
             }
         }
-        if !dirty_failed.is_empty() {
+        let had_dirty_failure = !dirty_failed.is_empty();
+        if had_dirty_failure {
             self.backend.restore_dirty(dirty_failed);
         }
 
-        // 3. Sync data file + manifest snapshot.
+        // Phase 3: pre-delete sync. Even when some writes failed at
+        // phase 2, the successful ones already retired their dirty
+        // entries via the write_through CAS — we must still fsync
+        // so those bytes are stable on disk. On sync failure,
+        // pending deletes haven't been applied yet, so restore them
+        // and bail.
         if let Err(e) = self.backend.flush() {
-            // The pending-delete snapshot hasn't been applied
-            // yet — restore it so the next checkpoint retries.
             self.backend.restore_pending_deletes(snap_pending);
             return Err(e);
         }
 
-        // 4. Apply pending deletes (manifest mutation).
+        // Phase 4: abort-on-dirty-failure gate. A failed parent
+        // write_through must NOT propagate to a manifest delete of
+        // its dependent child — that would orphan the parent's
+        // BlobNode pointer (parent on-disk still has the child
+        // pointer; manifest no longer has the child entry; WAL
+        // replay's walker descent would fail to read the deleted
+        // child). Restore the entire pending snapshot and surface
+        // the dirty error.
+        if had_dirty_failure {
+            self.backend.restore_pending_deletes(snap_pending);
+            return Err(first_dirty_err.expect("had_dirty_failure ⇒ first_dirty_err set"));
+        }
+
+        // Phase 5: apply pending deletes (manifest mutation).
         let mut pending_failed: HashMap<BlobGuid, u64> = HashMap::new();
+        let mut first_pending_err: Option<Error> = None;
         for (guid, seq) in &snap_pending {
             if let Err(e) = self.backend.execute_pending_delete(*guid) {
                 pending_failed.insert(*guid, *seq);
-                if first_err.is_none() {
-                    first_err = Some(e);
+                if first_pending_err.is_none() {
+                    first_pending_err = Some(e);
                 }
             }
         }
@@ -845,11 +888,13 @@ impl Tree {
             self.backend.restore_pending_deletes(pending_failed.clone());
         }
 
-        // 5. Re-sync iff any delete actually applied. On failure
-        //    restore the already-applied entries to pending so
-        //    the next checkpoint retries the Sync — re-executing
-        //    `delete_blob` is idempotent (HashMap::remove on a
-        //    missing key is a noop).
+        // Phase 6: post-delete sync iff any delete actually applied.
+        // On sync failure, restore the already-applied entries to
+        // pending — the manifest mutation we did at phase 5 is
+        // stuck in-memory until the next sync succeeds, so the
+        // truncate gate at phase 7 must stay closed. Re-executing
+        // `execute_pending_delete` on the restored entries is a
+        // no-op (HashMap::remove on a missing key).
         let applied_deletes = snap_pending.len() - pending_failed.len();
         if applied_deletes > 0 {
             if let Err(e) = self.backend.flush() {
@@ -863,7 +908,7 @@ impl Tree {
             }
         }
 
-        if let Some(e) = first_err {
+        if let Some(e) = first_pending_err {
             return Err(e);
         }
 

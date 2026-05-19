@@ -85,17 +85,12 @@ impl std::fmt::Display for FreeError {
 }
 impl std::error::Error for FreeError {}
 
-/// Outcome of a node alloc — slot index + a *mutable view* of the
-/// body bytes via offset (callers write directly into the frame
-/// buffer using `body_of_slot_mut`).
+/// Outcome of a node alloc — just the 1-based slot index.
+/// Callers write into the body via `body_of_slot_mut(slot)`.
 #[derive(Debug, Clone, Copy)]
 pub struct AllocOutcome {
     /// 1-based slot index of the allocated body.
     pub slot: u16,
-    /// Byte offset of the body within the blob buffer.
-    pub byte_offset: u32,
-    /// Body size in bytes.
-    pub size: u32,
 }
 
 /// Outcome of a raw-extent alloc (for Leaf key/value bytes).
@@ -103,8 +98,6 @@ pub struct AllocOutcome {
 pub struct ExtentAllocOutcome {
     /// Byte offset of the extent within the blob.
     pub byte_offset: u32,
-    /// Aligned size (always a multiple of 8).
-    pub aligned_size: u32,
 }
 
 /// Read-only typed view over a `PAGE_SIZE`-byte buffer.
@@ -132,12 +125,6 @@ impl<'a> BlobFrameRef<'a> {
             "BlobFrameRef requires PAGE_SIZE buffer"
         );
         Self { buf }
-    }
-
-    /// View of the buffer's raw bytes.
-    #[must_use]
-    pub fn raw(&self) -> &'a [u8] {
-        self.buf
     }
 
     /// Const reference to the header.
@@ -365,11 +352,7 @@ impl<'a> BlobFrame<'a> {
             let off = e.byte_offset();
             self.write_slot_entry(free_head, SlotEntry::live(ntype, off));
             self.header_mut().gap_space = self.header().gap_space.wrapping_add(size);
-            return Ok(AllocOutcome {
-                slot: free_head,
-                byte_offset: off,
-                size,
-            });
+            return Ok(AllocOutcome { slot: free_head });
         }
 
         // Same-size cross-type fallback for the 128-byte pair
@@ -391,11 +374,7 @@ impl<'a> BlobFrame<'a> {
                 let off = e.byte_offset();
                 self.write_slot_entry(sibling_head, SlotEntry::live(ntype, off));
                 self.header_mut().gap_space = self.header().gap_space.wrapping_add(size);
-                return Ok(AllocOutcome {
-                    slot: sibling_head,
-                    byte_offset: off,
-                    size,
-                });
+                return Ok(AllocOutcome { slot: sibling_head });
             }
         }
 
@@ -432,11 +411,7 @@ impl<'a> BlobFrame<'a> {
         h.space_used += size;
         h.gap_space = h.gap_space.wrapping_add(size);
 
-        Ok(AllocOutcome {
-            slot: new_slot,
-            byte_offset: body_off,
-            size,
-        })
+        Ok(AllocOutcome { slot: new_slot })
     }
 
     /// Push a slot onto its NodeType's free list. The body bytes
@@ -486,16 +461,7 @@ impl<'a> BlobFrame<'a> {
         }
         let off = h.space_used;
         self.header_mut().space_used += aligned;
-        Ok(ExtentAllocOutcome {
-            byte_offset: off,
-            aligned_size: aligned,
-        })
-    }
-
-    /// View of the buffer's raw bytes.
-    #[must_use]
-    pub fn raw(&self) -> &[u8] {
-        self.buf
+        Ok(ExtentAllocOutcome { byte_offset: off })
     }
 
     /// Raw byte view at an arbitrary offset.
@@ -561,8 +527,6 @@ mod tests {
         let space_before = frame.header().space_used;
         let out = frame.alloc_node(NodeType::Node4).unwrap();
         assert_eq!(out.slot, 2);
-        assert_eq!(out.size, 24);
-        assert_eq!(out.byte_offset, space_before);
         assert_eq!(frame.header().space_used, space_before + 24);
         assert_eq!(frame.header().num_slots, 2);
 
@@ -597,7 +561,6 @@ mod tests {
         let slots_before = frame.header().num_slots;
         let e = frame.alloc_extent(13).unwrap();
         // 13 → padded to 16.
-        assert_eq!(e.aligned_size, 16);
         assert_eq!(e.byte_offset, space_before);
         assert_eq!(frame.header().space_used, space_before + 16);
         // Slot table untouched.
@@ -621,8 +584,9 @@ mod tests {
 
         // The last 128 bytes are still reachable via
         // `alloc_node(NodeType::Blob)` — that's the spillover
-        // emergency path.
-        let bn = frame.alloc_node(NodeType::Blob).unwrap();
-        assert_eq!(bn.size, 128);
+        // emergency path. We don't need to verify the size here;
+        // SIZE_BY_TYPE[NodeType::Blob] is compile-time-asserted to
+        // 128 in `layout::mod.rs`.
+        let _bn = frame.alloc_node(NodeType::Blob).unwrap();
     }
 }

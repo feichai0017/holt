@@ -75,12 +75,12 @@ fn failpoint_err(msg: &'static str) -> holt::Error {
 }
 
 impl Backend for FailpointBackend {
-    fn read_blob(&self, guid: holt::layout::BlobGuid, dst: &mut AlignedBlobBuf) -> holt::Result<()> {
+    fn read_blob(&self, guid: holt::BlobGuid, dst: &mut AlignedBlobBuf) -> holt::Result<()> {
         self.inner.read_blob(guid, dst)
     }
     fn write_blob(
         &self,
-        guid: holt::layout::BlobGuid,
+        guid: holt::BlobGuid,
         src: &AlignedBlobBuf,
     ) -> holt::Result<()> {
         let n = self.write_calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -91,7 +91,7 @@ impl Backend for FailpointBackend {
         }
         self.inner.write_blob(guid, src)
     }
-    fn delete_blob(&self, guid: holt::layout::BlobGuid) -> holt::Result<()> {
+    fn delete_blob(&self, guid: holt::BlobGuid) -> holt::Result<()> {
         let n = self.delete_calls.fetch_add(1, Ordering::SeqCst) + 1;
         let armed = self.fail_delete_at.load(Ordering::SeqCst);
         if n == armed {
@@ -100,7 +100,7 @@ impl Backend for FailpointBackend {
         }
         self.inner.delete_blob(guid)
     }
-    fn list_blobs(&self) -> holt::Result<Vec<holt::layout::BlobGuid>> {
+    fn list_blobs(&self) -> holt::Result<Vec<holt::BlobGuid>> {
         self.inner.list_blobs()
     }
     fn flush(&self) -> holt::Result<()> {
@@ -112,7 +112,7 @@ impl Backend for FailpointBackend {
         }
         self.inner.flush()
     }
-    fn has_blob(&self, guid: holt::layout::BlobGuid) -> holt::Result<bool> {
+    fn has_blob(&self, guid: holt::BlobGuid) -> holt::Result<bool> {
         self.inner.has_blob(guid)
     }
 }
@@ -287,6 +287,116 @@ fn dirty_write_failure_is_retried_next_round() {
         tree.get(b"k1").unwrap().as_deref(),
         Some(&b"v1"[..]),
     );
+}
+
+#[test]
+fn dirty_write_failure_does_not_propagate_to_pending_delete() {
+    // Regression for the bug where a failed parent write_through
+    // didn't stop the round from applying a dependent child's
+    // manifest delete — leaving "old parent on-disk still
+    // references a now-deleted child" on a crash before the next
+    // round caught up. The fix: on any write failure, the
+    // pre-delete sync still runs (to fsync the writes that DID
+    // succeed), but no manifest delete fires; the whole pending
+    // snapshot is restored for the next round.
+    let (inner, fp, tree) = setup_with_pending_delete();
+    let stats_before = tree.stats().unwrap();
+    assert!(
+        stats_before.bm_dirty_count > 0,
+        "setup precondition: dirty entry queued (got {})",
+        stats_before.bm_dirty_count,
+    );
+    assert!(
+        stats_before.bm_pending_delete_count > 0,
+        "setup precondition: pending delete queued (got {})",
+        stats_before.bm_pending_delete_count,
+    );
+    let pending_before = stats_before.bm_pending_delete_count;
+
+    // Arm the NEXT write_blob to fail — that's the first
+    // write_through inside `tree.checkpoint`'s phase 2.
+    let writes_pre = fp.write_calls.load(Ordering::SeqCst);
+    fp.arm_write(writes_pre + 1);
+
+    let result = tree.checkpoint();
+    assert!(
+        result.is_err(),
+        "checkpoint must surface the write_through failure",
+    );
+
+    let stats_after = tree.stats().unwrap();
+    assert!(
+        stats_after.bm_dirty_count >= 1,
+        "failed dirty write must stay in `dirty` for next round (got {})",
+        stats_after.bm_dirty_count,
+    );
+    assert_eq!(
+        stats_after.bm_pending_delete_count, pending_before,
+        "dirty failure must NOT apply any pending delete — whole \
+         snapshot restored (got {} vs {})",
+        stats_after.bm_pending_delete_count, pending_before,
+    );
+
+    // Backend manifest must still hold every blob the tree knows
+    // about — no orphan deletes slipped through despite the
+    // failed parent write.
+    let backend_blobs = inner.list_blobs().unwrap();
+    let stats = tree.stats().unwrap();
+    assert_eq!(
+        backend_blobs.len() as u32,
+        stats.blob_count,
+        "no manifest delete must have applied while dirty write failed",
+    );
+
+    // Second checkpoint with no fault — drains everything.
+    tree.checkpoint().unwrap();
+    let stats_done = tree.stats().unwrap();
+    assert_eq!(stats_done.bm_dirty_count, 0);
+    assert_eq!(stats_done.bm_pending_delete_count, 0);
+}
+
+#[test]
+fn pre_delete_sync_failure_restores_pending() {
+    // Regression for the bug where the pre-delete `backend.flush`
+    // failure path drained `pending` (the wal.lock snapshot) but
+    // never restored it — losing every queued unlink intent. The
+    // fix restores `pending` on every Sync-failure return path
+    // before phase 6.
+    let (inner, fp, tree) = setup_with_pending_delete();
+    let pending_before = tree.stats().unwrap().bm_pending_delete_count;
+    assert!(pending_before > 0, "setup precondition");
+
+    // First `backend.flush` call inside `tree.checkpoint` is the
+    // pre-delete data Sync at phase 3 — arm to fail it.
+    let flushes_pre = fp.flush_calls.load(Ordering::SeqCst);
+    fp.arm_flush(flushes_pre + 1);
+
+    let result = tree.checkpoint();
+    assert!(
+        result.is_err(),
+        "checkpoint must surface the pre-delete Sync failure",
+    );
+
+    let stats_after = tree.stats().unwrap();
+    assert_eq!(
+        stats_after.bm_pending_delete_count, pending_before,
+        "pre-delete Sync failure must restore the entire pending \
+         snapshot (got {} vs {})",
+        stats_after.bm_pending_delete_count, pending_before,
+    );
+
+    // Phase 6 didn't run, so no manifest delete applied.
+    let backend_blobs = inner.list_blobs().unwrap();
+    let stats = tree.stats().unwrap();
+    assert_eq!(
+        backend_blobs.len() as u32,
+        stats.blob_count,
+        "no manifest delete must have applied while pre-delete Sync failed",
+    );
+
+    // Recovery: next checkpoint drains the restored snapshot.
+    tree.checkpoint().unwrap();
+    assert_eq!(tree.stats().unwrap().bm_pending_delete_count, 0);
 }
 
 #[test]

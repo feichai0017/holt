@@ -35,26 +35,35 @@
 //!
 //! ## Module map
 //!
-//! Public modules (the supported import surface):
+//! Public modules (the supported, SemVer-committed import surface):
 //!
 //! - [`api`] — high-level [`Tree`] + [`TxnBatch`] +
 //!   [`TreeBuilder`], plus the curated [`api::range`] /
 //!   [`api::stats`] re-export modules.
-//! - [`layout`] — extern struct layouts (BlobHeader, SlotEntry,
-//!   per-NodeType bodies). Each struct has a
-//!   `const _: () = assert!(...)` that pins its size + offsets.
-//!   Exposed so advanced users can inspect on-disk frames.
-//! - [`store`] — [`BufferManager`] + backend trait
-//!   ([`MemoryBackend`] / [`PersistentBackend`]).
-//! - [`journal`] — WAL codec + replay scanner + writer. Useful
-//!   for tools that want to inspect or replay journal files.
+//!
+//! Everything else is `pub(crate)`. The user surface is
+//! deliberately narrow so the on-disk format, WAL record codec,
+//! and buffer-manager internals are free to change in minor
+//! releases without breaking downstream code. Only the
+//! crate-root re-exports below are SemVer-stable.
 //!
 //! Internal modules (`pub(crate)`, not part of the SemVer surface):
 //!
+//! - `layout` — extern struct layouts (BlobHeader, SlotEntry,
+//!   per-NodeType bodies). Pinned at compile time via
+//!   `const _: () = assert!(...)` blocks per file.
+//! - `journal` — WAL codec + replay scanner + writer.
+//! - `store` — buffer manager + blob-frame allocator + backend
+//!   trait machinery. The supported backend surface
+//!   ([`Backend`], [`MemoryBackend`], [`PersistentBackend`],
+//!   [`AlignedBlobBuf`]) is re-exported at the crate root for
+//!   users who want to plug in a custom backend.
 //! - `engine` — recursive walker (insert / lookup / erase /
 //!   scan / rename / compact). Its public types (range iterators,
 //!   stats) are re-exported via [`api::range`] / [`api::stats`].
 //! - `concurrency` — `HybridLatch` 3-mode lock + guards.
+//! - `checkpoint` — 3-thread background checkpointer. Users opt
+//!   in via [`CheckpointConfig`].
 //!
 //! ## Platform support
 //!
@@ -122,13 +131,13 @@ compile_error!(
 );
 
 pub mod api;
-pub mod journal;
-pub mod layout;
-pub mod store;
 
 pub(crate) mod checkpoint;
 pub(crate) mod concurrency;
 pub(crate) mod engine;
+pub(crate) mod journal;
+pub(crate) mod layout;
+pub(crate) mod store;
 
 /// Prometheus text-format renderer for [`TreeStats`]. Enabled via
 /// the `metrics` feature flag.
@@ -162,5 +171,7 @@ pub use api::txn::TxnBatch;
 pub use checkpoint::CheckpointConfig;
 
 // Backend trait + bundled backends + zero-copy blob buffer.
+// Users implementing a custom `Backend` need `BlobGuid` to name
+// the blob they're storing.
+pub use layout::BlobGuid;
 pub use store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
-pub use store::BufferManager;

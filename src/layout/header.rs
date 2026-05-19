@@ -23,9 +23,6 @@ pub const SLOT_TABLE_SIZE: u32 = MAX_SLOTS * 4;
 /// Data area starts after the header + slot table.
 pub const DATA_AREA_START: u32 = HEADER_SIZE + SLOT_TABLE_SIZE;
 
-/// Bytes available for node bodies + key/value extents.
-pub const DATA_AREA_CAPACITY: u32 = PAGE_SIZE - DATA_AREA_START;
-
 const _: () = assert!(DATA_AREA_START == 0xB000);
 
 /// 128-bit blob identifier (stored as 16 bytes).
@@ -97,32 +94,6 @@ const _: () = assert!(offset_of!(BlobHeader, tombstone_leaf_cnt) == 0x6c);
 const _: () = assert!(offset_of!(BlobHeader, free_list_head) == 0x70);
 const _: () = assert!(offset_of!(BlobHeader, blob_guid) == 0xa0);
 
-impl BlobHeader {
-    /// All-zeros header; callers fill in `blob_guid` and the bump
-    /// cursor before use.
-    #[must_use]
-    pub const fn zeroed() -> Self {
-        Self {
-            _pad_0: [0; 0x50],
-            field_50: 0,
-            field_52: 0,
-            num_slots: 0,
-            root_slot: 0,
-            space_used: 0,
-            num_ext_blobs: 0,
-            field_5e: 0,
-            compact_times: 0,
-            _pad_64: [0; 4],
-            gap_space: 0,
-            tombstone_leaf_cnt: 0,
-            free_list_head: [0; 8],
-            _pad_80: [0; 0x20],
-            blob_guid: [0; 16],
-            _pad_b0: [0; (HEADER_SIZE as usize) - 0xb0],
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +117,5 @@ mod tests {
         assert_eq!(HEADER_SIZE, 4096);
         assert_eq!(MAX_SLOTS, 10_240);
         assert_eq!(DATA_AREA_START, 0xB000);
-        assert_eq!(DATA_AREA_CAPACITY + DATA_AREA_START, PAGE_SIZE);
     }
 }

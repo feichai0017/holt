@@ -57,12 +57,6 @@ impl TreeBuilder {
         self
     }
 
-    /// Bytes appended to the WAL before triggering a checkpoint.
-    pub fn checkpoint_byte_interval(mut self, bytes: u64) -> Self {
-        self.cfg.checkpoint_byte_interval = bytes;
-        self
-    }
-
     /// Background checkpointer policy.
     ///
     /// Default is disabled — callers drive

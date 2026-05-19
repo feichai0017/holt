@@ -23,7 +23,7 @@ pub mod aligned;
 pub mod memory;
 pub mod persistent;
 
-pub use aligned::{AlignedBlobBuf, BUF_ALIGN};
+pub use aligned::AlignedBlobBuf;
 pub use memory::MemoryBackend;
 pub use persistent::PersistentBackend;
 

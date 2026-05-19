@@ -14,9 +14,5 @@ mod blob_frame;
 // public API still goes through the re-exports below.
 pub(crate) mod buffer_manager;
 
-pub use blob_frame::{
-    AllocError, AllocOutcome, BlobFrame, BlobFrameRef, ExtentAllocOutcome, FreeError,
-};
-pub use buffer_manager::{
-    BlobReadGuard, BlobWriteGuard, BufferManager, CachedBlob, OptimisticGuard,
-};
+pub use blob_frame::{AllocError, BlobFrame, BlobFrameRef, FreeError};
+pub use buffer_manager::{BufferManager, CachedBlob};

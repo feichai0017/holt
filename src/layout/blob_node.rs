@@ -59,10 +59,4 @@ impl BlobNode {
         b.bytes[..prefix_bytes.len()].copy_from_slice(prefix_bytes);
         b
     }
-
-    /// View of the valid prefix bytes.
-    #[must_use]
-    pub fn prefix(&self) -> &[u8] {
-        &self.bytes[..self.prefix_len as usize]
-    }
 }

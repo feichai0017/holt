@@ -128,6 +128,10 @@ impl WalWriter {
     }
 
     /// Header recovered on open, including the embedded tree id.
+    ///
+    /// Diagnostic — verified by codec round-trip tests but not
+    /// directly read on the `Tree::open` hot path.
+    #[allow(dead_code)]
     #[must_use]
     pub fn header(&self) -> FileHeader {
         self.header
@@ -135,6 +139,7 @@ impl WalWriter {
 
     /// Bytes written (durable + buffered) since the file was
     /// created — useful as a stand-in offset for telemetry.
+    #[allow(dead_code)]
     #[must_use]
     pub fn bytes_written(&self) -> u64 {
         self.bytes_written + self.pending.len() as u64
@@ -158,7 +163,7 @@ impl WalWriter {
     /// MemMarker / NewTree / RmTree) where the cost doesn't
     /// matter.
     pub fn append(&mut self, op: &TxnOp, seq: u64) -> Result<()> {
-        encode_record(op, seq, &mut self.pending)?;
+        encode_record(op, seq, &mut self.pending);
         self.maybe_drain()
     }
 
@@ -235,6 +240,10 @@ impl WalWriter {
     /// check failed). Records already `flush`ed or auto-drained
     /// are unaffected — `discard_pending` only touches the
     /// in-memory tail since the last drain.
+    ///
+    /// Currently exercised by journal unit tests only; the
+    /// `Tree::txn` mid-batch bail path doesn't call this yet.
+    #[allow(dead_code)]
     pub fn discard_pending(&mut self) {
         self.pending.clear();
     }

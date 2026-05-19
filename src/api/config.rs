@@ -57,12 +57,6 @@ pub struct TreeConfig {
     /// default. Production deployments that need power-safe
     /// per-op durability flip this to `true`.
     pub wal_sync_on_commit: bool,
-    /// Bytes appended to the WAL before triggering an automatic
-    /// checkpoint. Reserved — the WAL writer's auto-flush bounds
-    /// the in-memory buffer; the user is still responsible for
-    /// calling `Tree::checkpoint` to truncate the on-disk log.
-    /// Default 16 MB.
-    pub checkpoint_byte_interval: u64,
     /// **Memory-only** BM-commit toggle (no effect on
     /// persistent trees — the WAL + `Tree::checkpoint` is the
     /// durability path there; see [`Self::wal_sync_on_commit`]).
@@ -92,7 +86,6 @@ impl TreeConfig {
             storage: Storage::Persistent { dir: dir.into() },
             buffer_pool_size: 64,
             wal_sync_on_commit: false,
-            checkpoint_byte_interval: 16 * 1024 * 1024,
             memory_flush_on_write: true,
             checkpoint: CheckpointConfig::default(),
         }
@@ -105,7 +98,6 @@ impl TreeConfig {
             storage: Storage::Memory,
             buffer_pool_size: 64,
             wal_sync_on_commit: false,
-            checkpoint_byte_interval: 16 * 1024 * 1024,
             memory_flush_on_write: true,
             checkpoint: CheckpointConfig::default(),
         }

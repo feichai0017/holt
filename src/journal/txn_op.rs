@@ -22,6 +22,12 @@ pub enum CompactReason {
 ///
 /// Variant tags are stable on-disk constants — see the `TY_*`
 /// block in [`super::codec`]. Never renumber; only append.
+// `seq` fields are populated on decode (from the record header) and
+// verified via codec round-trip tests, but production replay consumes
+// the per-record `seq` via the callback's separate parameter rather
+// than re-reading it off the variant. Allow dead_code so the lint
+// doesn't fire on those fields in non-test builds.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum TxnOp {
     /// Single-key insert / update.

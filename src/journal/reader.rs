@@ -23,6 +23,14 @@ use super::codec::{decode_file_header, decode_record, FileHeader, FILE_HEADER_SI
 use super::txn_op::TxnOp;
 
 /// Outcome of a successful scan.
+///
+/// All three fields are populated on every replay; the journal
+/// internal tests verify each. Production callers consume the
+/// per-record `seq` via the callback rather than re-reading
+/// `highest_seq` post-hoc, hence the `#[allow(dead_code)]` —
+/// the fields are part of the replay contract even though the
+/// `Tree::open` path doesn't currently read them.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub struct ReplayStats {
     /// Number of records the callback was invoked for.

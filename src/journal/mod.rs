@@ -24,3 +24,6 @@ pub mod codec;
 pub mod reader;
 pub mod txn_op;
 pub mod writer;
+
+#[cfg(test)]
+mod tests;

@@ -47,9 +47,6 @@ pub const RECORD_HEADER_SIZE: usize = 4 + 4 + 8 + 1;
 /// Fixed-size footer bytes: `crc32`.
 pub const RECORD_FOOTER_SIZE: usize = 4;
 
-/// Overhead per record (header + footer, excluding variable body).
-pub const RECORD_OVERHEAD: usize = RECORD_HEADER_SIZE + RECORD_FOOTER_SIZE;
-
 // ---------- File header ----------
 
 /// Top-of-file magic — `"WALA"` little-endian. Sits at offset 0 of
@@ -186,9 +183,8 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 /// [`encode_rename_object_record`] entry points instead — those
 /// skip the `TxnOp` enum construction and the three `Vec` clones
 /// it forces on the caller.
-pub fn encode_record(op: &TxnOp, seq: u64, out: &mut Vec<u8>) -> Result<()> {
+pub fn encode_record(op: &TxnOp, seq: u64, out: &mut Vec<u8>) {
     write_record(out, seq, variant_tag(op), |buf| encode_body(op, buf));
-    Ok(())
 }
 
 /// Internal: lay down the fixed record header, run the
@@ -666,7 +662,7 @@ mod tests {
 
     fn roundtrip(op: TxnOp, seq: u64) {
         let mut buf = Vec::new();
-        encode_record(&op, seq, &mut buf).unwrap();
+        encode_record(&op, seq, &mut buf);
 
         let r = decode_record(&buf).unwrap();
         assert_eq!(r.seq, seq);
@@ -819,7 +815,7 @@ mod tests {
             prev_value: None,
         };
         let mut buf = Vec::new();
-        encode_record(&op, 0, &mut buf).unwrap();
+        encode_record(&op, 0, &mut buf);
         // tree_id (8) + key_len (4) + key (1) + val_len (4) + val (1)
         //   + prev_present (1) = 19 byte body
         // Header (17) + body (19) + footer (4) = 40 bytes.
@@ -836,7 +832,7 @@ mod tests {
             prev_value: None,
         };
         let mut buf = Vec::new();
-        encode_record(&op, 1, &mut buf).unwrap();
+        encode_record(&op, 1, &mut buf);
         let last = buf.len() - 1;
         buf[last] ^= 0x01;
         match decode_record(&buf) {
@@ -851,7 +847,7 @@ mod tests {
     fn corrupt_magic_is_caught() {
         let op = TxnOp::MemMarker { seq: 5 };
         let mut buf = Vec::new();
-        encode_record(&op, 5, &mut buf).unwrap();
+        encode_record(&op, 5, &mut buf);
         buf[0] ^= 0xFF;
         match decode_record(&buf) {
             Err(Error::ReplaySanityFailed { context, .. }) => {
@@ -871,7 +867,7 @@ mod tests {
             prev_value: None,
         };
         let mut buf = Vec::new();
-        encode_record(&op, 1, &mut buf).unwrap();
+        encode_record(&op, 1, &mut buf);
         // Drop the last 10 bytes — simulates a torn write at EOF.
         let len = buf.len();
         buf.truncate(len - 10);
@@ -887,7 +883,7 @@ mod tests {
     fn unknown_variant_tag_is_caught() {
         let op = TxnOp::MemMarker { seq: 1 };
         let mut buf = Vec::new();
-        encode_record(&op, 1, &mut buf).unwrap();
+        encode_record(&op, 1, &mut buf);
         // Overwrite the ty byte (header offset 16) with a bogus value.
         buf[16] = 0xFF;
         // Recompute the CRC so the corruption looks plausible
@@ -917,8 +913,7 @@ mod tests {
             },
             1,
             &mut buf,
-        )
-        .unwrap();
+        );
         encode_record(
             &TxnOp::Erase {
                 tree_id: 0,
@@ -928,8 +923,7 @@ mod tests {
             },
             2,
             &mut buf,
-        )
-        .unwrap();
+        );
 
         let r1 = decode_record(&buf).unwrap();
         assert_eq!(r1.seq, 1);
@@ -970,7 +964,7 @@ mod tests {
             ],
         };
         let mut buf = Vec::new();
-        encode_record(&batch, base, &mut buf).unwrap();
+        encode_record(&batch, base, &mut buf);
 
         let r = decode_record(&buf).unwrap();
         assert_eq!(r.seq, base);
@@ -1020,7 +1014,7 @@ mod tests {
             ops: vec![],
         };
         let mut buf = Vec::new();
-        encode_record(&batch, 7, &mut buf).unwrap();
+        encode_record(&batch, 7, &mut buf);
         let r = decode_record(&buf).unwrap();
         assert_eq!(r.seq, 7);
         match r.op {
@@ -1041,6 +1035,6 @@ mod tests {
             ops: vec![inner],
         };
         let mut buf = Vec::new();
-        let _ = encode_record(&outer, 0, &mut buf);
+        encode_record(&outer, 0, &mut buf);
     }
 }
