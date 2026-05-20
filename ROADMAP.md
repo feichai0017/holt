@@ -192,11 +192,14 @@ threads. v0.3 makes the I/O side worth that structure:
 
 ### P4 — Large-tree shape control
 
-- Replace "largest non-Blob child" spillover with an
-  occupancy-aware split policy. The goal is bounded blob hops and
-  healthy parent/child fill ratios, not just freeing any space.
-- Implement `BlobNode` inline-prefix divergence split so a bad
-  blob boundary can recover into a high-fanout structure.
+- Recursive occupancy-aware spillover is implemented. The picker
+  skips existing `BlobNode` crossings, descends inside overfull
+  path branches, and chooses a victim near the target child fill
+  band instead of blindly peeling off the largest direct child.
+- `BlobNode` inline-prefix divergence split is implemented: a
+  bad blob boundary now recovers locally into
+  `Prefix? -> Node4 -> {old BlobNode, new Leaf}` instead of
+  failing the insert.
 - Make merge/rebalance incremental. `compact()` and background
   merge are now candidate-driven and online with respect to
   foreground writers through the atomic `maintenance_gate`; the

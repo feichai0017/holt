@@ -705,6 +705,66 @@ fn lookup_at_continues_descent_from_supplied_depth() {
     assert!(matches!(r1, LookupResult::Found(v) if v == b"v1"));
 }
 
+#[test]
+fn insert_splits_blob_node_inline_prefix_on_first_byte_divergence() {
+    let (mut buf, _) = fresh_blob();
+    let mut frame = BlobFrame::wrap(&mut buf);
+    let out = frame.alloc_node(NodeType::Blob).unwrap();
+    let child_guid: BlobGuid = [0xAA; 16];
+    install_blob_node(&mut frame, out.slot, b"img/", child_guid);
+    frame.header_mut().root_slot = out.slot;
+
+    let root = frame.header().root_slot;
+    let r = insert(&mut frame, root, b"doc/page1.txt", b"meta", 7).unwrap();
+    assert_eq!(r.previous, None);
+    assert_eq!(get(&frame, b"doc/page1.txt").as_deref(), Some(&b"meta"[..]));
+
+    let root = frame.header().root_slot;
+    assert_eq!(
+        frame.slot_entry(root).unwrap().node_type(),
+        Some(NodeType::Node4)
+    );
+    let r = lookup(frame.as_ref(), root, b"img/01.jpg").unwrap();
+    match r {
+        LookupResult::Crossing(c) => {
+            assert_eq!(c.child_guid, child_guid);
+            assert_eq!(c.child_depth, 4);
+        }
+        other => panic!("expected Crossing, got {other:?}"),
+    }
+}
+
+#[test]
+fn insert_splits_blob_node_inline_prefix_after_shared_prefix() {
+    let (mut buf, _) = fresh_blob();
+    let mut frame = BlobFrame::wrap(&mut buf);
+    let out = frame.alloc_node(NodeType::Blob).unwrap();
+    let child_guid: BlobGuid = [0xBB; 16];
+    install_blob_node(&mut frame, out.slot, b"bucket-a/", child_guid);
+    frame.header_mut().root_slot = out.slot;
+
+    let root = frame.header().root_slot;
+    insert(&mut frame, root, b"bucket-b/file", b"meta", 8).unwrap();
+    assert_eq!(get(&frame, b"bucket-b/file").as_deref(), Some(&b"meta"[..]));
+
+    let root = frame.header().root_slot;
+    assert_eq!(
+        frame.slot_entry(root).unwrap().node_type(),
+        Some(NodeType::Prefix)
+    );
+    let p = read_prefix(frame.as_ref(), root).unwrap();
+    assert_eq!(&p.bytes[..p.prefix_len as usize], b"bucket-");
+
+    let r = lookup(frame.as_ref(), root, b"bucket-a/file").unwrap();
+    match r {
+        LookupResult::Crossing(c) => {
+            assert_eq!(c.child_guid, child_guid);
+            assert_eq!(c.child_depth, b"bucket-a/".len());
+        }
+        other => panic!("expected Crossing, got {other:?}"),
+    }
+}
+
 // ---- make_blob_from_node ----
 
 fn read_value_from_new_blob(buf: &mut AlignedBlobBuf, key: &[u8]) -> Option<Vec<u8>> {

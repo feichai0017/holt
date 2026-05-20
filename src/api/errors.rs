@@ -31,8 +31,8 @@ pub enum Error {
         len: usize,
     },
     /// A walker arm hit a code path that the engine doesn't yet
-    /// implement (e.g. degenerate `Leaf` / `EmptyRoot` spillover,
-    /// inline-prefix `BlobNode` splits). The static string names
+    /// implement (e.g. degenerate `Leaf` / `EmptyRoot` spillover
+    /// or strict-prefix ART insert cases). The static string names
     /// the unimplemented case for diagnostics.
     NotYetImplemented(&'static str),
     /// An internal invariant the engine relies on was observed

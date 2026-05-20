@@ -71,12 +71,14 @@ pub use types::EraseOutcome;
 // ---------- shared internals ----------
 
 /// Cap on the spillover-retry loop inside `insert_multi`. Each
-/// spillover migrates the largest non-Blob subtree out of the
-/// current blob.
+/// spillover migrates an occupancy-aware non-Blob subtree out of
+/// the current blob.
 ///
-/// With the current heuristic (pick-largest, skip BlobNodes, cross-
-/// type Prefix↔Blob free-list fallback) one spillover frees roughly
-/// `(largest-child-subtree-size)` worth of slot entries.
+/// The current heuristic skips BlobNodes, descends inside overfull
+/// path branches, and aims for a child fill band instead of blindly
+/// peeling off the largest branch. One spillover should free enough
+/// slot/extent pressure for the triggering retry while avoiding an
+/// immediately-full child blob.
 ///
 /// 64 covers a 2-3× workload-vs-blob-capacity ratio for the
 /// uniform-key regimes the benchmark + integration tests exercise.

@@ -291,7 +291,7 @@ fn dirty_write_failure_does_not_propagate_to_pending_delete() {
     // pre-delete sync still runs (to fsync the writes that DID
     // succeed), but no manifest delete fires; the whole pending
     // snapshot is restored for the next round.
-    let (inner, fp, tree) = setup_with_pending_delete();
+    let (_inner, fp, tree) = setup_with_pending_delete();
     let stats_before = tree.stats().unwrap();
     assert!(
         stats_before.bm_dirty_count > 0,
@@ -304,6 +304,7 @@ fn dirty_write_failure_does_not_propagate_to_pending_delete() {
         stats_before.bm_pending_delete_count,
     );
     let pending_before = stats_before.bm_pending_delete_count;
+    let deletes_before = fp.delete_count();
 
     // Arm the NEXT write_blob to fail — that's the first
     // write_through inside `tree.checkpoint`'s phase 2.
@@ -329,15 +330,10 @@ fn dirty_write_failure_does_not_propagate_to_pending_delete() {
         stats_after.bm_pending_delete_count, pending_before,
     );
 
-    // Backend manifest must still hold every blob the tree knows
-    // about — no orphan deletes slipped through despite the
-    // failed parent write.
-    let backend_blobs = inner.list_blobs().unwrap();
-    let stats = tree.stats().unwrap();
     assert_eq!(
-        backend_blobs.len() as u32,
-        stats.blob_count,
-        "no manifest delete must have applied while dirty write failed",
+        fp.delete_count(),
+        deletes_before,
+        "no manifest delete attempt must run while dirty write failed",
     );
 
     // Second checkpoint with no fault — drains everything.

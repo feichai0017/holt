@@ -210,9 +210,10 @@ impl SubtreeFootprint {
     }
 }
 
-/// Pick an occupancy-aware non-`BlobNode` subtree at the root's first
-/// branching node. Walks through chained `Prefix` nodes to reach
-/// the first `Node4/16/48/256`.
+/// Pick an occupancy-aware non-`BlobNode` subtree below
+/// `start_slot`. Direct children are considered first; if a child
+/// is already larger than the target child fill, the search descends
+/// inside that child to find a healthier prefix boundary.
 ///
 /// **Heuristic rationale:**
 /// - Skipping `Blob` children avoids spillover-stutter (previously-
@@ -223,186 +224,145 @@ impl SubtreeFootprint {
 ///   turns path-shaped 2M+ put workloads into repeated blob hops.
 #[allow(clippy::too_many_lines)] // intentional — one match over NodeType arms
 fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim> {
-    let mut current = start_slot;
-    loop {
-        let ntype = ntype_of(frame.as_ref(), current)?;
-        match ntype {
-            NodeType::Node4 => {
-                let n = read_node4(frame.as_ref(), current)?;
-                return pick_occupancy_aware_non_blob(
-                    frame,
-                    current,
-                    NodeType::Node4,
-                    (n.count as usize).min(4),
-                    &n.keys[..],
-                    &n.children[..],
-                    false,
-                );
-            }
-            NodeType::Node16 => {
-                let n = read_node16(frame.as_ref(), current)?;
-                return pick_occupancy_aware_non_blob(
-                    frame,
-                    current,
-                    NodeType::Node16,
-                    (n.count as usize).min(16),
-                    &n.keys[..],
-                    &n.children[..],
-                    false,
-                );
-            }
-            NodeType::Node48 => {
-                let n = read_node48(frame.as_ref(), current)?;
-                let mut best: Option<VictimCandidate> = None;
-                for b in 0..256usize {
-                    let idx = n.index[b];
-                    if idx == 0 {
-                        continue;
-                    }
-                    let child_slot = n.children[idx as usize - 1] as u16;
-                    if ntype_of(frame.as_ref(), child_slot)? == NodeType::Blob {
-                        continue;
-                    }
-                    consider_candidate(
-                        frame,
-                        child_slot,
-                        Victim {
-                            parent_slot: current,
-                            kind: VictimEdgeKind::Inner(NodeType::Node48),
-                            byte: b as u8,
-                            victim_slot: child_slot,
-                            via_header_root: false,
-                        },
-                        &mut best,
-                    )?;
-                }
-                return best
-                    .map(|candidate| candidate.victim)
-                    .ok_or(Error::NotYetImplemented(
-                        "spillover: no non-Blob children to migrate (Node48)",
-                    ));
-            }
-            NodeType::Node256 => {
-                let n = read_node256(frame.as_ref(), current)?;
-                let mut best: Option<VictimCandidate> = None;
-                for (i, c) in n.children.iter().enumerate() {
-                    if *c == 0 {
-                        continue;
-                    }
-                    let child_slot = *c as u16;
-                    if ntype_of(frame.as_ref(), child_slot)? == NodeType::Blob {
-                        continue;
-                    }
-                    consider_candidate(
-                        frame,
-                        child_slot,
-                        Victim {
-                            parent_slot: current,
-                            kind: VictimEdgeKind::Inner(NodeType::Node256),
-                            byte: i as u8,
-                            victim_slot: child_slot,
-                            via_header_root: false,
-                        },
-                        &mut best,
-                    )?;
-                }
-                return best
-                    .map(|candidate| candidate.victim)
-                    .ok_or(Error::NotYetImplemented(
-                        "spillover: no non-Blob children to migrate (Node256)",
-                    ));
-            }
-            NodeType::Prefix => {
-                let p = read_prefix(frame.as_ref(), current)?;
-                let child_slot = p.child as u16;
-                let child_ntype = ntype_of(frame.as_ref(), child_slot)?;
-                match child_ntype {
-                    NodeType::Node4
-                    | NodeType::Node16
-                    | NodeType::Node48
-                    | NodeType::Node256
-                    | NodeType::Prefix => {
-                        current = child_slot;
-                    }
-                    NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {
-                        return Ok(Victim {
-                            parent_slot: current,
-                            kind: VictimEdgeKind::Prefix,
-                            byte: 0,
-                            victim_slot: child_slot,
-                            via_header_root: false,
-                        });
-                    }
-                    NodeType::Invalid => {
-                        return Err(Error::node_corrupt(
-                            "pick_victim_subtree: Prefix child Invalid",
-                        ));
-                    }
-                }
-            }
-            NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {
-                return Err(Error::NotYetImplemented(
-                    "spillover: tree too degenerate to migrate (root is Leaf/Empty/Blob)",
-                ));
-            }
-            NodeType::Invalid => {
-                return Err(Error::node_corrupt("pick_victim_subtree: Invalid"));
-            }
-        }
-    }
-}
-
-/// Scan a Node4/Node16's `keys[]`+`children[]` parallel arrays for
-/// the best occupancy-aware non-`BlobNode` child.
-fn pick_occupancy_aware_non_blob(
-    frame: &BlobFrame<'_>,
-    parent_slot: u16,
-    parent_ntype: NodeType,
-    count: usize,
-    keys: &[u8],
-    children: &[u32],
-    via_header_root: bool,
-) -> Result<Victim> {
     let mut best: Option<VictimCandidate> = None;
-    for i in 0..count {
-        let child_slot = children[i] as u16;
-        if ntype_of(frame.as_ref(), child_slot)? == NodeType::Blob {
-            continue;
-        }
-        consider_candidate(
-            frame,
-            child_slot,
-            Victim {
-                parent_slot,
-                kind: VictimEdgeKind::Inner(parent_ntype),
-                byte: keys[i],
-                victim_slot: child_slot,
-                via_header_root,
-            },
-            &mut best,
-        )?;
-    }
+    collect_victim_candidates(frame, start_slot, &mut best)?;
     best.map(|candidate| candidate.victim)
         .ok_or(Error::NotYetImplemented(
-            "spillover: no non-Blob children to migrate",
+            "spillover: no non-Blob subtree to migrate",
         ))
 }
 
-fn consider_candidate(
+#[allow(clippy::too_many_lines)] // one match over NodeType arms
+fn collect_victim_candidates(
     frame: &BlobFrame<'_>,
-    child_slot: u16,
+    current: u16,
+    best: &mut Option<VictimCandidate>,
+) -> Result<()> {
+    let ntype = ntype_of(frame.as_ref(), current)?;
+    match ntype {
+        NodeType::Node4 => {
+            let n = read_node4(frame.as_ref(), current)?;
+            for i in 0..(n.count as usize).min(4) {
+                visit_child_edge(
+                    frame,
+                    Victim {
+                        parent_slot: current,
+                        kind: VictimEdgeKind::Inner(NodeType::Node4),
+                        byte: n.keys[i],
+                        victim_slot: n.children[i] as u16,
+                        via_header_root: false,
+                    },
+                    best,
+                )?;
+            }
+        }
+        NodeType::Node16 => {
+            let n = read_node16(frame.as_ref(), current)?;
+            for i in 0..(n.count as usize).min(16) {
+                visit_child_edge(
+                    frame,
+                    Victim {
+                        parent_slot: current,
+                        kind: VictimEdgeKind::Inner(NodeType::Node16),
+                        byte: n.keys[i],
+                        victim_slot: n.children[i] as u16,
+                        via_header_root: false,
+                    },
+                    best,
+                )?;
+            }
+        }
+        NodeType::Node48 => {
+            let n = read_node48(frame.as_ref(), current)?;
+            for b in 0..256usize {
+                let idx = n.index[b];
+                if idx == 0 {
+                    continue;
+                }
+                let ci = idx as usize - 1;
+                if ci >= 48 {
+                    return Err(Error::node_corrupt(
+                        "collect_victim_candidates: Node48 index out of range",
+                    ));
+                }
+                visit_child_edge(
+                    frame,
+                    Victim {
+                        parent_slot: current,
+                        kind: VictimEdgeKind::Inner(NodeType::Node48),
+                        byte: b as u8,
+                        victim_slot: n.children[ci] as u16,
+                        via_header_root: false,
+                    },
+                    best,
+                )?;
+            }
+        }
+        NodeType::Node256 => {
+            let n = read_node256(frame.as_ref(), current)?;
+            for (b, &child) in n.children.iter().enumerate() {
+                if child == 0 {
+                    continue;
+                }
+                visit_child_edge(
+                    frame,
+                    Victim {
+                        parent_slot: current,
+                        kind: VictimEdgeKind::Inner(NodeType::Node256),
+                        byte: b as u8,
+                        victim_slot: child as u16,
+                        via_header_root: false,
+                    },
+                    best,
+                )?;
+            }
+        }
+        NodeType::Prefix => {
+            let p = read_prefix(frame.as_ref(), current)?;
+            visit_child_edge(
+                frame,
+                Victim {
+                    parent_slot: current,
+                    kind: VictimEdgeKind::Prefix,
+                    byte: 0,
+                    victim_slot: p.child as u16,
+                    via_header_root: false,
+                },
+                best,
+            )?;
+        }
+        NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
+        NodeType::Invalid => {
+            return Err(Error::node_corrupt("collect_victim_candidates: Invalid"));
+        }
+    }
+    Ok(())
+}
+
+fn visit_child_edge(
+    frame: &BlobFrame<'_>,
     victim: Victim,
     best: &mut Option<VictimCandidate>,
 ) -> Result<()> {
-    let candidate = VictimCandidate {
-        victim,
-        footprint: subtree_footprint(frame, child_slot)?,
-    };
+    let child_ntype = ntype_of(frame.as_ref(), victim.victim_slot)?;
+    match child_ntype {
+        NodeType::Invalid => {
+            return Err(Error::node_corrupt("visit_child_edge: Invalid child"));
+        }
+        NodeType::Blob => return Ok(()),
+        _ => {}
+    }
+
+    let footprint = subtree_footprint(frame, victim.victim_slot)?;
+    let candidate = VictimCandidate { victim, footprint };
     if best
         .as_ref()
         .is_none_or(|current| candidate_is_better(candidate, *current))
     {
         *best = Some(candidate);
+    }
+    if footprint.bytes > spillover_target_child_bytes() {
+        collect_victim_candidates(frame, victim.victim_slot, best)?;
     }
     Ok(())
 }
@@ -596,7 +556,10 @@ fn fill_os_entropy(buf: &mut [u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::insert::insert;
     use super::*;
+    use crate::layout::PAGE_SIZE;
+    use crate::store::BlobFrame;
 
     fn candidate(bytes: u32, nodes: u32) -> VictimCandidate {
         VictimCandidate {
@@ -646,5 +609,44 @@ mod tests {
             candidate(target - 4096, 20),
             candidate(target - 4096, 10),
         ));
+    }
+
+    fn put(frame: &mut BlobFrame<'_>, key: &[u8], value: &[u8], seq: u64) {
+        let root = frame.header().root_slot;
+        insert(frame, root, key, value, seq).unwrap();
+    }
+
+    #[test]
+    fn victim_search_descends_into_overfull_path_branch() {
+        let mut buf = vec![0u8; PAGE_SIZE as usize];
+        BlobFrame::init(&mut buf, [0x31; 16]).unwrap();
+        let mut frame = BlobFrame::wrap(&mut buf);
+        let value = vec![0x5A; 1024];
+
+        let mut seq = 1u64;
+        for i in 0..240u32 {
+            let key = format!("a/x/file-{i:06}").into_bytes();
+            put(&mut frame, &key, &value, seq);
+            seq += 1;
+        }
+        for i in 0..120u32 {
+            let key = format!("a/y/file-{i:06}").into_bytes();
+            put(&mut frame, &key, &value, seq);
+            seq += 1;
+        }
+        put(&mut frame, b"b/tiny", b"v", seq);
+
+        let victim = pick_victim_subtree(&frame, frame.header().root_slot).unwrap();
+        let footprint = subtree_footprint(&frame, victim.victim_slot).unwrap();
+
+        assert!(
+            footprint.bytes >= spillover_min_child_bytes(),
+            "victim too small: {footprint:?}",
+        );
+        assert!(
+            footprint.bytes <= spillover_target_child_bytes(),
+            "victim should be a nested in-band branch, not the overfull direct branch: {footprint:?}",
+        );
+        assert_eq!(victim.byte, b'x');
     }
 }

@@ -24,8 +24,10 @@ use super::MAX_SPILLOVER_ATTEMPTS;
 // ---------- public entry points ----------
 
 /// Single-blob insert. Surfaces [`Error::NotYetImplemented`] if
-/// the descent reaches a [`NodeType::Blob`] crossing — callers
-/// that need cross-blob support should use [`insert_multi`].
+/// the descent has to follow a matching [`NodeType::Blob`]
+/// crossing — callers that need cross-blob support should use
+/// [`insert_multi`]. Divergent BlobNode inline prefixes can still
+/// be split locally in the current blob.
 ///
 /// `seq` is the journal sequence number to stamp on the new leaf
 /// (callers should pass a monotonically-increasing value). Updates
@@ -327,42 +329,79 @@ fn insert_at_step(
             )
         }
         NodeType::Blob => {
-            if allow_crossing {
-                blob_node_insert_crossing(frame, slot, key, depth).map(InsertStep::Crossing)
-            } else {
-                Err(Error::NotYetImplemented(
-                "walker::insert_at: BlobNode crossing requires BufferManager — use insert_multi",
-                ))
-            }
+            blob_node_insert_step(frame, slot, key, value, depth, seq, allow_crossing)
         }
     }
 }
 
-fn blob_node_insert_crossing(
-    frame: &BlobFrame<'_>,
+fn blob_node_insert_step(
+    frame: &mut BlobFrame<'_>,
     slot: u16,
     key: SearchKey<'_>,
+    value: &[u8],
     depth: usize,
-) -> Result<InsertBlobCrossing> {
+    seq: u64,
+    allow_crossing: bool,
+) -> Result<InsertStep> {
     let body = frame.body_of_slot(slot).ok_or(Error::node_corrupt(
-        "blob_node_insert_crossing: BlobNode body resolution failed",
+        "blob_node_insert_step: BlobNode body resolution failed",
     ))?;
     let bn = *cast::<BlobNode>(body);
     let plen = bn.prefix_len as usize;
     if plen > BLOB_MAX_INLINE {
         return Err(Error::node_corrupt(
-            "blob_node_insert_crossing: BlobNode prefix_len exceeds inline buffer",
+            "blob_node_insert_step: BlobNode prefix_len exceeds inline buffer",
         ));
     }
-    if !key.range_eq(depth, &bn.bytes[..plen]) {
+    let prefix = &bn.bytes[..plen];
+    let common = key.common_prefix_with_slice(depth, prefix);
+
+    if common == plen {
+        if !allow_crossing {
+            return Err(Error::NotYetImplemented(
+                "walker::insert_at: BlobNode crossing requires BufferManager — use insert_multi",
+            ));
+        }
+        return Ok(InsertStep::Crossing(InsertBlobCrossing {
+            child_guid: bn.child_blob_guid,
+            child_depth: depth + plen,
+        }));
+    }
+
+    let Some(new_div_byte) = key.byte_at(depth + common) else {
         return Err(Error::NotYetImplemented(
-            "blob_node_insert_crossing: BlobNode inline-prefix split is not yet implemented",
+            "blob_node_insert_step: key terminates inside BlobNode prefix",
         ));
-    }
-    Ok(InsertBlobCrossing {
-        child_guid: bn.child_blob_guid,
-        child_depth: depth + plen,
-    })
+    };
+    let existing_div_byte = prefix[common];
+    debug_assert_ne!(existing_div_byte, new_div_byte);
+
+    // Keep the old BlobNode slot so parent pointers do not move.
+    // The branch byte is consumed by the new Node4, so the BlobNode
+    // only keeps the remaining inline tail before crossing to the
+    // unchanged child blob.
+    let existing_tail = &prefix[common + 1..];
+    let new_leaf = write_leaf(frame, key, value, seq)?;
+    let n4 = write_node4_with(
+        frame,
+        &[
+            (existing_div_byte, u32::from(slot)),
+            (new_div_byte, u32::from(new_leaf)),
+        ],
+    )?;
+    let final_slot = if common == 0 {
+        n4
+    } else {
+        write_prefix_chain(frame, &prefix[..common], n4)?
+    };
+
+    let adjusted = BlobNode::new(existing_tail, bn.child_blob_guid);
+    write_struct_to_slot(frame, slot, &adjusted)?;
+
+    Ok(InsertStep::Done(InsertReturn {
+        slot_after: final_slot,
+        previous: None,
+    }))
 }
 
 fn insert_into_empty_root(
