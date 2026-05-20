@@ -412,8 +412,7 @@ pub(super) fn fresh_blob_guid() -> BlobGuid {
 
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_nanos() as u64);
     let c = COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
 
     let mut tail = [0u8; 3];
@@ -451,7 +450,7 @@ fn fill_os_entropy(buf: &mut [u8]) -> bool {
     #[cfg(target_os = "linux")]
     unsafe {
         let r = libc::getrandom(buf.as_mut_ptr().cast(), buf.len(), 0);
-        return r >= 0 && (r as usize) == buf.len();
+        r >= 0 && (r as usize) == buf.len()
     }
     #[cfg(any(
         target_os = "macos",
