@@ -37,8 +37,8 @@ fn put_latency_under_bg_checkpoint_and_compact_interference() {
         TreeBuilder::new(dir.path())
             // Aggressive background checkpoint cadence — the
             // round runs constantly under the writer load, so
-            // any tail-latency spike from the wal.lock interlock
-            // shows up here.
+            // any tail-latency spike from commit publication or
+            // checkpoint I/O shows up here.
             .checkpoint(CheckpointConfig {
                 enabled: true,
                 idle_interval: Duration::from_millis(5),
@@ -86,9 +86,9 @@ fn put_latency_under_bg_checkpoint_and_compact_interference() {
     }
 
     // Compaction thread — runs `tree.compact()` periodically.
-    // It races on `wal.lock` against the writers + the bg
-    // checkpointer, so this is the worst-case maintenance
-    // interference shape.
+    // It races with writers + the bg checkpointer through the
+    // maintenance gate and commit publication path, so this is the
+    // worst-case maintenance interference shape.
     {
         let tree = Arc::clone(&tree);
         let stop = Arc::clone(&stop);

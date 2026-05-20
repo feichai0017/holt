@@ -4,12 +4,11 @@
 //!
 //! 1. [`WalWriter::create`] for a fresh file or
 //!    [`WalWriter::open_existing`] to resume an existing one.
-//! 2. `append_*` encoders write records into an in-memory buffer.
+//! 2. Encoded records are appended into an in-memory buffer.
 //!    When the buffer crosses [`AUTO_FLUSH_THRESHOLD`] (64 KB),
 //!    the writer transparently drains it to the OS via `write_all`
-//!    (no `sync_data`). This is buffered auto-drain, not a
-//!    durability group commit: the per-record user-space cost is
-//!    an in-memory copy, and durability is still explicit.
+//!    (no `sync_data`). The higher-level group-commit worker
+//!    controls which append waiters share a durability flush.
 //! 3. [`WalWriter::flush`] drains whatever is still pending and
 //!    runs `sync_data` so every record so far is durable past a
 //!    power failure. This is the **durability boundary**.
@@ -18,8 +17,9 @@
 //!    what's been auto-drained to page cache survives a process
 //!    crash but not a power loss until you `flush`").
 //!
-//! `Tree::checkpoint` calls [`WalWriter::truncate`] to trim
-//! records past the last durable blob commit.
+//! The group-commit worker calls [`WalWriter::truncate`] when
+//! `Tree::checkpoint` proves every WAL record is reflected in the
+//! durable blob image.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -29,10 +29,7 @@ use crate::api::errors::{Error, Result};
 
 #[cfg(test)]
 use super::codec::encode_record;
-use super::codec::{
-    decode_file_header, encode_erase_record, encode_file_header, encode_insert_record,
-    encode_rename_object_record, BatchEncoder, FileHeader, FILE_HEADER_SIZE,
-};
+use super::codec::{decode_file_header, encode_file_header, FileHeader, FILE_HEADER_SIZE};
 #[cfg(test)]
 use super::txn_op::TxnOp;
 
@@ -150,89 +147,25 @@ impl WalWriter {
     /// `sync_data`) — bounded user-space buffering, but per-op
     /// cost stays at an in-memory copy.
     ///
-    /// All four user-facing hot paths
-    /// (`Tree::put` / `delete` / `rename` / `txn`) use the
-    /// per-variant fast paths instead ([`Self::append_insert`] /
-    /// [`Self::append_erase`] / [`Self::append_rename_object`] /
-    /// [`Self::append_batch`]). Those skip the `TxnOp` enum's
-    /// `Vec` clones — measurable against the bench's hot path.
     /// Generic test-time entry point for exercising structural
     /// variants (Split / Merge / Compact / MemMarker / NewTree /
     /// RmTree) end-to-end through the writer + replay path.
+    /// Production hot paths encode records before handing them to
+    /// the group-commit journal worker.
     #[cfg(test)]
     pub fn append(&mut self, op: &TxnOp, seq: u64) -> Result<()> {
         encode_record(op, seq, &mut self.pending);
         self.maybe_drain()
     }
 
-    /// Fast-path: append an `Insert` record directly from refs.
-    /// Skips the `TxnOp::Insert` enum + the two `Vec::to_vec`
-    /// clones (key + value).
-    pub fn append_insert(
-        &mut self,
-        seq: u64,
-        tree_id: u64,
-        key: &[u8],
-        value: &[u8],
-    ) -> Result<()> {
-        encode_insert_record(&mut self.pending, seq, tree_id, key, value);
-        self.maybe_drain()
-    }
-
-    /// Fast-path: append an `Erase` record directly from refs.
-    /// Carries key only; the prior value (if the caller wanted it)
-    /// is delivered through `Tree::remove`'s return path, not
-    /// through the WAL.
-    pub fn append_erase(&mut self, seq: u64, tree_id: u64, key: &[u8]) -> Result<()> {
-        encode_erase_record(&mut self.pending, seq, tree_id, key);
-        self.maybe_drain()
-    }
-
-    /// Fast-path: append a `RenameObject` record directly from
-    /// refs.
-    pub fn append_rename_object(
-        &mut self,
-        seq: u64,
-        tree_id: u64,
-        src_key: &[u8],
-        dst_key: &[u8],
-        force: bool,
-    ) -> Result<()> {
-        encode_rename_object_record(&mut self.pending, seq, tree_id, src_key, dst_key, force);
-        self.maybe_drain()
-    }
-
-    /// Fast-path: stream a `Batch` envelope record directly from
-    /// refs. Hands the caller a [`BatchEncoder`] to push primitive
-    /// inner ops (`Insert` / `Erase` / `RenameObject`) without
-    /// constructing intermediate `TxnOp::Insert { key: Vec, value:
-    /// Vec, .. }` values — the per-op `Vec` clones that
-    /// `encode_record` would force are skipped.
+    /// Append one already-encoded WAL record.
     ///
-    /// The closure is `FnOnce(&mut BatchEncoder<'_>) -> Result<()>`:
-    /// returning `Err` cleanly aborts the batch (the encoder's
-    /// `Drop` rolls back the partial record bytes so the WAL
-    /// buffer ends up exactly where `begin` found it). On `Ok`
-    /// the encoder is `finish`ed (backpatch + CRC) and the
-    /// auto-drain threshold is re-checked.
-    ///
-    /// Returns the final inner op count (= the number of
-    /// `push_*` calls that ran inside the closure). The caller
-    /// can use this to skip emitting the record at all when the
-    /// effective inner count is 0 (e.g. a batch of pure no-op
-    /// deletes) — though calling `append_batch` with zero ops
-    /// still writes a well-formed empty-Batch record, matching
-    /// the generic `encode_record(&TxnOp::Batch { ops: vec![] })`
-    /// shape.
-    pub fn append_batch<F>(&mut self, base_seq: u64, tree_id: u64, build: F) -> Result<u32>
-    where
-        F: FnOnce(&mut BatchEncoder<'_>) -> Result<()>,
-    {
-        let mut enc = BatchEncoder::begin(&mut self.pending, base_seq, tree_id);
-        build(&mut enc)?;
-        let n = enc.finish();
-        self.maybe_drain()?;
-        Ok(n)
+    /// Used by the group-commit worker: foreground threads encode
+    /// into owned buffers, then the worker serially appends those
+    /// bytes to this writer and optionally flushes the whole batch.
+    pub(crate) fn append_encoded(&mut self, record: &[u8]) -> Result<()> {
+        self.pending.extend_from_slice(record);
+        self.maybe_drain()
     }
 
     fn maybe_drain(&mut self) -> Result<()> {

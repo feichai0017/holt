@@ -11,8 +11,8 @@ fine-grained per-commit history is in `git log`.
 
 The v0.3 milestone is still unreleased. Everything in this
 section is queued for the first v0.3 tag: the API split, walker
-hot-path optimizations, WAL format cleanup, zero-copy reads,
-batch-WAL encoding, and recursive cross-blob latch coupling.
+hot-path optimizations, WAL format cleanup, batch-WAL encoding,
+recursive cross-blob latch coupling, and journal group commit.
 
 The three breaking-but-surgical wins below land first; the
 extreme metadata-engine performance track builds on them.
@@ -47,39 +47,21 @@ Concretely:
   receives it through the return path (walker `leaf_extent` read,
   same as the earlier v0.3 API split).
 
-### Breaking — `Tree::get_with` zero-copy primitive
+### Breaking — public lookup surface stays owned
 
-New zero-copy primitive: `tree.get_with(key, |&[u8]| -> R)`
-hands the live cache-pin slice to a closure and returns the
-closure's result. Replaces the always-copying internal lookup
-path under the hood:
+The draft `Tree::get_with` closure API is removed before v0.3
+ships. The engine still uses an internal zero-copy lookup walker
+for existence probes and rename preflight, but the public API stays
+small:
 
 ```rust
-// Owned `Vec<u8>` convenience — unchanged caller-side from the v0.3 API split.
 pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
-
-// Zero-copy primitive — pass a closure that consumes the slice.
-pub fn get_with<R, F>(&self, key: &[u8], consume: F) -> Result<Option<R>>
-where
-    F: FnMut(&[u8]) -> R;
 ```
 
-`Tree::get` is a one-line wrapper over `get_with` (calls it
-with `<[u8]>::to_vec`); no caller-side change for any code that
-was using `tree.get(k)`. Hot read paths that don't need owned
-bytes — existence checks, in-place decode, filter pipelines,
-cache proxies — can opt in for the per-op allocation savings.
-
-The "breaking" label covers the engine-level rename: the
-internal `lookup_multi` is gone, replaced by `lookup_multi_with`
-that takes the consume closure. External callers don't touch
-that surface (it's `pub(crate)`).
-
-Closure contract: `consume` runs after the optimistic
-`validate()` succeeds — same race window as the owned
-`v.to_vec()` path. Keep the closure short to avoid widening the
-window past the existing baseline; for arbitrary work, copy out
-first via `<[u8]>::to_vec`.
+Reason: a closure borrowing live cache bytes is a lifetime and
+contention contract, not just a convenience method. For the
+metadata-engine surface we want to stabilize now, owned `Vec<u8>`
+lookups plus range iteration are the right external boundary.
 
 ### Performance — `txn()` batch bypasses `TxnOp` enum
 
@@ -116,9 +98,9 @@ same change applied inside the batch-path rename arm of
 - Dropped `write_optional_bytes` / `read_optional_bytes` helpers
   (no callers after Insert/Erase shed their optional slots).
 - `WalWriter::append` (the generic `&TxnOp` entry) is now
-  test-only; the four user-facing hot paths use the per-variant
-  fast paths (`append_insert` / `append_erase` /
-  `append_rename_object` / `append_batch`).
+  test-only. Foreground mutation paths encode owned WAL records
+  with the per-variant codec helpers and hand those bytes to the
+  journal worker.
 - `apply_put_inner` / `apply_delete_inner` / `apply_rename_inner`
   Tree helpers folded into the new `apply_batch_walker_inline`.
 
@@ -178,7 +160,7 @@ The remaining v0.3 concurrency cleanup is now in place:
   `Tree::compact()` and the background checkpointer's merge pass
   enter the exclusive side before folding child blobs back into
   parents and queuing those children for deferred delete.
-- Point reads (`get` / `get_with`) also take the shared
+- Point reads (`get`) also take the shared
   maintenance gate so a merge cannot delete a child after a reader
   observes the parent `BlobNode`. Blob-local reads still use
   per-blob optimistic validation; ordinary readers and writers
@@ -203,6 +185,25 @@ The remaining v0.3 concurrency cleanup is now in place:
   closing the pressure-window where a background sweep could drop
   the only cached image after `snapshot_dirty()` drained the dirty
   map but before the checkpoint planner copied the bytes.
+
+### Performance / Correctness — journal group commit
+
+- Persistent trees now own a dedicated `Journal` worker instead of
+  sharing `Arc<Mutex<WalWriter>>` directly.
+- Foreground writers encode a complete WAL record into owned bytes,
+  enter `commit_lock` only for walker mutation + dirty publish +
+  journal submission, then wait for the journal acknowledgement
+  outside that lock.
+- `wal_sync_on_commit=true` writers are batched by a short group
+  window; the journal worker appends every queued record and calls
+  `sync_data` once for all durable waiters in the batch.
+- Manual and background checkpoint rounds use the same
+  `commit_lock` while draining dirty/pending sets, flushing the
+  journal, and cloning snapshotted bytes. This prevents checkpoint
+  I/O from copying bytes from a writer whose WAL record was not in
+  the durable snapshot.
+- `Tree::stats()` / Prometheus metrics expose journal appends,
+  append batches, and sync counts.
 - Short-key padding now uses the 256-byte inline path without
   clearing the full stack buffer on every operation, and tree
   sequence allocation uses relaxed atomics because ordering is
@@ -395,10 +396,11 @@ ahead, and fs is **1.01×** ahead / effectively tied. Full table in
   delete sync still runs to fsync the writes that did succeed;
   the pending set is restored and the next round retries the
   parent + child together.
-- **Writer ↔ background-checkpoint W2D race.** Pending-delete
-  snapshot now drains inside the same `wal.lock` critical section
-  as `snapshot_dirty` + `wal.flush`, closing the inversion window
-  where a writer could land a fresh blob between the two drains.
+- **Writer ↔ background-checkpoint W2D race.** Dirty and
+  pending-delete snapshots now drain inside the same
+  commit-publish critical section as journal flush and byte
+  snapshotting, closing both the pending-delete inversion window
+  and the "snapshot cloned a newer unflushed mutation" window.
 - **Parent-side BlobNode pointer repair removed.** Compact keeps
   each child blob self-describing through `header.root_slot`; the
   parent no longer stores a child entry slot and therefore no
@@ -528,9 +530,11 @@ ubuntu + macOS CI.
 - Wait-free `Tree::get` walker — optimistic snapshots with
   validate-after, restart from root on torn read. No Tree-wide
   reader lock.
-- `put` / `delete` serialise on `wal.lock` (not a global writer
-  mutex); `rename` keeps a separate `rename_lock` for its
-  multi-step atomicity.
+- Persistent `put` / `delete` / `rename` / `txn` publish dirty
+  state and journal records through `commit_lock`; durable fsync
+  waits happen outside that lock through the group-commit worker.
+  `rename` keeps a separate `rename_lock` for its multi-step
+  atomicity.
 
 ### Persistence
 
@@ -542,7 +546,8 @@ ubuntu + macOS CI.
 - 10-variant `TxnOp` codec (`MAGIC | LEN | SEQ | TY | BODY |
   CRC32`); torn-tail-tolerant forward replay scanner.
 - `WalWriter` with `sync_data`-on-flush durability + 64 KB
-  buffered auto-drain.
+  buffered auto-drain, driven by a dedicated journal
+  group-commit worker in persistent trees.
 - `Tree::checkpoint` flushes WAL + commits BM + truncates WAL
   conditionally; replay reapplies records onto the BM-cached
   blob and resumes `next_seq` past every replayed record.

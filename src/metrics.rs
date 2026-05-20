@@ -48,6 +48,9 @@
 //! | `holt_bm_max_cross_blob_depth`          | gauge   | `TreeStats::bm_max_cross_blob_depth`   |
 //! | `holt_bm_spillovers_total`              | counter | `TreeStats::bm_spillovers`             |
 //! | `holt_bm_merges_total`                  | counter | `TreeStats::bm_merges`                 |
+//! | `holt_journal_appends_total`             | counter | `JournalStats::appends`                |
+//! | `holt_journal_batches_total`             | counter | `JournalStats::batches`                |
+//! | `holt_journal_syncs_total`               | counter | `JournalStats::syncs`                  |
 //! | `holt_checkpoint_rounds_attempted_total`| counter | `CheckpointerStats::rounds_attempted`  |
 //! | `holt_checkpoint_rounds_succeeded_total`| counter | `CheckpointerStats::rounds_succeeded`  |
 //! | `holt_checkpoint_blobs_flushed_total`   | counter | `CheckpointerStats::blobs_flushed`     |
@@ -55,9 +58,10 @@
 //! | `holt_checkpoint_truncates_total`       | counter | `CheckpointerStats::truncates`         |
 //! | `holt_checkpoint_evictions_total`       | counter | `CheckpointerStats::evictions`         |
 //!
-//! `CheckpointerStats` lines are emitted only when the
-//! background checkpointer is enabled (`TreeStats::checkpointer`
-//! is `Some`).
+//! `JournalStats` and `CheckpointerStats` lines are emitted only
+//! when the corresponding worker exists. The journal worker exists
+//! for persistent trees opened through `Tree::open`; the background
+//! checkpointer exists when `TreeStats::checkpointer` is `Some`.
 
 use std::fmt::Write;
 
@@ -205,6 +209,30 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         stats.bm_merges,
     );
 
+    if let Some(journal) = &stats.journal {
+        metric(
+            &mut out,
+            "holt_journal_appends_total",
+            "WAL append requests submitted to the journal worker.",
+            "counter",
+            journal.appends,
+        );
+        metric(
+            &mut out,
+            "holt_journal_batches_total",
+            "Append batches processed by the journal worker.",
+            "counter",
+            journal.batches,
+        );
+        metric(
+            &mut out,
+            "holt_journal_syncs_total",
+            "WAL sync_data calls issued by the journal worker.",
+            "counter",
+            journal.syncs,
+        );
+    }
+
     if let Some(ck) = &stats.checkpointer {
         metric(
             &mut out,
@@ -270,9 +298,9 @@ fn metric_f64(out: &mut String, name: &str, help: &str, ty: &str, value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::stats::{CheckpointerStats, TreeStats};
+    use crate::api::stats::{CheckpointerStats, JournalStats, TreeStats};
 
-    fn stats_fixture(with_checkpointer: bool) -> TreeStats {
+    fn stats_fixture(with_journal: bool, with_checkpointer: bool) -> TreeStats {
         TreeStats {
             blob_count: 3,
             total_space_used: 1024,
@@ -292,6 +320,11 @@ mod tests {
             bm_max_cross_blob_depth: 17,
             bm_spillovers: 2,
             bm_merges: 1,
+            journal: with_journal.then_some(JournalStats {
+                appends: 20,
+                batches: 5,
+                syncs: 4,
+            }),
             checkpointer: with_checkpointer.then_some(CheckpointerStats {
                 rounds_attempted: 11,
                 rounds_succeeded: 10,
@@ -305,7 +338,7 @@ mod tests {
 
     #[test]
     fn renders_core_metrics_for_stats_without_checkpointer() {
-        let out = render_prometheus(&stats_fixture(false));
+        let out = render_prometheus(&stats_fixture(false, false));
         assert!(out.contains("# HELP holt_blob_count "));
         assert!(out.contains("# TYPE holt_blob_count gauge\n"));
         assert!(out.contains("holt_blob_count 3\n"));
@@ -328,11 +361,20 @@ mod tests {
         assert!(!out.contains("holt_tombstones_total"));
         // No checkpointer block.
         assert!(!out.contains("holt_checkpoint_"));
+        assert!(!out.contains("holt_journal_"));
+    }
+
+    #[test]
+    fn renders_journal_block_when_present() {
+        let out = render_prometheus(&stats_fixture(true, false));
+        assert!(out.contains("holt_journal_appends_total 20\n"));
+        assert!(out.contains("holt_journal_batches_total 5\n"));
+        assert!(out.contains("holt_journal_syncs_total 4\n"));
     }
 
     #[test]
     fn renders_checkpoint_block_when_present() {
-        let out = render_prometheus(&stats_fixture(true));
+        let out = render_prometheus(&stats_fixture(false, true));
         assert!(out.contains("holt_checkpoint_rounds_attempted_total 11\n"));
         assert!(out.contains("holt_checkpoint_blobs_flushed_total 30\n"));
         assert!(out.contains("holt_checkpoint_evictions_total 17\n"));
@@ -340,7 +382,7 @@ mod tests {
 
     #[test]
     fn output_ends_with_newline() {
-        let out = render_prometheus(&stats_fixture(false));
+        let out = render_prometheus(&stats_fixture(false, false));
         assert!(out.ends_with('\n'), "Prometheus expects a trailing newline");
     }
 }

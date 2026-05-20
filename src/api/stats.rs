@@ -103,6 +103,9 @@ pub struct TreeStats {
     /// `BlobNode` children folded back into parents by manual
     /// compact or background merge passes.
     pub bm_merges: u64,
+    /// WAL/journal worker counters, or `None` for memory trees and
+    /// caller-supplied backends opened without holt's WAL.
+    pub journal: Option<JournalStats>,
     /// Background checkpointer telemetry, or `None` if the bg
     /// thread group isn't running (the default; opt in via
     /// [`crate::CheckpointConfig::enabled`]).
@@ -120,6 +123,21 @@ impl TreeStats {
             self.bm_walker_blob_hops as f64 / self.bm_walker_ops as f64
         }
     }
+}
+
+/// Snapshot of the WAL group-commit worker's counters.
+#[derive(Debug, Clone, Copy)]
+pub struct JournalStats {
+    /// Number of WAL append requests submitted by foreground
+    /// mutation paths.
+    pub appends: u64,
+    /// Number of append batches processed by the journal worker.
+    /// Under concurrent durable writers this should be lower than
+    /// [`Self::appends`].
+    pub batches: u64,
+    /// Number of `sync_data` calls issued by the journal worker,
+    /// including explicit checkpoint flush barriers.
+    pub syncs: u64,
 }
 
 /// Snapshot of the background checkpointer's accumulated

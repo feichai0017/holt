@@ -98,10 +98,10 @@ the OS page cache (not fsync) — the "you survive a process
 crash, not a power failure" mode high-throughput services target:
 
 - **holt**: `TreeConfig::new(tempdir)` (PersistentBackend with
-  `F_NOCACHE` on macOS / `O_DIRECT` on Linux). Every `put` /
-  `delete` / `rename` emits a `TxnOp` to the WAL writer;
+  `F_NOCACHE` on macOS / `O_DIRECT` on Linux). Every mutation
+  submits an encoded record to the journal worker;
   `wal_sync_on_commit` stays at its default `false`. Blobs only
-  hit disk at spillover or `Tree::checkpoint`.
+  hit disk at checkpoint.
 - **RocksDB**: temp-dir DB, `disable_wal = false`, `sync = false`.
   Each `put` appends to the WAL (buffered) plus the memtable.
 - **SQLite**: file-backed DB, `journal_mode=WAL`,

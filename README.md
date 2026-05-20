@@ -198,20 +198,20 @@ for entry in tree.range().prefix(b"img/").delimiter(b'/') {
 
 ### Durability
 
-Per-op writes land in the WAL writer's buffer + the BufferManager
-cache. Disk-truth advances at:
+Per-op writes land in the journal worker + BufferManager cache.
+Disk-truth advances at:
 
-- **`Tree::checkpoint()`** — flush WAL (`sync_data`), write the
-  BM root blob through to the backend, `fdatasync` the backend,
+- **`Tree::checkpoint()`** — flush the journal (`sync_data`),
+  write dirty blobs through to the backend, `fdatasync` the backend,
   truncate the WAL. Call this at your own application checkpoint
   cadence.
 - **WAL auto-flush** — once the WAL writer's pending buffer
   crosses 64 KB it drains to the OS page cache (no `sync_data`).
   Bounds in-memory buffering even if `checkpoint` is rare.
 - **`wal_sync_on_commit = true`** — opt in to a per-op
-  `sync_data` on the WAL. Trades ~µs per write for "durable to
-  disk past power loss." Default `false` matches RocksDB's
-  `sync=false`.
+  durable journal acknowledgement. Concurrent writers can share one
+  `sync_data` through group commit. Default `false` matches
+  RocksDB's `sync=false`.
 
 ```rust
 tree.checkpoint()?;   // flush WAL + write through + truncate

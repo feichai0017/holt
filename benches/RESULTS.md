@@ -311,11 +311,10 @@ for adjacent surfaces than for this exact table:
   wrote `Some(prev)` for; the current v0.3 line doesn't write the
   prev value to the WAL at all (the walker hands it straight to
   the caller).
-- **`Tree::get_with` zero-copy primitive.** `Tree::get` (the
-  Vec-returning convenience this bench uses) is unchanged. Hot
-  read paths that opt in to the callback skip the per-call
-  `Vec<u8>` allocation + memcpy — sized at ~100-200 ns on the
-  M3 Pro at 2 M, ~10-20 % of the total get latency.
+- **Public lookup surface stays owned.** The draft
+  `Tree::get_with` callback API was removed before v0.3 ships;
+  this bench continues to measure the stable `Tree::get` path
+  that returns owned `Vec<u8>` values.
 - **`Tree::txn` batch encoder bypass.** Single-op writes are
   unaffected; multi-op batches skip per-op intermediate `Vec`
   clones that the v0.3.0 `wal_ops: Vec<TxnOp>` aggregator forced.
@@ -373,15 +372,16 @@ cargo test --release --test bench_contention_p95 \
 
 - **267 k ops/s sustained** with 4 writer threads + a
   background checkpointer + concurrent `compact()`. Each
-  writer averages ~67 k ops/s on its own, so the wal-lock
-  serialization tax is modest.
-- **p50 ≈ 1.7 µs** — most puts hit only the common "walker
-  mutate + mark_dirty + wal.append + flush" critical section
-  with no maintenance interference.
-- **p95 ≈ 23 µs / p99 ≈ 108 µs** — tail dominated by the wal.lock
-  serialization point during checkpoint snapshots (rounds run
-  every ~5 ms and briefly take the lock to drain dirty +
-  pending_deletes + flush WAL).
+  writer averages ~67 k ops/s on its own. This run predates the
+  journal-worker group-commit cut; rerun it before quoting current
+  tail-latency numbers.
+- **p50 ≈ 1.7 µs** — most puts hit only the common walker mutate
+  + dirty publish + WAL append path with no maintenance
+  interference.
+- **p95 ≈ 23 µs / p99 ≈ 108 µs** — in this pre-group-commit run,
+  tail was dominated by the WAL/checkpoint publish point during
+  checkpoint snapshots. Current code uses a journal worker plus
+  `commit_lock`; rerun the bench for updated numbers.
 - **p99.9 ≈ 0.69 ms** with one max outlier near 48 ms — online
   compact no longer dominates the steady tail, but rare scheduler
   / checkpoint interference still shows up at the extreme max.

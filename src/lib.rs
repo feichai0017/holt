@@ -162,7 +162,7 @@ pub use api::tree::Tree;
 pub use api::range::{RangeBuilder, RangeEntry, RangeIter};
 
 // Stats snapshots returned by `Tree::stats`.
-pub use api::stats::{BlobStats, CheckpointerStats, TreeStats};
+pub use api::stats::{BlobStats, CheckpointerStats, JournalStats, TreeStats};
 
 // Single-record batched transactions.
 pub use api::txn::TxnBatch;

@@ -10,7 +10,10 @@
 //!   in-memory bytes ↔ `TxnOp`.
 //! - [`writer`] — append-only WAL file with
 //!   `sync_data`-on-flush durability + 64 KB buffered auto-drain
-//!   (not durable group commit).
+//!   mechanics.
+//! - [`group_commit`] — dedicated append worker; foreground
+//!   writers enqueue encoded records and durable waiters share
+//!   one `sync_data` per short batch window.
 //! - [`reader`] — forward replay scanner with graceful
 //!   torn-tail handling. Unpacks `Batch` records into per-inner
 //!   callbacks so consumers don't need a `Batch` arm.
@@ -21,6 +24,7 @@
 //! tree + journal boundary.
 
 pub mod codec;
+pub(crate) mod group_commit;
 pub mod reader;
 pub mod txn_op;
 pub mod writer;

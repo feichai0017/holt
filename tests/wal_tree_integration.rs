@@ -5,13 +5,15 @@
 //!   `wal_sync_on_commit = true` (verifies WAL replay reconstructs
 //!   the logical state on a crash-without-checkpoint).
 //! - "Default mode without checkpoint loses unflushed" — under
-//!   the default config (no per-op fsync) a drop without
+//!   the default config (no durable per-op journal wait) a drop without
 //!   `checkpoint()` leaves the disk WAL empty and reopen sees
 //!   the pre-mutation state.
 //! - `checkpoint()` flushes everything and truncates the WAL.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
+use std::thread;
 
 use tempfile::tempdir;
 
@@ -28,6 +30,51 @@ fn durable_cfg(dir: &std::path::Path) -> TreeConfig {
     let mut cfg = TreeConfig::new(dir);
     cfg.wal_sync_on_commit = true;
     cfg
+}
+
+#[test]
+fn durable_writers_share_group_commit_syncs() {
+    let dir = tempdir().unwrap();
+    let tree = Arc::new(Tree::open(durable_cfg(dir.path())).unwrap());
+    const WRITERS: usize = 12;
+    let barrier = Arc::new(Barrier::new(WRITERS));
+
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|i| {
+            let tree = Arc::clone(&tree);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let key = format!("gc/key-{i:02}");
+                let value = format!("value-{i:02}");
+                barrier.wait();
+                tree.put(key.as_bytes(), value.as_bytes()).unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let stats = tree.stats().unwrap();
+    let journal = stats.journal.expect("persistent tree has journal stats");
+    assert_eq!(journal.appends, WRITERS as u64);
+    assert!(
+        journal.syncs < journal.appends,
+        "durable writers should share fsyncs through group commit; appends={}, syncs={}",
+        journal.appends,
+        journal.syncs,
+    );
+
+    drop(tree);
+    let reopened = Tree::open(durable_cfg(dir.path())).unwrap();
+    for i in 0..WRITERS {
+        let key = format!("gc/key-{i:02}");
+        let value = format!("value-{i:02}");
+        assert_eq!(
+            reopened.get(key.as_bytes()).unwrap().as_deref(),
+            Some(value.as_bytes()),
+        );
+    }
 }
 
 #[test]
@@ -136,8 +183,8 @@ fn replay_then_checkpoint_then_reopen_preserves_data() {
 #[test]
 fn checkpoint_truncates_wal_and_keys_survive_reopen() {
     let dir = tempdir().unwrap();
-    // Need per-op fsync so the WAL has bytes on disk before
-    // the pre-checkpoint size assertion can trip.
+    // Need durable per-op journal waits so the WAL has bytes on
+    // disk before the pre-checkpoint size assertion can trip.
     let cfg = durable_cfg(dir.path());
 
     {
@@ -223,10 +270,10 @@ fn rename_through_wal_replays_correctly() {
 #[test]
 fn default_mode_loses_writes_without_checkpoint_or_fsync() {
     // Under the default config (`wal_sync_on_commit = false`),
-    // the WAL writer keeps records in its in-memory `Vec` /
-    // auto-flushes them only when the buffer crosses 64 KB.
-    // A short workload + drop-without-checkpoint = nothing
-    // durable — exactly the high-throughput trade-off.
+    // the journal worker can still hold records in process memory
+    // and only drains/syncs them at checkpoint. A short workload +
+    // drop-without-checkpoint = nothing durable — exactly the
+    // high-throughput trade-off.
     let dir = tempdir().unwrap();
     let cfg = TreeConfig::new(dir.path());
 
@@ -1035,9 +1082,9 @@ fn cross_blob_writes_replay_correctly_through_wal_without_checkpoint() {
 
 // ============================================================
 // Concurrent writer durability — regression for the W2D-strict
-// protocol that puts walker.mutate + mark_dirty + wal.append
-// inside one wal.lock and pulls the checkpoint round's
-// snapshot_dirty + wal.flush inside the same lock.
+// protocol that publishes walker.mutate + mark_dirty + journal
+// submission under commit_lock and makes checkpoint drain +
+// journal flush + byte snapshot use the same lock.
 //
 // The pre-fix race: a writer marked a blob dirty + then released
 // before appending WAL; a checkpoint round in between could
@@ -1140,10 +1187,9 @@ fn concurrent_writers_and_manual_checkpoints_preserve_acked_ops() {
         let done = Arc::new(AtomicBool::new(false));
 
         // Background "checkpointer" — periodic manual
-        // Tree::checkpoint() while writers churn. This is the
-        // path P0 #2 fixed: snapshot under wal.lock,
-        // write_through with expected_seq, conditional
-        // truncate.
+        // Tree::checkpoint() while writers churn. This exercises
+        // the production path: snapshot under commit_lock,
+        // write_through with expected_seq, conditional truncate.
         let ck_tree = Arc::clone(&tree);
         let ck_done = Arc::clone(&done);
         let ck_handle = thread::spawn(move || {

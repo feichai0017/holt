@@ -418,6 +418,59 @@ fn concurrent_reads_across_multi_blob_tree_via_buffer_manager() {
 }
 
 #[test]
+fn concurrent_writers_cross_blob_via_public_tree_api() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    let tree = Arc::new(Tree::open(TreeConfig::memory()).unwrap());
+    let seed_value = vec![0x5A; 220];
+    for dir in 0..8u32 {
+        for file in 0..350u32 {
+            let key = format!("tenant-{dir:02}/dir-{file:04}/seed").into_bytes();
+            tree.put(&key, &seed_value).unwrap();
+        }
+    }
+    assert!(
+        tree.stats().unwrap().blob_count >= 2,
+        "test precondition: seed workload must spill into child blobs",
+    );
+
+    const WRITERS: usize = 8;
+    const PER_WRITER: u32 = 120;
+    let barrier = Arc::new(Barrier::new(WRITERS));
+    let handles: Vec<_> = (0..WRITERS)
+        .map(|writer| {
+            let tree = Arc::clone(&tree);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                for i in 0..PER_WRITER {
+                    let key = format!("tenant-{writer:02}/hot/new-{i:04}").into_bytes();
+                    let value = format!("writer-{writer}/value-{i}").into_bytes();
+                    tree.put(&key, &value).unwrap();
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    for writer in 0..WRITERS {
+        for i in [0, PER_WRITER / 2, PER_WRITER - 1] {
+            let key = format!("tenant-{writer:02}/hot/new-{i:04}").into_bytes();
+            let value = format!("writer-{writer}/value-{i}").into_bytes();
+            assert_eq!(tree.get(&key).unwrap().as_deref(), Some(value.as_slice()));
+        }
+    }
+    let stats = tree.stats().unwrap();
+    assert!(
+        stats.bm_max_blob_hops >= 2,
+        "writers should have crossed at least one BlobNode boundary; stats={stats:?}",
+    );
+}
+
+#[test]
 fn compact_then_insert_reclaims_extent_leak() {
     // Pure-mutation workload: insert N keys, delete half, insert
     // another N. Without compact reclaiming the deleted-leaf

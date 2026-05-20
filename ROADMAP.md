@@ -50,7 +50,7 @@ structured `Error::NodeCorrupt`), PGO docs, `cargo deny check`
 in CI, scale-curve + p95/p99 contention benches.
 
 Concurrency primitives: per-blob `HybridLatch` (LeanStore 3-mode,
-wait-free optimistic reads) inside one `wal.lock` critical section
+wait-free optimistic reads) inside one WAL-writer critical section
 per write. Slot-versioned cross-blob lock-coupling was considered
 for v0.2 but deferred to v0.3 — it needs structural changes the
 v0.2 scope didn't budget for, and the per-slot version array is
@@ -126,23 +126,33 @@ current `HybridLatch` API has no timed acquisition boundary, and
 adding timing to every latch acquire should be driven by a
 contention benchmark rather than added speculatively.
 
-### P1 — Real journal group commit
+### P1 — Journal group commit (done, with one explicit boundary)
 
-The current WAL batches bytes in a per-writer buffer, but every
-persistent mutation still serialises through `wal.lock`. The next
-shape is a dedicated journal worker:
+Durable group commit is implemented:
 
-- Writers encode records into owned buffers and enqueue
-  `JournalRequest { seq, bytes, durability, notify }`.
-- The journal worker batches by byte threshold and short time
-  window, writes with `writev` / `pwritev`, and calls `fdatasync`
-  once for all durable waiters in the batch.
-- Publish dirty / pending-delete state only after the WAL record
-  is admitted to the journal pipeline, preserving W2D without
-  holding a global mutex around the whole walker mutation.
-- Expose durability classes internally: `visible` (accepted by
-  the journal worker), `durable` (fsync-completed), and
-  `checkpointed` (blob image written and WAL truncate-safe).
+- Persistent trees own a dedicated journal worker instead of an
+  exposed `Arc<Mutex<WalWriter>>`.
+- Writers encode complete WAL records into owned buffers, submit
+  them to the worker, and wait outside the commit-publish critical
+  section.
+- `wal_sync_on_commit=true` writers share one `sync_data` when
+  they arrive inside the short group window. `Tree::stats()` and
+  Prometheus export journal appends, append batches, and sync
+  counts so the batching ratio is observable.
+- Manual and background checkpoint rounds take the same
+  `commit_lock` while draining dirty/pending sets, flushing the
+  journal, and cloning dirty blob bytes. This is intentionally
+  conservative: it prevents backend writes from copying a blob
+  image that includes a mutation whose WAL record was not part of
+  the durable snapshot.
+
+Boundary kept on purpose: the current safe implementation still
+holds `commit_lock` across walker mutation + dirty publish +
+journal submission for persistent writes. Removing that final
+global publish section needs per-blob publish epochs (or an
+equivalent mutation-version protocol) so checkpoint byte snapshots
+can reject images that raced with an uncheckpointed writer. Do not
+delete the lock until that proof exists.
 
 ### P2 — NVMe-grade checkpoint I/O
 

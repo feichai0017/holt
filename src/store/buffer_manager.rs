@@ -12,14 +12,12 @@
 //! those edits stay in cache until a flush pushes them through.
 //! Two flush paths exist:
 //!
-//! - **Synchronous** [`BufferManager::commit`] — drives one blob
-//!   per call from [`crate::Tree::checkpoint`] or per-op
-//!   `memory_flush_on_write` mode. Writes the cache image to backend
-//!   and atomically clears the blob's dirty entry on success.
-//! - **Background checkpointer** — drives a round-based flush of
-//!   the entire dirty set; see [`BufferManager::snapshot_dirty`]
-//!   / [`BufferManager::restore_dirty`] /
-//!   [`BufferManager::min_unflushed_txn`].
+//! - **Synchronous checkpoint** — [`crate::Tree::checkpoint`]
+//!   drains the dirty map, clones cached bytes, then calls
+//!   [`BufferManager::write_through`] with the snapshotted seq.
+//! - **Background checkpointer** — drives the same protocol from
+//!   its planner/I/O threads; see [`BufferManager::snapshot_dirty`]
+//!   / [`BufferManager::restore_dirty`].
 //!
 //! The `write_blob` trait method is still write-through (cache +
 //! backend in one call). Internal call sites that produce a new
@@ -71,8 +69,8 @@
 //!   If a writer lapped the snapshot, the read is discarded and
 //!   the caller restarts. Used by `Tree::get`'s walker.
 //! - **Shared** — N readers run concurrently, mutually exclusive
-//!   with writers. Used by `BufferManager::commit` (durable write-
-//!   through reads the cached image under shared).
+//!   with writers. Checkpoint byte snapshots take this mode long
+//!   enough to clone the cached image.
 //! - **Exclusive** — single writer, mutually exclusive with all
 //!   readers. Used by every walker mutation hop (`insert_multi`
 //!   / `erase_multi` / spillover).
@@ -91,8 +89,9 @@
 //!   `BlobFrameRef::wrap` shape, but blocks behind any active
 //!   writer.
 //! - [`CachedBlob::write`] → [`BlobWriteGuard`] (exclusive). Use
-//!   `guard.frame()` for in-place mutation. Drop the guard, then
-//!   call [`BufferManager::commit`] to flush the change to disk.
+//!   `guard.frame()` for in-place mutation. The owning tree later
+//!   publishes dirty state and checkpoint writes it through via
+//!   [`BufferManager::write_through`].
 //!
 //! ## Eviction
 //!
@@ -810,55 +809,6 @@ impl BufferManager {
         Ok(entry)
     }
 
-    /// Durably write the cached image of `guid` to the inner backend.
-    ///
-    /// Used by mutation paths after they've finished editing a
-    /// pinned buffer: pin → write-guard → mutate → drop guard →
-    /// `commit`. Acquires a shared read-guard on the cache entry,
-    /// so multiple commits on different blobs run concurrently and
-    /// in-flight readers on the same blob are not blocked.
-    ///
-    /// If `guid` is **not** in cache the call is a no-op — there
-    /// is nothing dirty to commit (the inner backend already has
-    /// the canonical bytes). This matches the natural use case of
-    /// `Tree::checkpoint` running on a freshly-opened tree before
-    /// any mutation has loaded the root into cache.
-    ///
-    /// **Dirty bookkeeping** (invariants I1/I3 in the module docs):
-    /// the dirty entry for `guid`, if any, is *drained* before the
-    /// backend write so a concurrent `mark_dirty` lands a fresh
-    /// (newer-seq) entry rather than getting merged into the one
-    /// we're about to clear. On write failure the drained entry is
-    /// restored (taking `min` with anything the racing writer
-    /// added in the meantime); on success it stays removed.
-    ///
-    /// Test helper for the single-blob commit path. Production
-    /// checkpoint paths use `write_through` (CAS-on-seq) instead.
-    #[cfg(test)]
-    pub fn commit(&self, guid: BlobGuid) -> Result<()> {
-        let drained = {
-            let mut d = self.dirty.lock().unwrap();
-            d.dirty.remove(&guid)
-        };
-        if let Some(entry) = self.get_cached(guid) {
-            let buf = entry.read();
-            if let Err(e) = self.backend.write_blob(guid, &buf) {
-                // Backend write failed; put the dirty entry back so
-                // a future round retries. Merge with min in case a
-                // racing writer already re-added an entry.
-                if let Some(t) = drained {
-                    let mut d = self.dirty.lock().unwrap();
-                    d.dirty
-                        .entry(guid)
-                        .and_modify(|cur| *cur = (*cur).min(t))
-                        .or_insert(t);
-                }
-                return Err(e);
-            }
-        }
-        Ok(())
-    }
-
     // ---------- dirty tracking ----------
 
     /// Tag `guid` as dirty at WAL seq `txn_id`.
@@ -926,24 +876,6 @@ impl BufferManager {
                 .and_modify(|cur| *cur = (*cur).min(t))
                 .or_insert(t);
         }
-    }
-
-    /// Lowest unflushed WAL seq across all dirty blobs, or `None`
-    /// if every cached image is durable.
-    ///
-    /// This is the WAL trim watermark: records below this seq can
-    /// be discarded because their effects are already in the
-    /// backend. If the dirty map is empty, every seq up to
-    /// `next_seq - 1` is durable.
-    ///
-    /// Test helper. The conditional truncate gate in
-    /// `Tree::checkpoint` / the bg round uses `dirty_count()` +
-    /// `pending_delete_count()` instead.
-    #[cfg(test)]
-    #[must_use]
-    pub fn min_unflushed_txn(&self) -> Option<u64> {
-        let d = self.dirty.lock().unwrap();
-        d.dirty.values().copied().min()
     }
 
     /// Number of distinct dirty blobs currently tracked. Useful for
@@ -1415,15 +1347,9 @@ mod tests {
         bm.mark_dirty([0x01; 16], 50);
         bm.mark_dirty([0x01; 16], 30);
         bm.mark_dirty([0x01; 16], 99);
-        assert_eq!(bm.min_unflushed_txn(), Some(30));
         assert_eq!(bm.dirty_count(), 1);
-    }
-
-    #[test]
-    fn min_unflushed_txn_returns_none_when_clean() {
-        let bm = BufferManager::new(Arc::new(MemoryBackend::new()), 4);
-        assert_eq!(bm.min_unflushed_txn(), None);
-        assert_eq!(bm.dirty_count(), 0);
+        let snap = bm.snapshot_dirty();
+        assert_eq!(snap[&[0x01; 16]], 30);
     }
 
     #[test]
@@ -1439,12 +1365,12 @@ mod tests {
 
         // After snapshot the live map is empty.
         assert_eq!(bm.dirty_count(), 0);
-        assert_eq!(bm.min_unflushed_txn(), None);
 
         // Concurrent mark_dirty lands in the fresh empty map.
         bm.mark_dirty([0x03; 16], 99);
         assert_eq!(bm.dirty_count(), 1);
-        assert_eq!(bm.min_unflushed_txn(), Some(99));
+        let next = bm.snapshot_dirty();
+        assert_eq!(next[&[0x03; 16]], 99);
     }
 
     #[test]
@@ -1505,25 +1431,6 @@ mod tests {
         assert_eq!(live[&[0x01; 16]], 10);
         assert_eq!(live[&[0x02; 16]], 20);
         assert_eq!(live[&[0x03; 16]], 5);
-    }
-
-    #[test]
-    fn commit_clears_dirty_on_success() {
-        let inner: Arc<dyn Backend> = Arc::new(MemoryBackend::new());
-        inner.write_blob([0x77; 16], &make_buf(0)).unwrap();
-        let bm = BufferManager::new(inner, 4);
-
-        // Pin + write-guard to populate cache + mark dirty.
-        let pin = bm.pin([0x77; 16]).unwrap();
-        {
-            let mut g = pin.write();
-            g.as_mut_slice()[200] = 0xCD;
-        }
-        bm.mark_dirty([0x77; 16], 42);
-        assert_eq!(bm.dirty_count(), 1);
-
-        bm.commit([0x77; 16]).unwrap();
-        assert_eq!(bm.dirty_count(), 0, "successful commit must clear dirty");
     }
 
     #[test]
@@ -1649,7 +1556,9 @@ mod tests {
         // BM cached + dirty.
         assert_eq!(bm.cached_count(), 1);
         assert_eq!(bm.dirty_count(), 1);
-        assert_eq!(bm.min_unflushed_txn(), Some(42));
+        let snap = bm.snapshot_dirty();
+        assert_eq!(snap[&new_guid], 42);
+        bm.restore_dirty(snap);
 
         // Inner backend has nothing yet.
         assert!(
@@ -1664,9 +1573,12 @@ mod tests {
         drop(guard);
         drop(pin);
 
-        // After commit, the inner backend has the bytes and the
-        // dirty entry is cleared.
-        bm.commit(new_guid).unwrap();
+        // After the production checkpoint primitive runs, the inner
+        // backend has the bytes and the dirty entry is cleared.
+        let snap = bm.snapshot_dirty();
+        let bytes = bm.snapshot_bytes(new_guid).unwrap();
+        bm.write_through(new_guid, &bytes, snap[&new_guid]).unwrap();
+        bm.backend_flush().unwrap();
         assert_eq!(bm.dirty_count(), 0);
         assert!(inner.has_blob(new_guid).unwrap());
         let mut dst = AlignedBlobBuf::zeroed();

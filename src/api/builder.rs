@@ -51,7 +51,7 @@ impl TreeBuilder {
         self
     }
 
-    /// fsync the WAL on every commit (slow + durable) vs batched.
+    /// Wait for durable journal group commit on every mutation.
     pub fn wal_sync_on_commit(mut self, on: bool) -> Self {
         self.cfg.wal_sync_on_commit = on;
         self

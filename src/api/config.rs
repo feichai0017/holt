@@ -44,14 +44,16 @@ pub struct TreeConfig {
     /// Controls the WAL durability boundary on every `put` /
     /// `delete` / `rename`:
     ///
-    /// - `true` → call `sync_data` on the WAL file. Per-op
-    ///   durable past a power failure; **slow** (one fsync per
-    ///   op, ~ms on consumer SSDs).
-    /// - `false` (the default) → leave the record in the WAL
-    ///   writer's pending buffer / OS page cache. Survives a
-    ///   process crash (the auto-flush drains to the page cache
-    ///   at 64 KB); does **not** survive a power loss until
-    ///   `Tree::checkpoint` runs.
+    /// - `true` → wait until the journal worker has called
+    ///   `sync_data` on a batch containing this op. Durable past a
+    ///   power failure; concurrent writers can share one fsync via
+    ///   group commit.
+    /// - `false` (the default) → return after the journal queue
+    ///   accepts the record. The record may still be in the
+    ///   worker's queue, user-space buffer, or OS page cache, so
+    ///   this is not a per-op crash-durability boundary. Use
+    ///   `Tree::checkpoint` or `wal_sync_on_commit = true` when
+    ///   the caller needs durable acknowledgement.
     ///
     /// Matches `disable_wal=false, sync=false` in RocksDB's
     /// default. Production deployments that need power-safe

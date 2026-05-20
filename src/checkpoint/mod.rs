@@ -8,11 +8,11 @@
 //! │ checkpoint_thread (planner / orchestrator)               │
 //! │   park_timeout(idle_interval)                            │
 //! │     ├─ run_merge_pass                                    │
-//! │     ├─ snapshot_dirty + wal.flush                        │
+//! │     ├─ snapshot_dirty + journal.flush                    │
 //! │     ├─ submit IoTask::Flush per dirty blob               │
 //! │     ├─ wait completions                                  │
 //! │     ├─ submit IoTask::Sync, wait                         │
-//! │     └─ wal.truncate iff dirty_count == 0                 │
+//! │     └─ journal.truncate iff dirty_count == 0             │
 //! └────────┬─────────────────────────────────────────────────┘
 //!          │ IoTask (bounded crossbeam channel)
 //!          ▼
@@ -67,7 +67,7 @@
 //!    (still uses the I/O queue). Closes the window between the
 //!    planner's last round and the Tree handle's drop — writes
 //!    that landed in that window are otherwise lost when the
-//!    BM/WAL `Arc`s drop.
+//!    BM/journal `Arc`s drop.
 //! 3. Send `IoTask::Stop`; join the I/O thread.
 //! 4. Set `eviction_stop`; unpark + join the eviction thread.
 
@@ -83,7 +83,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::concurrency::MaintenanceGate;
-use crate::journal::writer::WalWriter;
+use crate::journal::group_commit::Journal;
 use crate::layout::BlobGuid;
 use crate::store::BufferManager;
 
@@ -189,7 +189,12 @@ impl CheckpointConfig {
 
 pub(super) struct Shared {
     pub(super) bm: Arc<BufferManager>,
-    pub(super) wal: Option<Arc<Mutex<WalWriter>>>,
+    pub(super) journal: Option<Arc<Journal>>,
+    /// Same commit-publish lock used by foreground writers.
+    /// Checkpoint rounds hold it while draining dirty entries and
+    /// cloning bytes so backend writes never include unjournaled
+    /// mutations.
+    pub(super) commit_lock: Arc<Mutex<()>>,
     /// GUID of the tree root — entry point for the merge-pass walk.
     pub(super) root_guid: BlobGuid,
     /// Shared structural gate with `Tree`: the merge pass enters
@@ -232,15 +237,16 @@ pub(crate) struct Checkpointer {
 
 impl Checkpointer {
     /// Spawn the three checkpointer threads bound to `bm` +
-    /// optional `wal`. Returns `None` if `cfg.enabled == false` —
+    /// optional journal. Returns `None` if `cfg.enabled == false` —
     /// the caller (typically `Tree::open_inner`) falls back to
     /// synchronous checkpointing in that case.
     #[must_use]
     pub(crate) fn spawn(
         bm: Arc<BufferManager>,
-        wal: Option<Arc<Mutex<WalWriter>>>,
+        journal: Option<Arc<Journal>>,
         root_guid: BlobGuid,
         maintenance_gate: Arc<MaintenanceGate>,
+        commit_lock: Arc<Mutex<()>>,
         cfg: CheckpointConfig,
     ) -> Option<Self> {
         if !cfg.enabled {
@@ -249,7 +255,8 @@ impl Checkpointer {
         let (io_tx, io_rx) = bounded::<IoTask>(cfg.io_queue_capacity.max(1));
         let shared = Arc::new(Shared {
             bm,
-            wal,
+            journal,
+            commit_lock,
             root_guid,
             maintenance_gate,
             cfg,
@@ -411,6 +418,10 @@ mod tests {
         Arc::new(MaintenanceGate::new())
     }
 
+    fn commit_lock() -> Arc<Mutex<()>> {
+        Arc::new(Mutex::new(()))
+    }
+
     /// Tests that don't construct a real Tree skip the merge pass —
     /// `collect_blob_guids` would otherwise try to pin a
     /// non-existent root.
@@ -428,15 +439,29 @@ mod tests {
         let bm = make_bm();
         let cfg = CheckpointConfig::default();
         assert!(!cfg.enabled);
-        let ck = Checkpointer::spawn(bm, None, TEST_ROOT_GUID, maintenance_gate(), cfg);
+        let ck = Checkpointer::spawn(
+            bm,
+            None,
+            TEST_ROOT_GUID,
+            maintenance_gate(),
+            commit_lock(),
+            cfg,
+        );
         assert!(ck.is_none());
     }
 
     #[test]
     fn spawn_and_drop_is_leak_free() {
         let bm = make_bm();
-        let ck = Checkpointer::spawn(bm, None, TEST_ROOT_GUID, maintenance_gate(), no_merge_cfg())
-            .expect("spawn");
+        let ck = Checkpointer::spawn(
+            bm,
+            None,
+            TEST_ROOT_GUID,
+            maintenance_gate(),
+            commit_lock(),
+            no_merge_cfg(),
+        )
+        .expect("spawn");
         // Give threads a tick to actually park.
         thread::sleep(Duration::from_millis(50));
         drop(ck);
@@ -460,6 +485,7 @@ mod tests {
             None,
             TEST_ROOT_GUID,
             maintenance_gate(),
+            commit_lock(),
             no_merge_cfg(),
         )
         .expect("spawn");
@@ -488,6 +514,7 @@ mod tests {
             None,
             TEST_ROOT_GUID,
             maintenance_gate(),
+            commit_lock(),
             cfg,
         )
         .expect("spawn");
@@ -541,6 +568,7 @@ mod tests {
             None,
             TEST_ROOT_GUID,
             maintenance_gate(),
+            commit_lock(),
             cfg,
         )
         .expect("spawn");

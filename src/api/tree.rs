@@ -22,10 +22,11 @@
 //!   and writers never block readers; only structural maintenance
 //!   (`compact` / merge) takes the exclusive side.
 //! - **Writes** (`put` / `delete`) take **exclusive** mode on
-//!   each blob they touch (always starting with the root). This
-//!   serialises concurrent mutators on the same blob without any
-//!   Tree-wide writer mutex; mutations on disjoint child blobs
-//!   can proceed in parallel.
+//!   each blob they touch. Persistent trees additionally enter a
+//!   short commit-publish critical section so checkpoint snapshots
+//!   never clone bytes that lack an admitted WAL record. Durable
+//!   fsync waiting happens after that section through the journal
+//!   group-commit worker.
 //! - **Structural maintenance** (`compact` and background merge)
 //!   takes a narrow tree-wide maintenance gate. Normal reads and
 //!   writers take the shared side while they may cross `BlobNode`
@@ -43,13 +44,16 @@ use std::sync::{Arc, Mutex};
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
-use super::stats::{BlobStats, CheckpointerStats, TreeStats};
+use super::stats::{BlobStats, CheckpointerStats, JournalStats, TreeStats};
 use crate::concurrency::MaintenanceGate;
 use crate::engine;
 use crate::engine::RangeBuilder;
+use crate::journal::codec::{
+    encode_erase_record, encode_insert_record, encode_rename_object_record, BatchEncoder,
+};
+use crate::journal::group_commit::Journal;
 use crate::journal::reader::replay;
 use crate::journal::txn_op::TxnOp;
-use crate::journal::writer::WalWriter;
 use crate::layout::{BlobGuid, PAGE_SIZE};
 use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
@@ -70,13 +74,10 @@ use super::txn::{BatchOp, TxnBatch};
 ///   from the root on a torn read. Never blocks foreground writers
 ///   and never block each other.
 /// - **Writes** (`put`, `delete`) hold the per-blob `HybridLatch`
-///   exclusively for the blobs they touch (always the root,
-///   plus any cross-blob descent target). For persistent trees
-///   the whole walker + `mark_dirty` + `wal.append` sequence
-///   runs inside one `wal.lock` critical section — see the
-///   `Tree::put` body for the W2D-strict protocol. There is
-///   **no** Tree-wide writer mutex; concurrent writers on
-///   disjoint blobs do not serialize on each other.
+///   exclusively for the blobs they touch. Persistent trees also
+///   take `commit_lock` while publishing the mutation to dirty
+///   tracking and the journal queue; the expensive durable wait
+///   happens after that lock through the group-commit worker.
 /// - **Maintenance** (`compact`, background merge) takes the
 ///   exclusive side of `maintenance_gate`; foreground reads and
 ///   writers enter the shared side around tree traversal. This
@@ -123,9 +124,15 @@ pub struct Tree {
     /// On open the tree replays the WAL and resumes at
     /// `highest_seq + 1`.
     next_seq: Arc<AtomicU64>,
-    /// WAL handle — `Some` for persistent trees, `None` for
-    /// memory trees (logging an in-memory engine has no point).
-    wal: Option<Arc<Mutex<WalWriter>>>,
+    /// Serialises the cache-mutation → dirty-publish →
+    /// journal-submit boundary in persistent mode. Checkpoint
+    /// snapshots take the same lock while draining dirty entries
+    /// and cloning their bytes, so no backend write can include
+    /// a mutation whose WAL record was not already admitted.
+    commit_lock: Arc<Mutex<()>>,
+    /// Group-commit WAL worker — `Some` for persistent trees,
+    /// `None` for memory trees.
+    journal: Option<Arc<Journal>>,
     /// Background checkpointer handle. `Some` iff
     /// `cfg.checkpoint.enabled`. Shared via `Arc` so the thread
     /// shuts down on the **last** `Tree` clone's drop, not the
@@ -269,7 +276,7 @@ impl Tree {
         // blob lags the WAL between the last `Tree::checkpoint`
         // and now, so the WAL is the source of truth for any op
         // committed via `memory_flush_on_write = true`.
-        let (wal, next_seq) = if attach_wal {
+        let (journal, next_seq) = if attach_wal {
             match cfg.wal_path() {
                 None => (None, 1u64),
                 Some(path) => {
@@ -278,8 +285,8 @@ impl Tree {
                     } else {
                         1
                     };
-                    let writer = WalWriter::open_or_create(&path, /*tree_id=*/ 0)?;
-                    (Some(Arc::new(Mutex::new(writer))), next_seq)
+                    let journal = Journal::open_or_create(&path, /*tree_id=*/ 0)?;
+                    (Some(Arc::new(journal)), next_seq)
                 }
             }
         } else {
@@ -296,15 +303,17 @@ impl Tree {
         // Shared structural gate for foreground writers, manual
         // compact, and the background merge pass.
         let maintenance_gate = Arc::new(MaintenanceGate::new());
+        let commit_lock = Arc::new(Mutex::new(()));
 
         // Spawn the background checkpointer if opted-in.
         // `Checkpointer::spawn` returns `None` for disabled
         // configs, so the `Option` chain stays clean.
         let checkpointer = crate::checkpoint::Checkpointer::spawn(
             Arc::clone(&bm),
-            wal.clone(),
+            journal.clone(),
             root_guid,
             Arc::clone(&maintenance_gate),
+            Arc::clone(&commit_lock),
             cfg.checkpoint.clone(),
         )
         .map(Arc::new);
@@ -317,7 +326,8 @@ impl Tree {
             rename_lock: Arc::new(Mutex::new(())),
             maintenance_gate,
             next_seq: Arc::new(AtomicU64::new(next_seq)),
-            wal,
+            commit_lock,
+            journal,
             checkpointer,
         })
     }
@@ -325,58 +335,14 @@ impl Tree {
     /// Look up `key`. Returns the value bytes, or `None` if no leaf
     /// matches.
     ///
-    /// Owned-`Vec<u8>` convenience over [`Tree::get_with`]. Pays
-    /// one allocation + memcpy per hit; on a miss returns
-    /// `Ok(None)` with no allocation.
-    ///
-    /// Equivalent to `tree.get_with(key, <[u8]>::to_vec)`. Reach
-    /// for `get_with` directly on hot read paths that don't need
-    /// owned bytes (existence checks, in-place decode, filter
-    /// pipelines, cache proxies).
+    /// Pays one allocation + memcpy per hit; on a miss returns
+    /// `Ok(None)` with no allocation. The walker itself reads
+    /// cached blobs optimistically and restarts from the root when
+    /// a concurrent writer invalidates its snapshot.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.get_with(key, <[u8]>::to_vec)
-    }
-
-    /// Zero-copy lookup with a user-supplied consumer closure.
-    ///
-    /// **Zero-copy with optimistic blob reads**: pins each blob via
-    /// the `BufferManager` and walks the cached buffer under the
-    /// blob's optimistic latch. N readers on different blobs
-    /// progress in parallel; readers on the same blob also progress
-    /// in parallel without a blocking per-blob read lock. The shared
-    /// maintenance gate only excludes compact/merge.
-    ///
-    /// `consume` is invoked at most once on the live cache-pin
-    /// slice when the key is present and the optimistic snapshot
-    /// validates; its return value is wrapped into `Some(_)`. On
-    /// `NotFound` returns `Ok(None)`. Keep the closure short — it
-    /// borrows directly into the cache buffer and a slow closure
-    /// widens the optimistic race window.
-    ///
-    /// Common shapes:
-    ///
-    /// - `tree.get_with(k, <[u8]>::to_vec)` — owned `Vec<u8>` (same
-    ///   as [`Tree::get`]).
-    /// - `tree.get_with(k, |_| ())` — pure existence check; never
-    ///   touches the value bytes after the leaf is found.
-    /// - `tree.get_with(k, |v| serde_json::from_slice(v))` —
-    ///   decode-in-place without an intermediate `Vec`.
-    ///
-    /// `F: FnMut` rather than `FnOnce` lets the walker's restart
-    /// loop hold onto the same closure across optimistic retries;
-    /// the closure is still invoked at most once per successful
-    /// lookup.
-    ///
-    /// Transparently follows `BlobNode` crossings — the lookup may
-    /// span multiple blobs when the tree has been split by
-    /// spillover.
-    pub fn get_with<R, F>(&self, key: &[u8], consume: F) -> Result<Option<R>>
-    where
-        F: FnMut(&[u8]) -> R,
-    {
         let _maintenance = self.maintenance_gate.enter_shared();
         let padded = pad_key(key);
-        engine::lookup_multi_with(&self.backend, &self.root_pin, &padded, consume)
+        engine::lookup_multi_with(&self.backend, &self.root_pin, &padded, <[u8]>::to_vec)
     }
 
     /// Insert or replace `(key, value)`. Returns `Ok(())`.
@@ -425,19 +391,18 @@ impl Tree {
     /// no prev_value field on disk since v0.3.1 / format v3).
     ///
     /// W2D-strict protocol (WAL mode): walker descent, `mark_dirty`,
-    /// and `wal.append` all happen inside one `wal.lock` critical
-    /// section. The checkpoint round's `snapshot_dirty` is also
-    /// taken under `wal.lock`, so any dirty entry it observes has
-    /// its WAL record already appended (and the trailing
-    /// `wal.flush` makes it durable). Concurrent writers serialise
-    /// on `wal.lock` — that's the intentional barrier.
+    /// and journal submission happen inside `commit_lock`. The
+    /// checkpoint round drains dirty entries and snapshots bytes
+    /// under the same lock, so any backend image it writes has a
+    /// WAL record admitted before the clone. Durable `sync_data`
+    /// waiting runs outside the lock through the journal worker.
     fn put_inner(&self, key: &[u8], value: &[u8], wants_prev: bool) -> Result<Option<Vec<u8>>> {
         let _maintenance = self.maintenance_gate.enter_shared();
         let padded = pad_key(key);
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
-        let outcome = if let Some(wal) = &self.wal {
-            let mut w = wal.lock().unwrap();
+        let (outcome, journal_ack) = if let Some(journal) = &self.journal {
+            let _commit = self.commit_lock.lock().unwrap();
             let outcome = engine::insert_multi(
                 &self.backend,
                 &self.root_pin,
@@ -449,18 +414,13 @@ impl Tree {
             if outcome.root_dirty {
                 self.backend.mark_dirty(self.root_guid, seq);
             }
-            // Fast-path encoder: writes (tree_id, key, value) only.
-            // Replay redoes from those three; the caller's
-            // `wants_prev` outcome is delivered through the return
-            // path, not the WAL.
-            w.append_insert(seq, 0, key, value)?;
-            if self.cfg.wal_sync_on_commit {
-                w.flush()?;
-            }
-            outcome
+            let mut record = Vec::new();
+            encode_insert_record(&mut record, seq, 0, key, value);
+            let ack = journal.submit(record, self.cfg.wal_sync_on_commit)?;
+            (outcome, ack)
         } else {
-            // No WAL — no checkpoint round to race with on the
-            // wal-lock axis. `memory_flush_on_write` (if set)
+            // No WAL — no journal/checkpoint publish boundary to
+            // race with. `memory_flush_on_write` (if set)
             // flushes dirty + pending-delete sets inline before
             // returning.
             let outcome = engine::insert_multi(
@@ -478,8 +438,11 @@ impl Tree {
                 self.flush_dirty_inline()?;
                 self.flush_pending_deletes_inline()?;
             }
-            outcome
+            (outcome, None)
         };
+        if let Some(ack) = journal_ack {
+            ack.wait()?;
+        }
         Ok(outcome.previous)
     }
 
@@ -532,8 +495,8 @@ impl Tree {
         // appear in any WAL record or dirty entry.
         let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
-        let outcome = if let Some(wal) = &self.wal {
-            let mut w = wal.lock().unwrap();
+        let (outcome, journal_ack) = if let Some(journal) = &self.journal {
+            let _commit = self.commit_lock.lock().unwrap();
             let outcome =
                 engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, wants_prev)?;
             if outcome.mutated {
@@ -543,16 +506,14 @@ impl Tree {
                 if outcome.root_dirty {
                     self.backend.mark_dirty(self.root_guid, seq);
                 }
-                // Fast-path encoder: writes (tree_id, key) only.
-                // The prior value (if `Tree::remove` asked for it)
-                // is delivered through the return path, not the WAL.
-                w.append_erase(seq, 0, key)?;
-                if self.cfg.wal_sync_on_commit {
-                    w.flush()?;
-                }
+                let mut record = Vec::new();
+                encode_erase_record(&mut record, seq, 0, key);
+                let ack = journal.submit(record, self.cfg.wal_sync_on_commit)?;
+                (outcome, ack)
+            } else {
+                (outcome, None)
             }
             // No-op delete (key wasn't there) is not logged.
-            outcome
         } else {
             let outcome =
                 engine::erase_multi(&self.backend, &self.root_pin, &padded, seq, wants_prev)?;
@@ -569,8 +530,11 @@ impl Tree {
                 // conservative parent-unlink path.
                 self.flush_pending_deletes_inline()?;
             }
-            outcome
+            (outcome, None)
         };
+        if let Some(ack) = journal_ack {
+            ack.wait()?;
+        }
         Ok(outcome)
     }
 
@@ -620,20 +584,20 @@ impl Tree {
             return Err(Error::DstExists);
         }
 
-        // W2D-strict protocol: walker + mark_dirty + wal.append
-        // all under one wal.lock critical section. Sharing one
-        // `seq` across both erase + insert phases keeps the
-        // rename atomic from the dirty-tracking perspective —
-        // failing halfway leaves a coherent partial-dirty set
-        // rather than two separately-staged ops.
+        // W2D-strict protocol: walker + mark_dirty + journal
+        // submission all happen under `commit_lock`. Sharing one
+        // `seq` across both erase + insert phases keeps the rename
+        // atomic from the dirty-tracking perspective — failing
+        // halfway leaves a coherent partial-dirty set rather than
+        // two separately-staged ops.
         //
         // Both walker calls pass `wants_prev=false`: the rename
         // already read the src value (above) and the dst existence
         // check (or `force=true`) gates the insert side, so the
         // walker-materialised previous values would just be
         // dropped on the floor.
-        if let Some(wal) = &self.wal {
-            let mut w = wal.lock().unwrap();
+        let journal_ack = if let Some(journal) = &self.journal {
+            let _commit = self.commit_lock.lock().unwrap();
             let erase_out =
                 engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
             let insert_out = engine::insert_multi(
@@ -647,12 +611,9 @@ impl Tree {
             if erase_out.root_dirty || insert_out.root_dirty {
                 self.backend.mark_dirty(self.root_guid, seq);
             }
-            // Fast-path: skips the `TxnOp::RenameObject` enum's
-            // two `Vec` clones (src_key, dst_key).
-            w.append_rename_object(seq, 0, src, dst, force)?;
-            if self.cfg.wal_sync_on_commit {
-                w.flush()?;
-            }
+            let mut record = Vec::new();
+            encode_rename_object_record(&mut record, seq, 0, src, dst, force);
+            journal.submit(record, self.cfg.wal_sync_on_commit)?
         } else {
             let erase_out =
                 engine::erase_multi(&self.backend, &self.root_pin, &src_padded, seq, false)?;
@@ -674,6 +635,10 @@ impl Tree {
                 self.flush_dirty_inline()?;
                 self.flush_pending_deletes_inline()?;
             }
+            None
+        };
+        if let Some(ack) = journal_ack {
+            ack.wait()?;
         }
         Ok(())
     }
@@ -747,22 +712,19 @@ impl Tree {
         let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
 
         // W2D-strict protocol: all inner ops' walker mutations +
-        // `mark_dirty` calls, plus the single envelope WAL append,
-        // happen under one wal.lock critical section — see
-        // `Tree::put` for the rationale.
-        if let Some(wal) = &self.wal {
-            let mut w = wal.lock().unwrap();
-            // `BatchEncoder` writes inner-op bytes directly into the
-            // WAL pending buffer from `&[u8]` refs, skipping the
-            // `TxnOp::Insert { key: Vec, value: Vec, .. }` enum
-            // construction (and its per-op `Vec` clones) the old
-            // `wal_ops: Vec<TxnOp>` path forced. On mid-batch error
-            // the encoder's `Drop` rolls back the partial record.
-            let _n = w.append_batch(base_seq, 0, |enc| {
-                self.apply_batch_walker_inline(pending, base_seq, Some(enc))
-            })?;
-            if self.cfg.wal_sync_on_commit {
-                w.flush()?;
+        // `mark_dirty` calls, plus the single envelope WAL submit,
+        // happen under `commit_lock` — see `Tree::put_inner`.
+        if let Some(journal) = &self.journal {
+            let ack = {
+                let _commit = self.commit_lock.lock().unwrap();
+                let mut record = Vec::new();
+                let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
+                self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))?;
+                let _n = enc.finish();
+                journal.submit(record, self.cfg.wal_sync_on_commit)?
+            };
+            if let Some(ack) = ack {
+                ack.wait()?;
             }
         } else {
             self.apply_batch_walker_inline(pending, base_seq, None)?;
@@ -1008,12 +970,11 @@ impl Tree {
     /// path restores any snapshot it drained so the next round
     /// retries.
     ///
-    /// 1. **Snapshot + WAL flush** (under `wal.lock`): drain BM
-    ///    dirty + pending-delete sets, then `wal.flush` so every
-    ///    record covering a drained entry is durable before any
-    ///    data byte or manifest mutation reaches backend
-    ///    (invariant **W2D**). WAL flush failure → restore
-    ///    both snapshots, return.
+    /// 1. **Snapshot + journal flush** (under `commit_lock`):
+    ///    drain BM dirty + pending-delete sets, force the journal
+    ///    durable, and clone each snapshotted blob's bytes before
+    ///    releasing the lock. Journal flush failure → restore both
+    ///    snapshots, return.
     /// 2. **Per-blob write-through** with CAS-on-seq. The CAS
     ///    retires the dirty entry only if no racing writer bumped
     ///    it; failures stay in `dirty` for the next round.
@@ -1049,27 +1010,49 @@ impl Tree {
 
         let _maintenance = self.maintenance_gate.enter_shared();
 
-        // Phase 1: snapshot under wal.lock so racing writers can't
-        // slip a not-yet-WAL-durable dirty entry past us. WAL flush
-        // failure must restore both snapshots — otherwise the next
-        // checkpoint sees `dirty == 0 && pending == 0` and may
-        // truncate the WAL, losing the cache mutations the failed
-        // flush had just drained from `dirty`.
-        let (snap_dirty, snap_pending) = if let Some(wal) = &self.wal {
-            let mut w = wal.lock().unwrap();
+        // Phase 1: snapshot dirty/pending, force the journal
+        // durable, and clone the snapshotted bytes under
+        // `commit_lock`. This closes the subtle W2D hole where a
+        // foreground writer mutates a blob after the dirty snapshot
+        // but before `snapshot_bytes`: without the shared lock, the
+        // checkpoint could write bytes whose WAL record was not in
+        // the flushed snapshot.
+        let (_snap_dirty, snap_pending, snap_bytes) = if let Some(journal) = &self.journal {
+            let _commit = self.commit_lock.lock().unwrap();
             let snap_dirty = self.backend.snapshot_dirty();
             let snap_pending = self.backend.snapshot_pending_deletes();
-            if let Err(e) = w.flush() {
+            if let Err(e) = journal.flush() {
                 self.backend.restore_dirty(snap_dirty);
                 self.backend.restore_pending_deletes(snap_pending);
                 return Err(e);
             }
-            (snap_dirty, snap_pending)
+            let mut snap_bytes = Vec::with_capacity(snap_dirty.len());
+            for (guid, expected_seq) in &snap_dirty {
+                let Some(bytes) = self.backend.snapshot_bytes(*guid) else {
+                    self.backend.restore_dirty(snap_dirty);
+                    self.backend.restore_pending_deletes(snap_pending);
+                    return Err(Error::Internal(
+                        "checkpoint: dirty entry lost cache image — invariant I1 violated",
+                    ));
+                };
+                snap_bytes.push((*guid, *expected_seq, bytes));
+            }
+            (snap_dirty, snap_pending, snap_bytes)
         } else {
-            (
-                self.backend.snapshot_dirty(),
-                self.backend.snapshot_pending_deletes(),
-            )
+            let snap_dirty = self.backend.snapshot_dirty();
+            let snap_pending = self.backend.snapshot_pending_deletes();
+            let mut snap_bytes = Vec::with_capacity(snap_dirty.len());
+            for (guid, expected_seq) in &snap_dirty {
+                let Some(bytes) = self.backend.snapshot_bytes(*guid) else {
+                    self.backend.restore_dirty(snap_dirty);
+                    self.backend.restore_pending_deletes(snap_pending);
+                    return Err(Error::Internal(
+                        "checkpoint: dirty entry lost cache image — invariant I1 violated",
+                    ));
+                };
+                snap_bytes.push((*guid, *expected_seq, bytes));
+            }
+            (snap_dirty, snap_pending, snap_bytes)
         };
 
         // Phase 2: per-blob write_through with CAS-on-seq.
@@ -1083,23 +1066,8 @@ impl Tree {
         // Restore both snapshots and bail loud.
         let mut dirty_failed: HashMap<BlobGuid, u64> = HashMap::new();
         let mut first_dirty_err: Option<Error> = None;
-        for (guid, expected_seq) in &snap_dirty {
-            let Some(bytes) = self.backend.snapshot_bytes(*guid) else {
-                let restore_dirty: HashMap<BlobGuid, u64> = snap_dirty
-                    .iter()
-                    .filter(|(g, _)| !dirty_failed.contains_key(*g))
-                    .map(|(g, s)| (*g, *s))
-                    .collect();
-                self.backend.restore_dirty(restore_dirty);
-                if !dirty_failed.is_empty() {
-                    self.backend.restore_dirty(dirty_failed);
-                }
-                self.backend.restore_pending_deletes(snap_pending);
-                return Err(Error::Internal(
-                    "checkpoint: dirty entry lost cache image — invariant I1 violated",
-                ));
-            };
-            if let Err(e) = self.backend.write_through(*guid, &bytes, *expected_seq) {
+        for (guid, expected_seq, bytes) in &snap_bytes {
+            if let Err(e) = self.backend.write_through(*guid, bytes, *expected_seq) {
                 dirty_failed.insert(*guid, *expected_seq);
                 if first_dirty_err.is_none() {
                     first_dirty_err = Some(e);
@@ -1181,10 +1149,10 @@ impl Tree {
         //    what we observed at step 1); leave the WAL alone so
         //    that entry's WAL record stays recoverable. Same
         //    logic for pending_delete_count.
-        if let Some(wal) = &self.wal {
-            let mut w = wal.lock().unwrap();
+        if let Some(journal) = &self.journal {
+            let _commit = self.commit_lock.lock().unwrap();
             if self.backend.dirty_count() == 0 && self.backend.pending_delete_count() == 0 {
-                w.truncate()?;
+                journal.truncate()?;
             }
         }
         Ok(())
@@ -1256,6 +1224,14 @@ impl Tree {
         let bm_max_cross_blob_depth = self.backend.max_cross_blob_depth();
         let bm_spillovers = self.backend.spillover_count();
         let bm_merges = self.backend.merge_count();
+        let journal = self.journal.as_ref().map(|j| {
+            let s = j.stats();
+            JournalStats {
+                appends: s.appends,
+                batches: s.batches,
+                syncs: s.syncs,
+            }
+        });
         let checkpointer = self.checkpointer.as_ref().map(|ck| CheckpointerStats {
             rounds_attempted: ck.rounds_attempted(),
             rounds_succeeded: ck.rounds_succeeded(),
@@ -1283,6 +1259,7 @@ impl Tree {
             bm_max_cross_blob_depth,
             bm_spillovers,
             bm_merges,
+            journal,
             checkpointer,
         })
     }

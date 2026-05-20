@@ -210,7 +210,7 @@ fn pending_delete_sync_failure_keeps_state_for_retry() {
     );
 
     // `Tree::checkpoint`'s flush calls in order:
-    //   1. `wal.flush` — but no WAL here, so doesn't hit
+    //   1. journal flush — but no WAL here, so doesn't hit
     //      backend (no FailpointBackend::flush call).
     //   2. `backend.flush` (data Sync, step 3) — call #1.
     //   3. `backend.flush` (manifest Sync, step 5) — call #2.
@@ -350,7 +350,7 @@ fn dirty_write_failure_does_not_propagate_to_pending_delete() {
 #[test]
 fn pre_delete_sync_failure_restores_pending() {
     // Regression for the bug where the pre-delete `backend.flush`
-    // failure path drained `pending` (the wal.lock snapshot) but
+    // failure path drained `pending` (the checkpoint snapshot) but
     // never restored it — losing every queued unlink intent. The
     // fix restores `pending` on every Sync-failure return path
     // before phase 6.

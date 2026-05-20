@@ -10,15 +10,12 @@
 //!    mutations are staged through the same dirty /
 //!    pending-delete sets as foreground writes, then flushed by
 //!    this round after the WAL sync.
-//! 1. **Snapshot dirty** — atomically drain the BM dirty map.
-//!    Concurrent writers' new `mark_dirty` lands in a fresh empty
-//!    map and gets picked up by the next round.
-//! 2. **Flush WAL** — `sync_data` the writer so every record that
+//! 1. **Snapshot dirty + pending deletes** under the tree's
+//!    commit-publish lock.
+//! 2. **Flush WAL** through the journal worker so every record that
 //!    mirrors a snapshotted seq is durable before we drop it.
-//! 3. **Submit `Flush` tasks** — snapshot bytes per dirty blob via
-//!    `bm.snapshot_bytes` (memcpy under a brief shared read guard),
-//!    move the bytes into an `IoTask::Flush`, and push the task to
-//!    the I/O thread.
+//! 3. **Clone snapshotted bytes** while still holding the same
+//!    commit-publish lock, then submit one `IoTask::Flush` per blob.
 //! 4. **Collect completions** — wait for each task's one-shot
 //!    completion. On any failure, restore the corresponding dirty
 //!    entry via `bm.restore_dirty` so the next round retries.
@@ -26,10 +23,10 @@
 //!    landed. `fdatasync` of the inner backend, including the
 //!    PersistentBackend's manifest persist.
 //! 6. **Truncate WAL** — only when (a) no `Flush` failed AND (b)
-//!    `bm.dirty_count() == 0` checked **under the WAL lock**. The
-//!    interlock with the writer-side `mark_dirty → wal.lock`
-//!    ordering ensures we never drop a record whose effect isn't
-//!    already in backend.
+//!    `bm.dirty_count() == 0` checked under the commit-publish
+//!    lock. The interlock with the writer-side dirty/journal
+//!    publish order ensures we never drop a record whose effect
+//!    isn't already in backend.
 //!
 //! This function is called from two places:
 //!
@@ -78,19 +75,18 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     #[cfg(feature = "tracing")]
     let round_start = std::time::Instant::now();
 
-    // 1+2. Snapshot dirty AND pending-deletes + flush WAL, all
-    // under the same wal lock so both sets we drain are closed
-    // against in-flight writers (W2D-strict). The writer-side
-    // protocol holds wal.lock for the duration of walker.mutate
-    // + mark_dirty / mark_for_delete + wal.append, so any entry
-    // visible here has its WAL record already buffered in the
-    // writer — the trailing `wal.flush` makes it durable before
-    // we touch backend.
+    // 1+2+3. Snapshot dirty AND pending-deletes, flush the journal,
+    // then clone bytes under the same commit-publish lock used by
+    // foreground persistent writers. Holding the lock through the
+    // byte clone is load-bearing: a writer must not mutate a blob
+    // between our dirty snapshot and `snapshot_bytes`, otherwise
+    // the backend flush could include bytes whose WAL record was
+    // not part of the durable snapshot.
     //
     // If `snapshot_pending_deletes` were taken outside this
-    // wal.lock block, a writer could (a) take the lock, (b)
-    // walker.erase that hits `SubtreeGone` (which calls
-    // `mark_for_delete`), (c) wal.append the erase record, (d)
+    // commit-publish block, a writer could (a) enter its mutation,
+    // (b) walker.erase that hits `SubtreeGone` (which calls
+    // `mark_for_delete`), (c) submit the erase record, (d)
     // release the lock, before we snapshot pending; we'd then
     // execute `backend.delete_blob` and re-Sync manifest while
     // the writer's WAL record was still only in the writer's
@@ -98,23 +94,52 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     // WAL — exactly the W2D violation deferred-delete was
     // designed to prevent.
     //
-    // No-WAL trees (memory mode, user-supplied backend) skip
-    // the lock; concurrency safety there is the user's contract.
-    let (snap, pending) = if let Some(wal) = &shared.wal {
-        let mut w = wal.lock().unwrap();
+    // No-WAL trees (memory mode, user-supplied backend) skip the
+    // journal flush but still clone immediately after draining.
+    let (snap, pending, snap_bytes) = if let Some(journal) = &shared.journal {
+        let _commit = shared.commit_lock.lock().unwrap();
         let snap = shared.bm.snapshot_dirty();
         let pending = shared.bm.snapshot_pending_deletes();
-        if let Err(e) = w.flush() {
+        if let Err(e) = journal.flush() {
             shared.bm.restore_dirty(snap);
             shared.bm.restore_pending_deletes(pending);
             return Err(e);
         }
-        (snap, pending)
+        let mut snap_bytes = Vec::with_capacity(snap.len());
+        for (guid, txn_id) in &snap {
+            let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
+                let mut failed = HashMap::new();
+                for (g, t) in &snap {
+                    failed.entry(*g).or_insert(*t);
+                }
+                shared.bm.restore_dirty(failed);
+                shared.bm.restore_pending_deletes(pending);
+                return Err(Error::Internal(
+                    "checkpoint: dirty entry lost cache image — invariant I1 violated",
+                ));
+            };
+            snap_bytes.push((*guid, *txn_id, bytes));
+        }
+        (snap, pending, snap_bytes)
     } else {
-        (
-            shared.bm.snapshot_dirty(),
-            shared.bm.snapshot_pending_deletes(),
-        )
+        let snap = shared.bm.snapshot_dirty();
+        let pending = shared.bm.snapshot_pending_deletes();
+        let mut snap_bytes = Vec::with_capacity(snap.len());
+        for (guid, txn_id) in &snap {
+            let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
+                let mut failed = HashMap::new();
+                for (g, t) in &snap {
+                    failed.entry(*g).or_insert(*t);
+                }
+                shared.bm.restore_dirty(failed);
+                shared.bm.restore_pending_deletes(pending);
+                return Err(Error::Internal(
+                    "checkpoint: dirty entry lost cache image — invariant I1 violated",
+                ));
+            };
+            snap_bytes.push((*guid, *txn_id, bytes));
+        }
+        (snap, pending, snap_bytes)
     };
     let snap_count = snap.len();
     shared.last_dirty_count.store(snap_count, Ordering::Relaxed);
@@ -137,36 +162,16 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         Vec::with_capacity(snap.len());
     let mut failed: HashMap<BlobGuid, u64> = HashMap::new();
 
-    for (guid, txn_id) in &snap {
-        // A drained dirty entry **must** have a cache image —
-        // that's invariant **I1** (dirty ⟺ cache newer than
-        // backend). If `snapshot_bytes` returns `None`, the cache
-        // image was evicted while the dirty entry survived: a
-        // silent data-loss path (the BM's `try_evict_lru` /
-        // `try_evict_cold` are supposed to skip dirty entries,
-        // but a regression there is exactly the bug class this
-        // check catches). Restore everything drained and bail
-        // loud — better than silently truncating the WAL when
-        // the next round sees `dirty == 0`.
-        let Some(bytes) = shared.bm.snapshot_bytes(*guid) else {
-            for (g, t) in &snap {
-                failed.entry(*g).or_insert(*t);
-            }
-            shared.bm.restore_dirty(failed);
-            shared.bm.restore_pending_deletes(pending);
-            return Err(Error::Internal(
-                "checkpoint: dirty entry lost cache image — invariant I1 violated",
-            ));
-        };
+    for (guid, txn_id, bytes) in snap_bytes {
         let (tx, rx) = bounded(1);
         let task = IoTask::Flush {
-            guid: *guid,
+            guid,
             bytes,
             // Carry the drained dirty seq so the I/O worker can
             // tell "no writer raced us" (safe to retire the dirty
             // entry) from "racer landed" (must leave the new
             // entry alone for the next round).
-            expected_seq: *txn_id,
+            expected_seq: txn_id,
             on_done: tx,
         };
         if shared.io_tx.send(task).is_err() {
@@ -187,7 +192,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
                 "checkpoint: I/O worker channel closed mid-round",
             ));
         }
-        completions.push((*guid, *txn_id, rx));
+        completions.push((guid, txn_id, rx));
     }
 
     // 4. Collect completions.
@@ -262,9 +267,9 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     }
 
     // 6. Apply pending deletes — `pending` was already drained in
-    //    step 1 under the wal.lock, so the writer-side WAL records
+    //    step 1 under the commit-publish lock, so the writer-side WAL records
     //    covering each unlink op are durable on disk (via the
-    //    step-2 wal.flush). Phase 5 has fsync'd the per-blob writes
+    //    step-2 journal flush). Phase 5 has fsync'd the per-blob writes
     //    that the manifest delete is allowed to follow. Safe to
     //    mutate the manifest now; the trailing re-Sync at step 7
     //    persists it.
@@ -332,16 +337,16 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
     }
 
     // 8. Truncate WAL atomically iff every snapshot landed AND no
-    //    racing writer has re-dirtied (under WAL-lock check), AND
+    //    racing writer has re-dirtied (under commit-lock check), AND
     //    no deferred deletes are still queued. The pending-delete
     //    gate is essential: a queued delete means a WAL record
     //    "this blob is unlinked" hasn't yet propagated to the
     //    manifest, so truncating would orphan the unlink.
     if failed.is_empty() && pending_failed.is_empty() {
-        if let Some(wal) = &shared.wal {
-            let mut w = wal.lock().unwrap();
+        if let Some(journal) = &shared.journal {
+            let _commit = shared.commit_lock.lock().unwrap();
             if shared.bm.dirty_count() == 0 && shared.bm.pending_delete_count() == 0 {
-                w.truncate()?;
+                journal.truncate()?;
                 shared.truncates.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -354,7 +359,7 @@ pub(super) fn run_round(shared: &Arc<Shared>) -> Result<()> {
         let elapsed = round_start.elapsed();
         let truncated = failed.is_empty()
             && pending_failed.is_empty()
-            && shared.wal.is_some()
+            && shared.journal.is_some()
             && shared.bm.dirty_count() == 0
             && shared.bm.pending_delete_count() == 0;
         tracing::info!(
