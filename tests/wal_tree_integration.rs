@@ -571,6 +571,42 @@ fn batch_persists_through_crash_and_replay() {
 }
 
 #[test]
+fn compact_insert_run_batch_persists_through_replay() {
+    let dir = tempdir().unwrap();
+    let cfg = durable_cfg(dir.path());
+    let mut versions = Vec::new();
+
+    {
+        let tree = Tree::open(cfg.clone()).unwrap();
+        tree.atomic(|b| {
+            for i in 0..16u32 {
+                let key = format!("bulk/object-{i:04}");
+                let value = format!("metadata-{i:04}");
+                b.put(key.as_bytes(), value.as_bytes());
+            }
+        })
+        .unwrap();
+
+        for i in 0..16u32 {
+            let key = format!("bulk/object-{i:04}");
+            versions.push(tree.get_record(key.as_bytes()).unwrap().unwrap().version);
+        }
+    }
+
+    let tree = Tree::open(cfg).unwrap();
+    for i in 0..16u32 {
+        let key = format!("bulk/object-{i:04}");
+        let value = format!("metadata-{i:04}");
+        let record = tree.get_record(key.as_bytes()).unwrap().unwrap();
+        assert_eq!(record.value, value.as_bytes());
+        assert_eq!(
+            record.version, versions[i as usize],
+            "compact insert-run replay must preserve per-inner record versions",
+        );
+    }
+}
+
+#[test]
 fn batch_conditional_ops_replay_with_stable_versions() {
     let dir = tempdir().unwrap();
     let cfg = durable_cfg(dir.path());

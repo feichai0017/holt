@@ -160,6 +160,7 @@ const TY_INSERT: u8 = 0;
 const TY_ERASE: u8 = 1;
 const TY_RENAME_OBJECT: u8 = 5;
 const TY_BATCH: u8 = 10;
+const TY_BATCH_INSERT_RUN: u8 = 11;
 
 // ---------- CRC32 (IEEE 802.3) ----------
 
@@ -288,9 +289,10 @@ pub(crate) const fn encoded_rename_object_record_len(
 /// 1. [`BatchEncoder::begin`] writes the record header and the
 ///    batch body prefix (`tree_id` + zero-placeholder inner-count).
 /// 2. The caller interleaves walker mutations with
-///    [`Self::push_insert`] / [`Self::push_erase`] /
-///    [`Self::push_rename_object`] calls. Each push appends one
-///    `inner_ty | inner_body` block to the body.
+///    [`Self::push_insert`] / [`Self::push_insert_run`] /
+///    [`Self::push_erase`] / [`Self::push_rename_object`] calls.
+///    Each push appends one logical inner op or one compact run
+///    of logical inner ops to the body.
 /// 3. [`Self::finish`] backpatches the inner count + body length
 ///    and appends the CRC. On a successful finish the record is
 ///    fully formed in the underlying buffer.
@@ -351,6 +353,53 @@ impl<'buf> BatchEncoder<'buf> {
         write_bytes(self.out, key);
         write_bytes(self.out, value);
         self.inner_count += 1;
+    }
+
+    /// Append a compact run of consecutive `Insert` inner ops
+    /// where every key and value has the same byte length.
+    ///
+    /// This is still logically `count` primitive insert records:
+    /// replay expands the run back into `Insert` ops with seqs
+    /// `base + logical_index`. The compact wire frame only removes
+    /// repeated inner tags, tree ids, and per-item length prefixes.
+    pub fn push_insert_run<'a, I>(
+        &mut self,
+        tree_id: u64,
+        count: usize,
+        key_len: usize,
+        value_len: usize,
+        items: I,
+    ) where
+        I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    {
+        if count == 1 {
+            let mut iter = items.into_iter();
+            let (key, value) = iter.next().expect("single insert run has one item");
+            debug_assert!(iter.next().is_none());
+            self.push_insert(tree_id, key, value);
+            return;
+        }
+
+        let count_u32 = u32::try_from(count).expect("insert run count fits in u32");
+        let key_len_u32 = u32::try_from(key_len).expect("key length fits in u32");
+        let value_len_u32 = u32::try_from(value_len).expect("value length fits in u32");
+
+        self.out.push(TY_BATCH_INSERT_RUN);
+        self.out.extend_from_slice(&tree_id.to_le_bytes());
+        self.out.extend_from_slice(&count_u32.to_le_bytes());
+        self.out.extend_from_slice(&key_len_u32.to_le_bytes());
+        self.out.extend_from_slice(&value_len_u32.to_le_bytes());
+
+        let mut actual = 0usize;
+        for (key, value) in items {
+            debug_assert_eq!(key.len(), key_len);
+            debug_assert_eq!(value.len(), value_len);
+            self.out.extend_from_slice(key);
+            self.out.extend_from_slice(value);
+            actual += 1;
+        }
+        assert_eq!(actual, count, "insert run item count mismatch");
+        self.inner_count += count_u32;
     }
 
     /// Append one `Erase` inner op.
@@ -569,20 +618,56 @@ fn decode_body_into(ty: u8, body: &mut &[u8], seq: u64) -> Result<WalOp> {
             let tree_id = read_u64(body)?;
             let count = read_u32(body)? as usize;
             let mut ops = Vec::with_capacity(count);
-            for i in 0..count {
+            while ops.len() < count {
                 let inner_ty = read_u8(body)?;
                 if inner_ty == TY_BATCH {
                     return Err(sanity("nested Batch is rejected"));
                 }
-                let inner_seq = seq.wrapping_add(i as u64);
-                let inner = decode_body_into(inner_ty, body, inner_seq)?;
-                ops.push(inner);
+                if inner_ty == TY_BATCH_INSERT_RUN {
+                    decode_insert_run(body, seq, count, &mut ops)?;
+                } else {
+                    let inner_seq = seq.wrapping_add(ops.len() as u64);
+                    let inner = decode_body_into(inner_ty, body, inner_seq)?;
+                    ops.push(inner);
+                }
             }
             WalOp::Batch { tree_id, ops }
         }
         _ => return Err(sanity("unknown WalOp variant tag")),
     };
     Ok(op)
+}
+
+fn decode_insert_run(
+    body: &mut &[u8],
+    base_seq: u64,
+    batch_count: usize,
+    ops: &mut Vec<WalOp>,
+) -> Result<()> {
+    let tree_id = read_u64(body)?;
+    let count = read_u32(body)? as usize;
+    if count == 0 {
+        return Err(sanity("empty BatchInsertRun is rejected"));
+    }
+    if ops.len().saturating_add(count) > batch_count {
+        return Err(sanity("BatchInsertRun exceeds batch inner count"));
+    }
+    let key_len = read_u32(body)? as usize;
+    let value_len = read_u32(body)? as usize;
+    for _ in 0..count {
+        let (key, rest) = take(body, key_len)?;
+        *body = rest;
+        let (value, rest) = take(body, value_len)?;
+        *body = rest;
+        let seq = base_seq.wrapping_add(ops.len() as u64);
+        ops.push(WalOp::Insert {
+            tree_id,
+            seq,
+            key: key.to_vec(),
+            value: value.to_vec(),
+        });
+    }
+    Ok(())
 }
 
 fn read_u8(body: &mut &[u8]) -> Result<u8> {
@@ -1008,6 +1093,63 @@ mod tests {
         assert_eq!(r.seq, base);
         match r.op {
             WalOp::Batch { ops, .. } => assert_eq!(ops.len(), 3),
+            other => panic!("expected Batch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_insert_run_round_trips_and_saves_wire_bytes() {
+        let base = 300u64;
+
+        let mut compact = Vec::new();
+        {
+            let mut enc = BatchEncoder::begin(&mut compact, base, 0);
+            enc.push_insert_run(
+                0,
+                3,
+                4,
+                2,
+                [
+                    (&b"k001"[..], &b"v1"[..]),
+                    (&b"k002"[..], &b"v2"[..]),
+                    (&b"k003"[..], &b"v3"[..]),
+                ],
+            );
+            assert_eq!(enc.finish(), 3);
+        }
+
+        let mut individual = Vec::new();
+        {
+            let mut enc = BatchEncoder::begin(&mut individual, base, 0);
+            enc.push_insert(0, b"k001", b"v1");
+            enc.push_insert(0, b"k002", b"v2");
+            enc.push_insert(0, b"k003", b"v3");
+            assert_eq!(enc.finish(), 3);
+        }
+
+        assert!(
+            compact.len() < individual.len(),
+            "compact insert run should be smaller: compact={}, individual={}",
+            compact.len(),
+            individual.len(),
+        );
+
+        let r = decode_record(&compact).unwrap();
+        match r.op {
+            WalOp::Batch { ops, .. } => {
+                assert_eq!(ops.len(), 3);
+                for (idx, op) in ops.iter().enumerate() {
+                    let WalOp::Insert {
+                        seq, key, value, ..
+                    } = op
+                    else {
+                        panic!("expected insert, got {op:?}");
+                    };
+                    assert_eq!(*seq, base + idx as u64);
+                    assert_eq!(key, format!("k{:03}", idx + 1).as_bytes());
+                    assert_eq!(value, format!("v{}", idx + 1).as_bytes());
+                }
+            }
             other => panic!("expected Batch, got {other:?}"),
         }
     }

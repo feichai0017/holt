@@ -41,6 +41,7 @@
 //!   `rename_lock` (a `Mutex<()>` scoped to rename only) to
 //!   prevent racing renames from interleaving.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -67,6 +68,8 @@ use super::atomic::{AtomicBatch, BatchOp, Record, RecordVersion};
 
 const ONLINE_COMPACT_BLOB_BUDGET: usize = 256;
 const ONLINE_MERGE_PARENT_BUDGET: usize = 256;
+
+type BatchOverlay = HashMap<Vec<u8>, Option<Record>>;
 
 /// An `holt` tree — your handle to one metadata store.
 ///
@@ -172,24 +175,61 @@ pub(crate) const ROOT_BLOB_GUID: BlobGuid = [0; 16];
 
 fn encoded_batch_record_len(ops: &[BatchOp]) -> usize {
     let body_prefix_len = 8 + 4; // tree_id + inner_count
-    RECORD_HEADER_SIZE
-        + body_prefix_len
-        + ops
-            .iter()
-            .filter(|op| op.emits_wal())
-            .map(|op| match op {
-                BatchOp::Put { key, value } => 1 + 8 + 4 + key.len() + 4 + value.len(),
-                BatchOp::PutIfAbsent { key, value } | BatchOp::CompareAndPut { key, value, .. } => {
-                    1 + 8 + 4 + key.len() + 4 + value.len()
-                }
-                BatchOp::Delete { key } | BatchOp::DeleteIfVersion { key, .. } => {
-                    1 + 8 + 4 + key.len()
-                }
-                BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
-                BatchOp::Rename { src, dst, .. } => 1 + 8 + 4 + src.len() + 4 + dst.len() + 1,
-            })
-            .sum::<usize>()
-        + RECORD_FOOTER_SIZE
+    let mut len = RECORD_HEADER_SIZE + body_prefix_len + RECORD_FOOTER_SIZE;
+    let mut i = 0usize;
+    while i < ops.len() {
+        if let Some((key, value)) = batch_insert_parts(&ops[i]) {
+            let run = same_shape_insert_run_len(ops, i);
+            if run > 1 {
+                len += 1 + 8 + 4 + 4 + 4 + run * (key.len() + value.len());
+            } else {
+                len += 1 + 8 + 4 + key.len() + 4 + value.len();
+            }
+            i += run;
+            continue;
+        }
+        len += match &ops[i] {
+            BatchOp::Delete { key } | BatchOp::DeleteIfVersion { key, .. } => 1 + 8 + 4 + key.len(),
+            BatchOp::Rename { src, dst, .. } => 1 + 8 + 4 + src.len() + 4 + dst.len() + 1,
+            BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => 0,
+            BatchOp::Put { .. } | BatchOp::PutIfAbsent { .. } | BatchOp::CompareAndPut { .. } => {
+                unreachable!("insert-like ops handled above")
+            }
+        };
+        i += 1;
+    }
+    len
+}
+
+fn batch_insert_parts(op: &BatchOp) -> Option<(&[u8], &[u8])> {
+    match op {
+        BatchOp::Put { key, value }
+        | BatchOp::PutIfAbsent { key, value }
+        | BatchOp::CompareAndPut { key, value, .. } => Some((key, value)),
+        BatchOp::Delete { .. }
+        | BatchOp::DeleteIfVersion { .. }
+        | BatchOp::AssertVersion { .. }
+        | BatchOp::AssertPrefixEmpty { .. }
+        | BatchOp::Rename { .. } => None,
+    }
+}
+
+fn same_shape_insert_run_len(ops: &[BatchOp], start: usize) -> usize {
+    let Some((first_key, first_value)) = batch_insert_parts(&ops[start]) else {
+        return 0;
+    };
+    let mut end = start + 1;
+    while end < ops.len() {
+        match batch_insert_parts(&ops[end]) {
+            Some((key, value))
+                if key.len() == first_key.len() && value.len() == first_value.len() =>
+            {
+                end += 1;
+            }
+            _ => break,
+        }
+    }
+    end - start
 }
 
 impl Tree {
@@ -836,7 +876,7 @@ impl Tree {
                 let _commit = self.commit_gate.enter_writer();
                 let mut record = Vec::with_capacity(encoded_batch_record_len(&pending));
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
-                self.apply_batch_walker_inline(pending, base_seq, Some(&mut enc))?;
+                self.apply_batch_walker_inline(&pending, base_seq, Some(&mut enc))?;
                 let _n = enc.finish();
                 journal.submit(record, self.cfg.wal_sync_on_commit)?
             };
@@ -844,7 +884,7 @@ impl Tree {
                 ack.wait()?;
             }
         } else {
-            self.apply_batch_walker_inline(pending, base_seq, None)?;
+            self.apply_batch_walker_inline(&pending, base_seq, None)?;
             if self.cfg.memory_flush_on_write {
                 // Every inner op may have dirtied root + cross-blob
                 // children — drain the whole set rather than just
@@ -858,8 +898,12 @@ impl Tree {
     }
 
     fn preflight_batch(&self, pending: &[BatchOp], base_seq: u64) -> Result<bool> {
-        let mut overlay: std::collections::HashMap<Vec<u8>, Option<Record>> =
-            std::collections::HashMap::new();
+        if Self::batch_is_guard_free(pending) {
+            Self::preflight_guard_free_batch(pending)?;
+            return Ok(true);
+        }
+
+        let mut overlay = BatchOverlay::new();
         let mut seq_offset = 0u64;
 
         for op in pending {
@@ -870,112 +914,135 @@ impl Tree {
             } else {
                 base_seq + seq_offset
             };
-            match op {
-                BatchOp::Put { key, value } => {
-                    Self::validate_insert_shape(key, value)?;
-                    overlay.insert(
-                        key.clone(),
-                        Some(Record {
-                            value: value.clone(),
-                            version: RecordVersion::new(seq),
-                        }),
-                    );
-                }
-                BatchOp::PutIfAbsent { key, value } => {
-                    Self::validate_insert_shape(key, value)?;
-                    if self.projected_record(&overlay, key)?.is_some() {
-                        return Ok(false);
-                    }
-                    overlay.insert(
-                        key.clone(),
-                        Some(Record {
-                            value: value.clone(),
-                            version: RecordVersion::new(seq),
-                        }),
-                    );
-                }
-                BatchOp::CompareAndPut {
-                    key,
-                    expected,
-                    value,
-                } => {
-                    Self::validate_insert_shape(key, value)?;
-                    match self.projected_record(&overlay, key)? {
-                        Some(record) if record.version == *expected => {
-                            overlay.insert(
-                                key.clone(),
-                                Some(Record {
-                                    value: value.clone(),
-                                    version: RecordVersion::new(seq),
-                                }),
-                            );
-                        }
-                        _ => return Ok(false),
-                    }
-                }
-                BatchOp::Delete { key } => {
-                    overlay.insert(key.clone(), None);
-                }
-                BatchOp::DeleteIfVersion { key, expected } => {
-                    match self.projected_record(&overlay, key)? {
-                        Some(record) if record.version == *expected => {
-                            overlay.insert(key.clone(), None);
-                        }
-                        _ => return Ok(false),
-                    }
-                }
-                BatchOp::AssertVersion { key, expected } => {
-                    match self.projected_record(&overlay, key)? {
-                        Some(record) if record.version == *expected => {}
-                        _ => return Ok(false),
-                    }
-                }
-                BatchOp::AssertPrefixEmpty { prefix } => {
-                    if !self.projected_prefix_empty(&overlay, prefix)? {
-                        return Ok(false);
-                    }
-                }
-                BatchOp::Rename { src, dst, force } => {
-                    let Some(src_record) = self.projected_record(&overlay, src)? else {
-                        return Err(Error::NotFound);
-                    };
-                    if src == dst {
-                        continue;
-                    }
-                    if !*force && self.projected_record(&overlay, dst)?.is_some() {
-                        return Err(Error::DstExists);
-                    }
-                    Self::validate_insert_shape(dst, &src_record.value)?;
-                    overlay.insert(src.clone(), None);
-                    overlay.insert(
-                        dst.clone(),
-                        Some(Record {
-                            value: src_record.value,
-                            version: RecordVersion::new(seq),
-                        }),
-                    );
-                }
+            if !self.preflight_batch_op(&mut overlay, op, seq)? {
+                return Ok(false);
             }
         }
         Ok(true)
     }
 
-    fn projected_record(
+    fn preflight_batch_op(
         &self,
-        overlay: &std::collections::HashMap<Vec<u8>, Option<Record>>,
-        key: &[u8],
-    ) -> Result<Option<Record>> {
+        overlay: &mut BatchOverlay,
+        op: &BatchOp,
+        seq: u64,
+    ) -> Result<bool> {
+        match op {
+            BatchOp::Put { key, value } => {
+                Self::validate_insert_shape(key, value)?;
+                Self::overlay_put(overlay, key, value, seq);
+            }
+            BatchOp::PutIfAbsent { key, value } => {
+                Self::validate_insert_shape(key, value)?;
+                if self.projected_record(overlay, key)?.is_some() {
+                    return Ok(false);
+                }
+                Self::overlay_put(overlay, key, value, seq);
+            }
+            BatchOp::CompareAndPut {
+                key,
+                expected,
+                value,
+            } => {
+                Self::validate_insert_shape(key, value)?;
+                match self.projected_record(overlay, key)? {
+                    Some(record) if record.version == *expected => {
+                        Self::overlay_put(overlay, key, value, seq);
+                    }
+                    _ => return Ok(false),
+                }
+            }
+            BatchOp::Delete { key } => {
+                overlay.insert(key.clone(), None);
+            }
+            BatchOp::DeleteIfVersion { key, expected } => {
+                match self.projected_record(overlay, key)? {
+                    Some(record) if record.version == *expected => {
+                        overlay.insert(key.clone(), None);
+                    }
+                    _ => return Ok(false),
+                }
+            }
+            BatchOp::AssertVersion { key, expected } => {
+                match self.projected_record(overlay, key)? {
+                    Some(record) if record.version == *expected => {}
+                    _ => return Ok(false),
+                }
+            }
+            BatchOp::AssertPrefixEmpty { prefix } => {
+                if !self.projected_prefix_empty(overlay, prefix)? {
+                    return Ok(false);
+                }
+            }
+            BatchOp::Rename { src, dst, force } => {
+                self.preflight_rename_op(overlay, src, dst, *force, seq)?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn preflight_rename_op(
+        &self,
+        overlay: &mut BatchOverlay,
+        src: &[u8],
+        dst: &[u8],
+        force: bool,
+        seq: u64,
+    ) -> Result<()> {
+        let Some(src_record) = self.projected_record(overlay, src)? else {
+            return Err(Error::NotFound);
+        };
+        if src == dst {
+            return Ok(());
+        }
+        if !force && self.projected_record(overlay, dst)?.is_some() {
+            return Err(Error::DstExists);
+        }
+        Self::validate_insert_shape(dst, &src_record.value)?;
+        overlay.insert(src.to_vec(), None);
+        overlay.insert(
+            dst.to_vec(),
+            Some(Record {
+                value: src_record.value,
+                version: RecordVersion::new(seq),
+            }),
+        );
+        Ok(())
+    }
+
+    fn overlay_put(overlay: &mut BatchOverlay, key: &[u8], value: &[u8], seq: u64) {
+        overlay.insert(
+            key.to_vec(),
+            Some(Record {
+                value: value.to_vec(),
+                version: RecordVersion::new(seq),
+            }),
+        );
+    }
+
+    fn batch_is_guard_free(pending: &[BatchOp]) -> bool {
+        pending
+            .iter()
+            .all(|op| matches!(op, BatchOp::Put { .. } | BatchOp::Delete { .. }))
+    }
+
+    fn preflight_guard_free_batch(pending: &[BatchOp]) -> Result<()> {
+        for op in pending {
+            if let BatchOp::Put { key, value } = op {
+                Self::validate_insert_shape(key, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn projected_record(&self, overlay: &BatchOverlay, key: &[u8]) -> Result<Option<Record>> {
         match overlay.get(key) {
             Some(record) => Ok(record.clone()),
             None => self.lookup_record_unlocked(key),
         }
     }
 
-    fn projected_prefix_empty(
-        &self,
-        overlay: &std::collections::HashMap<Vec<u8>, Option<Record>>,
-        prefix: &[u8],
-    ) -> Result<bool> {
+    fn projected_prefix_empty(&self, overlay: &BatchOverlay, prefix: &[u8]) -> Result<bool> {
         if overlay
             .iter()
             .any(|(key, record)| record.is_some() && key.starts_with(prefix))
@@ -1018,12 +1085,38 @@ impl Tree {
     #[allow(clippy::too_many_lines)] // one explicit match keeps batch apply order auditable
     fn apply_batch_walker_inline(
         &self,
-        pending: Vec<BatchOp>,
+        pending: &[BatchOp],
         base_seq: u64,
         mut enc: Option<&mut crate::journal::codec::BatchEncoder<'_>>,
     ) -> Result<()> {
         let mut seq_offset = 0u64;
-        for op in pending {
+        let mut i = 0usize;
+        while i < pending.len() {
+            if batch_insert_parts(&pending[i]).is_some() {
+                let run_len = same_shape_insert_run_len(pending, i);
+                for op in &pending[i..i + run_len] {
+                    let seq = base_seq + seq_offset;
+                    seq_offset += 1;
+                    self.apply_batch_insert_walker(op, seq)?;
+                }
+                if let Some(enc) = enc.as_deref_mut() {
+                    let (key, value) = batch_insert_parts(&pending[i])
+                        .expect("insert run begins with insert-like op");
+                    enc.push_insert_run(
+                        0,
+                        run_len,
+                        key.len(),
+                        value.len(),
+                        pending[i..i + run_len]
+                            .iter()
+                            .map(|op| batch_insert_parts(op).expect("same-shape insert run")),
+                    );
+                }
+                i += run_len;
+                continue;
+            }
+
+            let op = &pending[i];
             let seq = if op.emits_wal() {
                 let seq = base_seq + seq_offset;
                 seq_offset += 1;
@@ -1032,81 +1125,13 @@ impl Tree {
                 base_seq + seq_offset
             };
             match op {
-                BatchOp::Put { key, value } => {
-                    let search = engine::SearchKey::user(&key);
-                    let outcome = engine::insert_multi(
-                        &self.store,
-                        &self.root_pin,
-                        Some(&self.route_cache),
-                        search,
-                        &value,
-                        seq,
-                        false,
-                    )?;
-                    if outcome.root_dirty {
-                        self.store
-                            .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
-                    }
-                    if let Some(enc) = enc.as_deref_mut() {
-                        enc.push_insert(0, &key, &value);
-                    }
-                }
-                BatchOp::PutIfAbsent { key, value } => {
-                    let search = engine::SearchKey::user(&key);
-                    let outcome = engine::insert_multi_conditional(
-                        &self.store,
-                        &self.root_pin,
-                        Some(&self.route_cache),
-                        search,
-                        &value,
-                        seq,
-                        false,
-                        engine::InsertCondition::IfAbsent,
-                    )?;
-                    if !outcome.mutated {
-                        return Err(Error::Internal(
-                            "atomic preflight missed put_if_absent guard",
-                        ));
-                    }
-                    if outcome.root_dirty {
-                        self.store
-                            .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
-                    }
-                    if let Some(enc) = enc.as_deref_mut() {
-                        enc.push_insert(0, &key, &value);
-                    }
-                }
-                BatchOp::CompareAndPut {
-                    key,
-                    expected,
-                    value,
-                } => {
-                    let search = engine::SearchKey::user(&key);
-                    let outcome = engine::insert_multi_conditional(
-                        &self.store,
-                        &self.root_pin,
-                        Some(&self.route_cache),
-                        search,
-                        &value,
-                        seq,
-                        false,
-                        engine::InsertCondition::IfVersion(expected.as_u64()),
-                    )?;
-                    if !outcome.mutated {
-                        return Err(Error::Internal(
-                            "atomic preflight missed compare_and_put guard",
-                        ));
-                    }
-                    if outcome.root_dirty {
-                        self.store
-                            .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
-                    }
-                    if let Some(enc) = enc.as_deref_mut() {
-                        enc.push_insert(0, &key, &value);
-                    }
+                BatchOp::Put { .. }
+                | BatchOp::PutIfAbsent { .. }
+                | BatchOp::CompareAndPut { .. } => {
+                    unreachable!("insert-like ops are handled by the run path");
                 }
                 BatchOp::Delete { key } => {
-                    let search = engine::SearchKey::user(&key);
+                    let search = engine::SearchKey::user(key);
                     let outcome = engine::erase_multi(
                         &self.store,
                         &self.root_pin,
@@ -1124,11 +1149,11 @@ impl Tree {
                     // to keep later record versions stable across
                     // crash/replay.
                     if let Some(enc) = enc.as_deref_mut() {
-                        enc.push_erase(0, &key);
+                        enc.push_erase(0, key);
                     }
                 }
                 BatchOp::DeleteIfVersion { key, expected } => {
-                    let search = engine::SearchKey::user(&key);
+                    let search = engine::SearchKey::user(key);
                     let outcome = engine::erase_multi_conditional(
                         &self.store,
                         &self.root_pin,
@@ -1148,17 +1173,66 @@ impl Tree {
                             .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                     }
                     if let Some(enc) = enc.as_deref_mut() {
-                        enc.push_erase(0, &key);
+                        enc.push_erase(0, key);
                     }
                 }
                 BatchOp::AssertVersion { .. } | BatchOp::AssertPrefixEmpty { .. } => {}
                 BatchOp::Rename { src, dst, force } => {
-                    self.apply_batch_rename_walker(&src, &dst, force, seq)?;
+                    self.apply_batch_rename_walker(src, dst, *force, seq)?;
                     if let Some(enc) = enc.as_deref_mut() {
-                        enc.push_rename_object(0, &src, &dst, force);
+                        enc.push_rename_object(0, src, dst, *force);
                     }
                 }
             }
+            i += 1;
+        }
+        Ok(())
+    }
+
+    fn apply_batch_insert_walker(&self, op: &BatchOp, seq: u64) -> Result<()> {
+        let (key, value, condition) = match op {
+            BatchOp::Put { key, value } => (key, value, engine::InsertCondition::Always),
+            BatchOp::PutIfAbsent { key, value } => (key, value, engine::InsertCondition::IfAbsent),
+            BatchOp::CompareAndPut {
+                key,
+                expected,
+                value,
+            } => (
+                key,
+                value,
+                engine::InsertCondition::IfVersion(expected.as_u64()),
+            ),
+            BatchOp::Delete { .. }
+            | BatchOp::DeleteIfVersion { .. }
+            | BatchOp::AssertVersion { .. }
+            | BatchOp::AssertPrefixEmpty { .. }
+            | BatchOp::Rename { .. } => unreachable!("not an insert-like batch op"),
+        };
+
+        let search = engine::SearchKey::user(key);
+        let outcome = engine::insert_multi_conditional(
+            &self.store,
+            &self.root_pin,
+            Some(&self.route_cache),
+            search,
+            value,
+            seq,
+            false,
+            condition,
+        )?;
+        if !outcome.mutated {
+            let context = match condition {
+                engine::InsertCondition::Always => "atomic insert unexpectedly did not mutate",
+                engine::InsertCondition::IfAbsent => "atomic preflight missed put_if_absent guard",
+                engine::InsertCondition::IfVersion(_) => {
+                    "atomic preflight missed compare_and_put guard"
+                }
+            };
+            return Err(Error::Internal(context));
+        }
+        if outcome.root_dirty {
+            self.store
+                .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
         }
         Ok(())
     }
