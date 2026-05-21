@@ -65,6 +65,14 @@ checkpoints. It reports checkpoint percentiles plus
 append-only manifest path can be tracked separately from point
 lookup/insert microbenches.
 
+A sixth probe — **WAL/checkpoint fast paths** — lives in
+`tests/bench_wal_checkpoint.rs`. It separates clean foreground
+checkpoints, durable group-commit reuse, default non-durable
+checkpoint barriers, and background idle rounds. The timing table
+is paired with journal `syncs` / checkpointer `truncates`
+counters, so regressions show up even when data-file flush cost
+dominates wall-clock latency.
+
 ## Running
 
 ```sh
@@ -104,6 +112,16 @@ cargo test --release --test bench_manifest_checkpoint \
 HOLT_MANIFEST_BENCH_ROUNDS=3 \
 HOLT_MANIFEST_BENCH_KEYS_PER_ROUND=1000 \
 cargo test --release --test bench_manifest_checkpoint \
+    -- --ignored --nocapture
+
+# WAL/checkpoint fast paths:
+cargo test --release --test bench_wal_checkpoint \
+    -- --ignored --nocapture
+
+# Short WAL/checkpoint smoke:
+HOLT_WAL_BENCH_CLEAN_ITERS=50 \
+HOLT_WAL_BENCH_MUTATIONS=10 \
+cargo test --release --test bench_wal_checkpoint \
     -- --ignored --nocapture
 ```
 

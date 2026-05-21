@@ -200,6 +200,12 @@ threads. v0.3 makes the I/O side worth that structure:
   without paying an unrelated backend Sync. WAL truncate itself is
   an in-place `ftruncate` + `sync_data`, avoiding the older
   temp-file write, rename, and fd reopen after every checkpoint.
+- `tests/bench_wal_checkpoint.rs` now isolates those fast paths:
+  clean checkpoints, durable group-commit reuse, default
+  checkpoint WAL barriers, and background idle rounds. It reports
+  latency percentiles together with journal `syncs` and
+  checkpointer `truncates`, so future checkpoint/I/O work can
+  distinguish data-file cost from accidental WAL re-sync work.
 
 ### P3 — CPU hot-path work
 
