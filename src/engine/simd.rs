@@ -1,6 +1,6 @@
 //! SIMD hot paths used by the walker.
 //!
-//! Four operations dominate the ART walker's byte-scan cost:
+//! Five operations dominate the ART walker's byte-scan cost:
 //!
 //! 1. **Node16 byte search** — find the index `i` in `keys[0..count]`
 //!    such that `keys[i] == byte`. The scalar form is a 16-iteration
@@ -17,12 +17,14 @@
 //!    `children[256]` (the slot-index array) starting from
 //!    `start`. Same shape as #3 but on `u32` lanes.
 //!    [`find_next_nonzero_u32`].
+//! 5. **Delimiter byte scan** — find `/` or another delimiter in a
+//!    leaf suffix during S3/POSIX rollup iteration.
+//!    [`find_byte`].
 //!
-//! Dispatch is compile-time only — `cfg(target_arch = ...)` selects
-//! the SSE2 path on x86_64 (always available — SSE2 is part of the
-//! base x86_64 ISA), the NEON path on aarch64 (also always
-//! available), and a scalar fallback otherwise. Behaviour is
-//! identical across paths; the scalar form is the spec.
+//! Dispatch is architecture-local: x86_64 uses SSE2 as the base
+//! path and upgrades long scans to AVX2 when available; aarch64
+//! uses NEON; other targets use scalar code. Behaviour is identical
+//! across paths; the scalar form is the spec.
 
 // ---------------------------------------------------------------
 // Public API
@@ -74,6 +76,17 @@ pub fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
     let mut i = 0;
 
     #[cfg(target_arch = "x86_64")]
+    if limit >= 64 && x86::avx2_available() {
+        while i + 32 <= limit {
+            let mask = unsafe { x86::cmp_32_bytes_bitmask(a[i..].as_ptr(), b[i..].as_ptr()) };
+            if mask != u32::MAX {
+                return i + mask.trailing_ones() as usize;
+            }
+            i += 32;
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
     while i + 16 <= limit {
         let mask = unsafe { x86::cmp_16_bytes_bitmask(a[i..].as_ptr(), b[i..].as_ptr()) };
         if mask != 0xFFFF {
@@ -103,6 +116,52 @@ pub fn longest_common_prefix(a: &[u8], b: &[u8]) -> usize {
 }
 
 /// Find the smallest index `i ∈ [start, bytes.len())` with
+/// `bytes[i] == needle`, or `None` if the byte is absent.
+///
+/// This is the generic slice version of the Node16 byte search. It
+/// exists for delimiter-heavy metadata scans (`list_dir`,
+/// S3-style `LIST prefix + delimiter`) where every yielded leaf used
+/// to pay a scalar `position()` walk over the path suffix.
+#[inline]
+pub fn find_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
+    let len = bytes.len();
+    if start >= len {
+        return None;
+    }
+    let mut i = start;
+
+    #[cfg(target_arch = "x86_64")]
+    if len - i >= 64 && x86::avx2_available() {
+        while i + 32 <= len {
+            let ptr = unsafe { bytes.as_ptr().add(i) };
+            let mask = unsafe { x86::cmp_byte_eq_mask_32(ptr, needle) };
+            if mask != 0 {
+                return Some(i + mask.trailing_zeros() as usize);
+            }
+            i += 32;
+        }
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    while i + 16 <= len {
+        let ptr = unsafe { bytes.as_ptr().add(i) };
+        let mask = unsafe { byte_eq_mask_16(ptr, needle) };
+        if mask != 0 {
+            return Some(i + mask.trailing_zeros() as usize);
+        }
+        i += 16;
+    }
+
+    while i < len {
+        if bytes[i] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the smallest index `i ∈ [start, bytes.len())` with
 /// `bytes[i] != 0`, or `None` if every byte from `start` onwards
 /// is zero.
 ///
@@ -117,6 +176,18 @@ pub fn find_next_nonzero_byte(bytes: &[u8], start: usize) -> Option<usize> {
         return None;
     }
     let mut i = start;
+
+    #[cfg(target_arch = "x86_64")]
+    if len - i >= 64 && x86::avx2_available() {
+        while i + 32 <= len {
+            let ptr = unsafe { bytes.as_ptr().add(i) };
+            let mask = unsafe { x86::cmp_byte_neq_zero_mask_32(ptr) };
+            if mask != 0 {
+                return Some(i + mask.trailing_zeros() as usize);
+            }
+            i += 32;
+        }
+    }
 
     // Align the SIMD window to whole 16-byte chunks. The tail (and
     // an unaligned `start`) falls through to the scalar loop below.
@@ -155,6 +226,18 @@ pub fn find_next_nonzero_u32(words: &[u32], start: usize) -> Option<usize> {
     }
     let mut i = start;
 
+    #[cfg(target_arch = "x86_64")]
+    if len - i >= 16 && x86::avx2_available() {
+        while i + 8 <= len {
+            let ptr = unsafe { words.as_ptr().add(i) };
+            let mask = unsafe { x86::cmp_u32_neq_zero_mask_8(ptr) };
+            if mask != 0 {
+                return Some(i + mask.trailing_zeros() as usize);
+            }
+            i += 8;
+        }
+    }
+
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     while i + 4 <= len {
         let ptr = unsafe { words.as_ptr().add(i) };
@@ -180,6 +263,12 @@ pub fn find_next_nonzero_u32(words: &[u32], start: usize) -> Option<usize> {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
+unsafe fn byte_eq_mask_16(ptr: *const u8, needle: u8) -> u32 {
+    unsafe { x86::cmp_byte_eq_mask_16(ptr, needle) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
 unsafe fn nonzero_byte_mask_16(ptr: *const u8) -> u32 {
     // Compare 16 bytes against zero, then *invert* the mask so 1
     // means "non-zero".
@@ -190,6 +279,12 @@ unsafe fn nonzero_byte_mask_16(ptr: *const u8) -> u32 {
 #[inline]
 unsafe fn nonzero_u32_mask_4(ptr: *const u32) -> u32 {
     unsafe { x86::cmp_u32_neq_zero_mask_4(ptr) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn byte_eq_mask_16(ptr: *const u8, needle: u8) -> u32 {
+    unsafe { arm::cmp_byte_eq_mask_16(ptr, needle) }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -211,9 +306,16 @@ unsafe fn nonzero_u32_mask_4(ptr: *const u32) -> u32 {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::{
-        __m128i, _mm_cmpeq_epi32, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8,
-        _mm_movemask_ps, _mm_set1_epi8, _mm_setzero_si128,
+        __m128i, __m256i, _mm256_cmpeq_epi32, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_movemask_ps, _mm256_set1_epi8, _mm256_setzero_si256,
+        _mm_cmpeq_epi32, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_movemask_ps,
+        _mm_set1_epi8, _mm_setzero_si128,
     };
+
+    #[inline]
+    pub(super) fn avx2_available() -> bool {
+        cfg!(target_feature = "avx2") || std::arch::is_x86_feature_detected!("avx2")
+    }
 
     /// Compare 16 bytes from `a` against 16 from `b`. Returns a
     /// 16-bit bitmask: bit `i` = 1 iff `a[i] == b[i]`. Caller
@@ -224,6 +326,41 @@ mod x86 {
         let vb = unsafe { _mm_loadu_si128(b.cast::<__m128i>()) };
         let cmp = _mm_cmpeq_epi8(va, vb);
         _mm_movemask_epi8(cmp) as u32
+    }
+
+    /// Compare 32 bytes from `a` against 32 from `b`. Returns a
+    /// 32-bit bitmask: bit `i` = 1 iff `a[i] == b[i]`.
+    /// Caller guarantees AVX2 support and both pointers are at
+    /// least 32 bytes valid.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub(super) unsafe fn cmp_32_bytes_bitmask(a: *const u8, b: *const u8) -> u32 {
+        let va = unsafe { _mm256_loadu_si256(a.cast::<__m256i>()) };
+        let vb = unsafe { _mm256_loadu_si256(b.cast::<__m256i>()) };
+        let cmp = _mm256_cmpeq_epi8(va, vb);
+        _mm256_movemask_epi8(cmp) as u32
+    }
+
+    /// 16-bit mask where bit `i = 1` iff byte `i` equals `needle`.
+    /// Caller guarantees `ptr` is at least 16 bytes valid.
+    #[inline]
+    pub(super) unsafe fn cmp_byte_eq_mask_16(ptr: *const u8, needle: u8) -> u32 {
+        let vec = unsafe { _mm_loadu_si128(ptr.cast::<__m128i>()) };
+        let needle = _mm_set1_epi8(needle as i8);
+        let cmp = _mm_cmpeq_epi8(vec, needle);
+        _mm_movemask_epi8(cmp) as u32
+    }
+
+    /// 32-bit mask where bit `i = 1` iff byte `i` equals `needle`.
+    /// Caller guarantees AVX2 support and `ptr` is at least 32
+    /// bytes valid.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub(super) unsafe fn cmp_byte_eq_mask_32(ptr: *const u8, needle: u8) -> u32 {
+        let vec = unsafe { _mm256_loadu_si256(ptr.cast::<__m256i>()) };
+        let needle = _mm256_set1_epi8(needle as i8);
+        let cmp = _mm256_cmpeq_epi8(vec, needle);
+        _mm256_movemask_epi8(cmp) as u32
     }
 
     /// Find `byte` in 16 keys; return the first matching index or
@@ -264,6 +401,19 @@ mod x86 {
         (!zero_mask) & 0xFFFF
     }
 
+    /// 32-bit mask where bit `i = 1` iff byte `i` of the 32-byte
+    /// window is **non-zero**. Caller guarantees AVX2 support and
+    /// `ptr` is at least 32 bytes valid.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub(super) unsafe fn cmp_byte_neq_zero_mask_32(ptr: *const u8) -> u32 {
+        let vec = unsafe { _mm256_loadu_si256(ptr.cast::<__m256i>()) };
+        let zero = _mm256_setzero_si256();
+        let cmp_eq_zero = _mm256_cmpeq_epi8(vec, zero);
+        let zero_mask = _mm256_movemask_epi8(cmp_eq_zero) as u32;
+        !zero_mask
+    }
+
     /// 4-bit mask where bit `i = 1` iff `u32` lane `i` of the
     /// 4-lane window at `ptr` is **non-zero**. Caller guarantees
     /// `ptr` is at least 16 bytes (4 × `u32`) valid.
@@ -281,6 +431,21 @@ mod x86 {
             unsafe { std::mem::transmute::<__m128i, std::arch::x86_64::__m128>(cmp_eq_zero) };
         let zero_mask = (_mm_movemask_ps(as_ps) as u32) & 0xF;
         (!zero_mask) & 0xF
+    }
+
+    /// 8-bit mask where bit `i = 1` iff `u32` lane `i` of the
+    /// 8-lane window at `ptr` is **non-zero**. Caller guarantees
+    /// AVX2 support and `ptr` is at least 32 bytes valid.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub(super) unsafe fn cmp_u32_neq_zero_mask_8(ptr: *const u32) -> u32 {
+        let vec = unsafe { _mm256_loadu_si256(ptr.cast::<__m256i>()) };
+        let zero = _mm256_setzero_si256();
+        let cmp_eq_zero = _mm256_cmpeq_epi32(vec, zero);
+        let as_ps =
+            unsafe { std::mem::transmute::<__m256i, std::arch::x86_64::__m256>(cmp_eq_zero) };
+        let zero_mask = (_mm256_movemask_ps(as_ps) as u32) & 0xFF;
+        (!zero_mask) & 0xFF
     }
 }
 
@@ -303,6 +468,19 @@ mod arm {
     unsafe fn byte_mask_to_nibble_u64(cmp: uint8x16_t) -> u64 {
         let narrow = vshrn_n_u16::<4>(vreinterpretq_u16_u8(cmp));
         vget_lane_u64::<0>(vreinterpret_u64_u8(narrow))
+    }
+
+    /// Compress the low bit of each 4-bit nibble into the low
+    /// 16 bits. Input nibbles are expected to be either `0x0` or
+    /// `0xF`, as produced by [`byte_mask_to_nibble_u64`].
+    #[inline]
+    fn nibble_mask_to_bitmask_16(nib: u64) -> u32 {
+        let mut x = nib & 0x1111_1111_1111_1111;
+        x = (x | (x >> 3)) & 0x0303_0303_0303_0303;
+        x = (x | (x >> 6)) & 0x000f_000f_000f_000f;
+        x = (x | (x >> 12)) & 0x0000_00ff_0000_00ff;
+        x = (x | (x >> 24)) & 0x0000_0000_0000_ffff;
+        x as u32
     }
 
     /// Compare 16 bytes; return a 64-bit nibble-mask (see
@@ -339,6 +517,17 @@ mod arm {
         }
     }
 
+    /// 16-bit mask where bit `i = 1` iff byte `i` equals `needle`.
+    /// Caller guarantees `ptr` is at least 16 bytes valid.
+    #[inline]
+    pub(super) unsafe fn cmp_byte_eq_mask_16(ptr: *const u8, needle: u8) -> u32 {
+        let vec = unsafe { vld1q_u8(ptr) };
+        let needle = vdupq_n_u8(needle);
+        let cmp = vceqq_u8(vec, needle);
+        let nib = unsafe { byte_mask_to_nibble_u64(cmp) };
+        nibble_mask_to_bitmask_16(nib)
+    }
+
     /// 16-bit mask where bit `i = 1` iff byte `i` of the 16-byte
     /// window at `ptr` is **non-zero**. Caller guarantees `ptr` is
     /// at least 16 bytes valid.
@@ -355,22 +544,11 @@ mod arm {
         let cmp_eq_zero = vceqq_u8(vec, zero);
         let cmp_neq_zero = vmvnq_u8(cmp_eq_zero);
         // Each byte lane is 0xFF for non-zero, 0x00 for zero;
-        // shrink to a 64-bit nibble mask, then collapse adjacent
-        // nibble pairs into a single bit per byte.
+        // shrink to a 64-bit nibble mask, then compact one bit per
+        // nibble with SWAR. This avoids the previous per-chunk
+        // 16-iteration scalar collapse on Apple Silicon.
         let nib = unsafe { byte_mask_to_nibble_u64(cmp_neq_zero) };
-        // bit_i_of_output = OR of nibble_2i and nibble_2i+1 ...
-        // but since each nibble is either 0xF or 0x0, we can
-        // just observe: nibble != 0  ⟺  byte != 0. So pick the
-        // low bit of each nibble.
-        let mut out: u32 = 0;
-        let mut i = 0;
-        while i < 16 {
-            if ((nib >> (i * 4)) & 0xF) != 0 {
-                out |= 1u32 << i;
-            }
-            i += 1;
-        }
-        out
+        nibble_mask_to_bitmask_16(nib)
     }
 
     /// 4-bit mask where bit `i = 1` iff `u32` lane `i` of the
@@ -380,23 +558,17 @@ mod arm {
     pub(super) unsafe fn cmp_u32_neq_zero_mask_4(ptr: *const u32) -> u32 {
         let vec = unsafe { vld1q_u32(ptr) };
         let zero = vdupq_n_u32(0);
-        let cmp_eq_zero = vceqq_u32(vec, zero); // 0xFFFFFFFF where zero
-        let cmp_neq_zero = vmvnq_u32(cmp_eq_zero); // 0xFFFFFFFF where non-zero
-                                                   // Reinterpret as u8 and reuse the nibble-shrink. Each
-                                                   // u32 lane occupies 8 nibbles in the output (all 0xF for
-                                                   // non-zero, all 0x0 for zero); sample one nibble per
-                                                   // lane.
+        // 0xFFFFFFFF where zero.
+        let cmp_eq_zero = vceqq_u32(vec, zero);
+        // 0xFFFFFFFF where non-zero.
+        let cmp_neq_zero = vmvnq_u32(cmp_eq_zero);
+        // Reinterpret as u8 and reuse the nibble-shrink. Each u32
+        // lane occupies 8 nibbles in the output; sample one byte
+        // bit per lane, then compact those lane bits to low 4 bits.
         let as_bytes = vreinterpretq_u8_u32(cmp_neq_zero);
         let nib = unsafe { byte_mask_to_nibble_u64(as_bytes) };
-        let mut out: u32 = 0;
-        let mut i = 0;
-        while i < 4 {
-            if ((nib >> ((i * 4) * 4)) & 0xF) != 0 {
-                out |= 1u32 << i;
-            }
-            i += 1;
-        }
-        out
+        let byte_bits = nibble_mask_to_bitmask_16(nib);
+        nibble_mask_to_bitmask_16(u64::from(byte_bits & 0x1111)) & 0xF
     }
 }
 
@@ -557,6 +729,61 @@ mod tests {
         let a = b"aaaaaaaaaaaaaaaaXrest";
         let b = b"aaaaaaaaaaaaaaaaYrest";
         assert_eq!(longest_common_prefix(a, b), 16);
+    }
+
+    // ---- find_byte ----
+
+    fn scalar_find_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
+        bytes
+            .iter()
+            .enumerate()
+            .skip(start)
+            .find(|(_, b)| **b == needle)
+            .map(|(i, _)| i)
+    }
+
+    #[test]
+    fn find_byte_respects_start_and_boundaries() {
+        let mut bytes = [b'a'; 96];
+        for pos in [0usize, 1, 15, 16, 17, 31, 32, 63, 64, 95] {
+            bytes.fill(b'a');
+            bytes[pos] = b'/';
+            assert_eq!(find_byte(&bytes, b'/', 0), Some(pos), "pos={pos}");
+            assert_eq!(find_byte(&bytes, b'/', pos), Some(pos), "pos={pos}");
+            if pos + 1 < bytes.len() {
+                assert_eq!(find_byte(&bytes, b'/', pos + 1), None, "pos={pos}");
+            }
+        }
+    }
+
+    #[test]
+    fn find_byte_random_matches_scalar() {
+        let mut state: u64 = 0xA11C_E55E_D15C_0DED;
+        let step = |s: &mut u64| -> u8 {
+            *s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*s >> 33) as u8
+        };
+        for len in [0usize, 1, 3, 15, 16, 17, 31, 32, 33, 127, 255] {
+            let mut bytes = vec![0u8; len];
+            for b in &mut bytes {
+                *b = step(&mut state);
+            }
+            for _ in 0..32 {
+                let needle = step(&mut state);
+                let start = if len == 0 {
+                    0
+                } else {
+                    (step(&mut state) as usize) % (len + 1)
+                };
+                assert_eq!(
+                    find_byte(&bytes, needle, start),
+                    scalar_find_byte(&bytes, needle, start),
+                    "len={len} start={start} needle={needle}",
+                );
+            }
+        }
     }
 
     // ---- find_next_nonzero_byte ----

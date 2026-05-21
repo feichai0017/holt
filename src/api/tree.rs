@@ -59,7 +59,7 @@ use crate::journal::group_commit::Journal;
 use crate::journal::reader::replay;
 use crate::journal::txn_op::TxnOp;
 use crate::layout::{BlobGuid, PAGE_SIZE};
-use crate::store::backend::{AlignedBlobBuf, Backend, MemoryBackend, PersistentBackend};
+use crate::store::backend::{Backend, MemoryBackend, PersistentBackend};
 use crate::store::buffer_manager::WriteThroughEntry;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
@@ -195,7 +195,19 @@ impl Tree {
     pub fn open(cfg: TreeConfig) -> Result<Self> {
         let backend: Arc<dyn Backend> = match &cfg.storage {
             Storage::Memory => Arc::new(MemoryBackend::new()),
-            Storage::Persistent { dir } => Arc::new(PersistentBackend::open(dir)?),
+            Storage::Persistent { dir } => {
+                #[cfg(all(target_os = "linux", feature = "io-uring"))]
+                {
+                    Arc::new(PersistentBackend::open_with_buffer_pool_hint(
+                        dir,
+                        cfg.buffer_pool_size,
+                    )?)
+                }
+                #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+                {
+                    Arc::new(PersistentBackend::open(dir)?)
+                }
+            }
         };
         // The auto-managed backend earns automatic WAL coverage.
         Self::open_inner(cfg, backend, /*attach_wal=*/ true)
@@ -228,7 +240,7 @@ impl Tree {
         let root_guid = ROOT_BLOB_GUID;
         if !bm.has_blob(root_guid)? {
             // Seed an empty root blob and write it through.
-            let mut scratch = AlignedBlobBuf::zeroed();
+            let mut scratch = bm.alloc_blob_buf_zeroed();
             BlobFrame::init(scratch.as_mut_slice(), root_guid)?;
             bm.write_blob(root_guid, &scratch)?;
             bm.flush()?;

@@ -24,6 +24,8 @@ pub mod memory;
 pub mod persistent;
 
 pub use aligned::AlignedBlobBuf;
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+pub(crate) use aligned::BlobBufPool;
 pub use memory::MemoryBackend;
 pub use persistent::PersistentBackend;
 
@@ -46,6 +48,21 @@ use crate::layout::BlobGuid;
 /// - `flush` blocks until **every** write that returned before the
 ///   call is durable on the underlying medium.
 pub trait Backend: Send + Sync {
+    /// Allocate a zero-filled blob buffer suitable for this backend.
+    ///
+    /// The default is a heap-backed 4 KB-aligned frame. Linux
+    /// `io_uring` persistent backends override this to lease from
+    /// their registered fixed-buffer pool when available.
+    fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf {
+        AlignedBlobBuf::zeroed()
+    }
+
+    /// Allocate an uninitialized blob buffer suitable for this
+    /// backend. Callers must fill all bytes before reading.
+    fn alloc_blob_buf_uninit(&self) -> AlignedBlobBuf {
+        AlignedBlobBuf::uninit()
+    }
+
     /// Read blob `guid` into `dst`. `dst.len() == PAGE_SIZE`.
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()>;
 

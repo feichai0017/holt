@@ -16,7 +16,7 @@ use crate::layout::{
 use crate::store::{BlobFrame, BufferManager};
 
 use super::cast;
-use super::migrate::make_blob_from_node;
+use super::migrate::make_blob_from_node_in;
 use super::readers::{
     ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48, read_prefix,
 };
@@ -95,7 +95,7 @@ pub(super) fn spillover_blob(
     let victim = pick_victim_subtree(frame, root_slot)?;
 
     let new_guid = fresh_blob_guid();
-    let outcome = make_blob_from_node(frame, victim.victim_slot, new_guid)?;
+    let outcome = make_blob_from_node_in(bm, frame, victim.victim_slot, new_guid)?;
 
     // Stage the new blob via the unified `mark_dirty → checkpoint
     // round` protocol — the bytes stay in cache until the round

@@ -10,7 +10,8 @@
 //!   the internal `readers` / `writers` / `types` primitives
 //!   they share.
 //! - [`simd`] — SIMD hot paths the walker calls into:
-//!   `Node16` byte search and longest-common-prefix
+//!   `Node16` byte search, longest-common-prefix, Node48 /
+//!   Node256 sparse-child scans, and delimiter byte search
 //!   (SSE2 / NEON / scalar fallback).
 //!
 //! Read paths take [`crate::store::BlobFrameRef`] and run

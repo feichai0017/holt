@@ -819,9 +819,17 @@ impl BufferManager {
     /// `last_touched` so it doesn't look cold to the eviction
     /// thread on its very next sweep.
     fn insert_into_cache(&self, guid: BlobGuid, contents: &AlignedBlobBuf) {
+        self.insert_owned_into_cache(guid, contents.clone());
+    }
+
+    /// Internal: insert a freshly-loaded owned blob into the cache
+    /// without cloning its 512 KB payload. Used on backend read
+    /// misses so an allocator-provided registered buffer can become
+    /// the cached image directly.
+    fn insert_owned_into_cache(&self, guid: BlobGuid, contents: AlignedBlobBuf) {
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
         let inserted = self.cache.entry(guid).or_insert_with(|| {
-            let entry = Arc::new(CachedBlob::new(contents.clone()));
+            let entry = Arc::new(CachedBlob::new(contents));
             entry.last_touched.store(tick, Ordering::Relaxed);
             entry
         });
@@ -980,12 +988,12 @@ impl BufferManager {
         // Cache miss — load from inner backend, then take a second
         // lookup so the cache, not our scratch buffer, owns the
         // canonical entry.
-        let mut scratch = AlignedBlobBuf::zeroed();
+        let mut scratch = self.backend.alloc_blob_buf_uninit();
         self.backend.read_blob(guid, &mut scratch)?;
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
-        self.insert_into_cache(guid, &scratch);
+        self.insert_owned_into_cache(guid, scratch);
         // Almost always cached now; if another thread evicted it
         // in the gap, fall back to a fresh insert with our scratch.
         if let Some(entry) = self.get_cached(guid) {
@@ -993,6 +1001,8 @@ impl BufferManager {
         }
         // Pathological: insert raced with eviction. Build an
         // entry directly from scratch and force-insert it.
+        let mut scratch = self.backend.alloc_blob_buf_uninit();
+        self.backend.read_blob(guid, &mut scratch)?;
         let entry = Arc::new(CachedBlob::new(scratch));
         let tick = self.clock.fetch_add(1, Ordering::Relaxed);
         entry.last_touched.store(tick, Ordering::Relaxed);
@@ -1023,15 +1033,17 @@ impl BufferManager {
         if let Some(entry) = self.get_cached_silent(guid) {
             return Ok(entry);
         }
-        let mut scratch = AlignedBlobBuf::zeroed();
+        let mut scratch = self.backend.alloc_blob_buf_uninit();
         self.backend.read_blob(guid, &mut scratch)?;
         if self.is_pending_delete(guid) {
             return Err(Self::pending_delete_not_found(guid));
         }
-        self.insert_into_cache(guid, &scratch);
+        self.insert_owned_into_cache(guid, scratch);
         if let Some(entry) = self.get_cached_silent(guid) {
             return Ok(entry);
         }
+        let mut scratch = self.backend.alloc_blob_buf_uninit();
+        self.backend.read_blob(guid, &mut scratch)?;
         let entry = Arc::new(CachedBlob::new(scratch));
         // We still stamp last_touched on the truly-pathological
         // race-with-eviction fallback path — the entry is being
@@ -1345,7 +1357,16 @@ impl BufferManager {
     pub(crate) fn snapshot_bytes(&self, guid: BlobGuid) -> Option<AlignedBlobBuf> {
         let entry = self.get_cached(guid)?;
         let buf = entry.read();
-        Some(buf.clone())
+        let mut out = self.backend.alloc_blob_buf_uninit();
+        out.as_mut_slice().copy_from_slice(buf.as_slice());
+        Some(out)
+    }
+
+    /// Allocate a zero-filled blob buffer from the inner backend's
+    /// preferred allocator.
+    #[must_use]
+    pub(crate) fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf {
+        self.backend.alloc_blob_buf_zeroed()
     }
 
     /// Push a whole checkpoint snapshot to the inner backend using

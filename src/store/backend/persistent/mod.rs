@@ -78,6 +78,8 @@ use std::sync::RwLock;
 use crate::api::errors::{Error, Result};
 use crate::layout::{BlobGuid, PAGE_SIZE};
 
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+use super::BlobBufPool;
 use super::{AlignedBlobBuf, Backend};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
@@ -102,6 +104,15 @@ const PWRITEV_IOV_MAX: usize = 1024;
 const DATA_PREALLOC_SMALL_CHUNK_SLOTS: u64 = 8;
 const DATA_PREALLOC_LARGE_CHUNK_SLOTS: u64 = 64;
 const DATA_PREALLOC_LARGE_AT_SLOTS: u64 = 128;
+/// Upper bound for `io_uring` fixed-buffer registration.
+///
+/// Each slot is one 512 KiB blob frame. Registering the whole cache
+/// would pin `buffer_pool_size * 512 KiB` at open/reopen time, which
+/// quickly dominates startup latency. Keep a bounded hot I/O pool
+/// instead: resident cache entries and checkpoint snapshots try to
+/// lease these fixed frames first, and fall back to normal aligned
+/// heap buffers when the hot pool is exhausted.
+const REGISTERED_BUFFER_MAX_SLOTS: usize = 32;
 
 /// Manifest file magic — recognised on load to refuse bogus files.
 const MANIFEST_MAGIC: [u8; 8] = *b"ARTSNMNF";
@@ -146,6 +157,12 @@ pub struct PersistentBackend {
     /// worker thread this lock is uncontended on the hot path.
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     uring: Mutex<UringContext>,
+    /// Fixed-buffer pool registered with `uring`. Buffers allocated
+    /// from this pool carry a stable `buf_index` so the Linux path
+    /// can submit `READ_FIXED` / `WRITE_FIXED` without per-op
+    /// registration.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    registered_buffers: Option<BlobBufPool>,
 }
 
 #[derive(Debug)]
@@ -205,6 +222,27 @@ impl PersistentBackend {
     /// with `O_CLOEXEC` only (macOS additionally sets `F_NOCACHE`).
     /// Loads the manifest if present; otherwise starts empty.
     pub fn open<P: Into<PathBuf>>(data_dir: P) -> Result<Self> {
+        Self::open_with_registered_buffer_capacity(data_dir, REGISTERED_BUFFER_MAX_SLOTS)
+    }
+
+    /// Open with a registered-buffer hot-pool hint derived from the
+    /// caller's buffer-manager capacity. The actual pool is bounded
+    /// by [`REGISTERED_BUFFER_MAX_SLOTS`] so large caches do not pin
+    /// proportional memory at open/reopen time.
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub(crate) fn open_with_buffer_pool_hint<P: Into<PathBuf>>(
+        data_dir: P,
+        buffer_pool_size: usize,
+    ) -> Result<Self> {
+        let slots = registered_buffer_slots(buffer_pool_size);
+        Self::open_with_registered_buffer_capacity(data_dir, slots)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn open_with_registered_buffer_capacity<P: Into<PathBuf>>(
+        data_dir: P,
+        registered_buffer_slots: usize,
+    ) -> Result<Self> {
         let data_dir = data_dir.into();
         std::fs::create_dir_all(&data_dir)?;
 
@@ -242,7 +280,16 @@ impl PersistentBackend {
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
-        let uring = Mutex::new(UringContext::new(&data_file)?);
+        let (uring, registered_buffers) = {
+            let pool = BlobBufPool::new(registered_buffer_slots);
+            match pool {
+                Some(pool) => match UringContext::new(&data_file, Some(&pool)) {
+                    Ok(ctx) => (Mutex::new(ctx), Some(pool)),
+                    Err(_) => (Mutex::new(UringContext::new(&data_file, None)?), None),
+                },
+                None => (Mutex::new(UringContext::new(&data_file, None)?), None),
+            }
+        };
 
         Ok(Self {
             data_dir,
@@ -253,6 +300,56 @@ impl PersistentBackend {
             preallocated_slots: AtomicU64::new(preallocated_slots),
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             uring,
+            #[cfg(all(target_os = "linux", feature = "io-uring"))]
+            registered_buffers,
+        })
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    fn open_with_registered_buffer_capacity<P: Into<PathBuf>>(
+        data_dir: P,
+        _registered_buffer_slots: usize,
+    ) -> Result<Self> {
+        let data_dir = data_dir.into();
+        std::fs::create_dir_all(&data_dir)?;
+
+        let data_path = data_dir.join(DATA_FILENAME);
+        let manifest_path = data_dir.join(MANIFEST_FILENAME);
+        let manifest_log_path = data_dir.join(MANIFEST_LOG_FILENAME);
+
+        let custom_flags = {
+            #[cfg(target_os = "linux")]
+            {
+                libc::O_DIRECT | libc::O_CLOEXEC
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                libc::O_CLOEXEC
+            }
+        };
+        let data_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .custom_flags(custom_flags)
+            .open(&data_path)?;
+
+        #[cfg(target_os = "macos")]
+        unsafe {
+            let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
+        }
+
+        let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
+        let file_slots = slots_for_len(data_file.metadata()?.len());
+        let preallocated_slots = file_slots.max(manifest.next_slot);
+
+        Ok(Self {
+            data_dir,
+            data_file,
+            manifest: RwLock::new(manifest),
+            manifest_dirty: AtomicBool::new(false),
+            data_dirty: AtomicBool::new(false),
+            preallocated_slots: AtomicU64::new(preallocated_slots),
         })
     }
 
@@ -325,40 +422,48 @@ impl PersistentBackend {
     // `write_blob` clean of any conditional plumbing.
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    fn pread_at(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
+    fn pread_at(&self, offset: u64, dst: &mut AlignedBlobBuf) -> Result<()> {
         let mut ring = self.uring.lock().unwrap();
         ring.pread_at(offset, dst)?;
         Ok(())
     }
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    fn pread_at(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
+    fn pread_at(&self, offset: u64, dst: &mut AlignedBlobBuf) -> Result<()> {
+        let dst = dst.as_mut_slice();
         self.data_file.read_exact_at(dst, offset)?;
         Ok(())
     }
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    fn pwrite_at(&self, offset: u64, src: &[u8]) -> Result<()> {
+    fn pwrite_at(&self, offset: u64, src: &AlignedBlobBuf) -> Result<()> {
         let mut ring = self.uring.lock().unwrap();
         ring.pwrite_at(offset, src)?;
         Ok(())
     }
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    fn pwrite_many_at(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+    fn pwrite_many_at(&self, writes: &[(u64, &AlignedBlobBuf)]) -> Result<()> {
         let mut ring = self.uring.lock().unwrap();
         ring.pwrite_many_at(writes)?;
         Ok(())
     }
 
-    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    fn pwrite_at(&self, offset: u64, src: &[u8]) -> Result<()> {
-        self.data_file.write_all_at(src, offset)?;
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    fn sync_data_file(&self) -> Result<()> {
+        let mut ring = self.uring.lock().unwrap();
+        ring.sync_data()?;
         Ok(())
     }
 
     #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
-    fn pwrite_many_at(&self, writes: &[(u64, &[u8])]) -> Result<()> {
+    fn pwrite_at(&self, offset: u64, src: &AlignedBlobBuf) -> Result<()> {
+        self.data_file.write_all_at(src.as_slice(), offset)?;
+        Ok(())
+    }
+
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    fn pwrite_many_at(&self, writes: &[(u64, &AlignedBlobBuf)]) -> Result<()> {
         if writes.is_empty() {
             return Ok(());
         }
@@ -368,7 +473,7 @@ impl PersistentBackend {
             .enumerate()
             .map(|(order, (offset, src))| OrderedWrite {
                 offset: *offset,
-                src,
+                src: src.as_slice(),
                 order,
             })
             .collect();
@@ -429,6 +534,12 @@ impl PersistentBackend {
         Ok(())
     }
 
+    #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
+    fn sync_data_file(&self) -> Result<()> {
+        self.data_file.sync_data()?;
+        Ok(())
+    }
+
     fn ensure_data_capacity(&self, required_slots: u64) -> Result<()> {
         let current = self.preallocated_slots.load(Ordering::Acquire);
         if required_slots <= current {
@@ -461,6 +572,11 @@ fn round_up_slots(required_slots: u64) -> u64 {
         DATA_PREALLOC_SMALL_CHUNK_SLOTS
     };
     required_slots.saturating_add(chunk - 1) / chunk * chunk
+}
+
+#[cfg(all(target_os = "linux", feature = "io-uring"))]
+fn registered_buffer_slots(buffer_pool_size: usize) -> usize {
+    buffer_pool_size.clamp(1, REGISTERED_BUFFER_MAX_SLOTS)
 }
 
 #[cfg(target_os = "linux")]
@@ -533,9 +649,29 @@ fn preallocate_unsupported(err: &io::Error) -> bool {
 }
 
 impl Backend for PersistentBackend {
+    fn alloc_blob_buf_zeroed(&self) -> AlignedBlobBuf {
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        if let Some(pool) = &self.registered_buffers {
+            if let Some(buf) = AlignedBlobBuf::pooled_zeroed(pool) {
+                return buf;
+            }
+        }
+        AlignedBlobBuf::zeroed()
+    }
+
+    fn alloc_blob_buf_uninit(&self) -> AlignedBlobBuf {
+        #[cfg(all(target_os = "linux", feature = "io-uring"))]
+        if let Some(pool) = &self.registered_buffers {
+            if let Some(buf) = AlignedBlobBuf::pooled_uninit(pool) {
+                return buf;
+            }
+        }
+        AlignedBlobBuf::uninit()
+    }
+
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()> {
         let offset = self.offset_of(guid)?;
-        self.pread_at(offset, dst.as_mut_slice())?;
+        self.pread_at(offset, dst)?;
         Ok(())
     }
 
@@ -546,7 +682,7 @@ impl Backend for PersistentBackend {
         // Bracket the syscall so a racing flush cannot clear the
         // flag before this write has actually reached the fd.
         self.data_dirty.store(true, Ordering::Release);
-        let result = self.pwrite_at(offset, src.as_slice());
+        let result = self.pwrite_at(offset, src);
         self.data_dirty.store(true, Ordering::Release);
         result?;
         Ok(())
@@ -562,7 +698,7 @@ impl Backend for PersistentBackend {
         }
         let mut io = Vec::with_capacity(writes.len());
         for ((_, src), slot) in writes.iter().zip(slots) {
-            io.push((slot * u64::from(PAGE_SIZE), src.as_slice()));
+            io.push((slot * u64::from(PAGE_SIZE), *src));
         }
         // See `write_blob`: keep the dirty hint conservative
         // across concurrent flush attempts and partial I/O errors.
@@ -594,9 +730,9 @@ impl Backend for PersistentBackend {
         // manifest pointing at a slot whose data is still in NVMe's
         // write cache.
         if self.data_dirty.swap(false, Ordering::AcqRel) {
-            if let Err(e) = self.data_file.sync_data() {
+            if let Err(e) = self.sync_data_file() {
                 self.data_dirty.store(true, Ordering::Release);
-                return Err(Error::BackendIo(e));
+                return Err(e);
             }
         }
 
@@ -1035,6 +1171,37 @@ mod tests {
             }
             Err(e) => panic!("unexpected open error: {e}"),
         }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    #[test]
+    fn registered_buffer_allocator_returns_fixed_buffers_when_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(b) = try_open(dir.path()) else {
+            return;
+        };
+        if b.registered_buffers.is_none() {
+            eprintln!("skipping: io_uring fixed-buffer registration unavailable");
+            return;
+        }
+
+        let mut src = b.alloc_blob_buf_zeroed();
+        let mut dst = b.alloc_blob_buf_uninit();
+        assert!(
+            src.fixed_buffer_index().is_some(),
+            "source buffer should come from the registered pool"
+        );
+        assert!(
+            dst.fixed_buffer_index().is_some(),
+            "destination buffer should come from the registered pool"
+        );
+
+        src.as_mut_slice()[100] = 0x5A;
+        let g: BlobGuid = [0xF1; 16];
+        b.write_blob(g, &src).unwrap();
+        b.flush().unwrap();
+        b.read_blob(g, &mut dst).unwrap();
+        assert_eq!(dst.as_slice()[100], 0x5A);
     }
 
     #[test]

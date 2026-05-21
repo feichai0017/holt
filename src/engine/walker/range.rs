@@ -275,7 +275,7 @@ impl Iterator for RangeIter {
                     }
                     if let Some(d) = self.delimiter {
                         let rest = &user_key[self.prefix.len()..];
-                        if let Some(idx) = rest.iter().position(|b| *b == d) {
+                        if let Some(idx) = simd::find_byte(rest, d, 0) {
                             let common: Vec<u8> = user_key[..=self.prefix.len() + idx].to_vec();
                             if self.last_common_prefix.as_deref() == Some(common.as_slice()) {
                                 // Defensive dedup: fast-forward below

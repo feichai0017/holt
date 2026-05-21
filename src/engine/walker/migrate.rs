@@ -54,12 +54,35 @@ const MERGE_RESERVE: u32 = 0x1000;
 /// Migration is **preserve-mode** — tombstones in the source travel
 /// to the destination verbatim. Compaction (in either blob) is the
 /// place to drop them.
+#[cfg(test)]
 pub fn make_blob_from_node(
     src_frame: &BlobFrame<'_>,
     src_slot: u16,
     new_guid: BlobGuid,
 ) -> Result<MakeBlobOutcome> {
-    let mut buf = AlignedBlobBuf::zeroed();
+    make_blob_from_node_with_buf(AlignedBlobBuf::zeroed(), src_frame, src_slot, new_guid)
+}
+
+/// Same as [`make_blob_from_node`], but allocates the destination
+/// from the buffer manager's backend-preferred allocator. Spillover
+/// uses this path so fresh child blobs enter the cache backed by
+/// registered `io_uring` buffers when the persistent backend has a
+/// fixed-buffer pool.
+pub fn make_blob_from_node_in(
+    bm: &BufferManager,
+    src_frame: &BlobFrame<'_>,
+    src_slot: u16,
+    new_guid: BlobGuid,
+) -> Result<MakeBlobOutcome> {
+    make_blob_from_node_with_buf(bm.alloc_blob_buf_zeroed(), src_frame, src_slot, new_guid)
+}
+
+fn make_blob_from_node_with_buf(
+    mut buf: AlignedBlobBuf,
+    src_frame: &BlobFrame<'_>,
+    src_slot: u16,
+    new_guid: BlobGuid,
+) -> Result<MakeBlobOutcome> {
     let cloned_root_slot;
     {
         let mut new_frame = BlobFrame::init(buf.as_mut_slice(), new_guid)?;
@@ -130,7 +153,7 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
         (h.blob_guid, h.root_slot, h.compact_times)
     };
 
-    let mut new_buf = AlignedBlobBuf::zeroed();
+    let mut new_buf = buf.zeroed_like();
     {
         let mut new_frame = BlobFrame::init(new_buf.as_mut_slice(), blob_guid)?;
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
