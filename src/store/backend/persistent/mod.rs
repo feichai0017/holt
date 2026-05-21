@@ -28,7 +28,10 @@
 //! - **O_DIRECT / F_NOCACHE** bypasses the page cache: ours *is*
 //!   the cache. The buffer manager owns dirty pages and flushes
 //!   through the backend; the kernel must not silently cache
-//!   anything.
+//!   anything. The packed data file is preallocated in coarse
+//!   chunks (`posix_fallocate` on Linux, `F_PREALLOCATE` on
+//!   macOS) so checkpoint bursts do not repeatedly pay file-growth
+//!   allocation latency.
 //! - **4 KB-aligned I/O** (every offset is a multiple of `PAGE_SIZE`
 //!   = 512 KB, every buffer is [`AlignedBlobBuf`] = 4 KB aligned) so
 //!   `O_DIRECT` accepts every submission without `EINVAL`.
@@ -64,13 +67,10 @@ use std::io::{self, Read, Write};
 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(any(
-    target_os = "macos",
-    not(all(target_os = "linux", feature = "io-uring"))
-))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -96,6 +96,12 @@ const MANIFEST_TMP_FILENAME: &str = "manifest.bin.tmp";
 /// support 1024, and chunking keeps us below the common cap.
 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
 const PWRITEV_IOV_MAX: usize = 1024;
+/// Packed-file reservation units. Small trees grow in 4 MiB
+/// chunks; large trees switch to 32 MiB chunks so checkpoint bursts
+/// don't pay file-growth allocation every few blobs.
+const DATA_PREALLOC_SMALL_CHUNK_SLOTS: u64 = 8;
+const DATA_PREALLOC_LARGE_CHUNK_SLOTS: u64 = 64;
+const DATA_PREALLOC_LARGE_AT_SLOTS: u64 = 128;
 
 /// Manifest file magic — recognised on load to refuse bogus files.
 const MANIFEST_MAGIC: [u8; 8] = *b"ARTSNMNF";
@@ -131,6 +137,9 @@ pub struct PersistentBackend {
     /// `sync_data` without skipping a retry after a previous sync
     /// failure.
     data_dirty: AtomicBool,
+    /// Highest slot count the packed data file has been
+    /// best-effort preallocated to.
+    preallocated_slots: AtomicU64,
     /// `io_uring` context — present iff Linux + `feature =
     /// "io-uring"`. Held behind a `Mutex` so concurrent callers
     /// serialise on the submission queue; with the single I/O
@@ -229,6 +238,8 @@ impl PersistentBackend {
         }
 
         let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
+        let file_slots = slots_for_len(data_file.metadata()?.len());
+        let preallocated_slots = file_slots.max(manifest.next_slot);
 
         #[cfg(all(target_os = "linux", feature = "io-uring"))]
         let uring = Mutex::new(UringContext::new(&data_file)?);
@@ -239,6 +250,7 @@ impl PersistentBackend {
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
             data_dirty: AtomicBool::new(false),
+            preallocated_slots: AtomicU64::new(preallocated_slots),
             #[cfg(all(target_os = "linux", feature = "io-uring"))]
             uring,
         })
@@ -416,6 +428,17 @@ impl PersistentBackend {
         }
         Ok(())
     }
+
+    fn ensure_data_capacity(&self, required_slots: u64) -> Result<()> {
+        let current = self.preallocated_slots.load(Ordering::Acquire);
+        if required_slots <= current {
+            return Ok(());
+        }
+        let target = round_up_slots(required_slots);
+        preallocate_data_file(&self.data_file, target.saturating_mul(u64::from(PAGE_SIZE)))?;
+        self.preallocated_slots.fetch_max(target, Ordering::AcqRel);
+        Ok(())
+    }
 }
 
 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
@@ -424,6 +447,89 @@ struct OrderedWrite<'a> {
     offset: u64,
     src: &'a [u8],
     order: usize,
+}
+
+fn slots_for_len(len: u64) -> u64 {
+    let page = u64::from(PAGE_SIZE);
+    len.saturating_add(page - 1) / page
+}
+
+fn round_up_slots(required_slots: u64) -> u64 {
+    let chunk = if required_slots >= DATA_PREALLOC_LARGE_AT_SLOTS {
+        DATA_PREALLOC_LARGE_CHUNK_SLOTS
+    } else {
+        DATA_PREALLOC_SMALL_CHUNK_SLOTS
+    };
+    required_slots.saturating_add(chunk - 1) / chunk * chunk
+}
+
+#[cfg(target_os = "linux")]
+fn preallocate_data_file(file: &File, len: u64) -> Result<()> {
+    let len = libc::off_t::try_from(len)
+        .map_err(|_| Error::BackendIo(io::Error::other("data file length exceeds off_t")))?;
+    let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, len) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::from_raw_os_error(rc);
+    if preallocate_unsupported(&err) {
+        return Ok(());
+    }
+    Err(Error::BackendIo(err))
+}
+
+#[cfg(target_os = "macos")]
+fn preallocate_data_file(file: &File, len: u64) -> Result<()> {
+    let current = file.metadata()?.len();
+    if current >= len {
+        return Ok(());
+    }
+    let reserve = libc::off_t::try_from(len - current)
+        .map_err(|_| Error::BackendIo(io::Error::other("data file length exceeds off_t")))?;
+    let mut store = libc::fstore_t {
+        fst_flags: libc::F_ALLOCATECONTIG,
+        fst_posmode: libc::F_PEOFPOSMODE,
+        fst_offset: 0,
+        fst_length: reserve,
+        fst_bytesalloc: 0,
+    };
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &store) };
+    if rc != 0 {
+        store.fst_flags = libc::F_ALLOCATEALL;
+        let fallback_rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_PREALLOCATE, &store) };
+        if fallback_rc != 0 {
+            let err = io::Error::last_os_error();
+            if preallocate_unsupported(&err) {
+                return Ok(());
+            }
+            return Err(Error::BackendIo(err));
+        }
+    }
+
+    file.set_len(len)?;
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn preallocate_data_file(_file: &File, _len: u64) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn preallocate_unsupported(err: &io::Error) -> bool {
+    let Some(raw) = err.raw_os_error() else {
+        return false;
+    };
+    raw == libc::ENOSYS || raw == libc::EINVAL || raw == libc::EOPNOTSUPP || {
+        #[cfg(target_os = "macos")]
+        {
+            raw == libc::ENOTSUP
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
 }
 
 impl Backend for PersistentBackend {
@@ -436,6 +542,7 @@ impl Backend for PersistentBackend {
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let slot = self.assign_slot(guid);
         let offset = slot * u64::from(PAGE_SIZE);
+        self.ensure_data_capacity(slot.saturating_add(1))?;
         // Bracket the syscall so a racing flush cannot clear the
         // flag before this write has actually reached the fd.
         self.data_dirty.store(true, Ordering::Release);
@@ -450,6 +557,9 @@ impl Backend for PersistentBackend {
             return Ok(());
         }
         let slots = self.assign_slots(writes.iter().map(|(guid, _)| *guid));
+        if let Some(required_slots) = slots.iter().map(|slot| slot.saturating_add(1)).max() {
+            self.ensure_data_capacity(required_slots)?;
+        }
         let mut io = Vec::with_capacity(writes.len());
         for ((_, src), slot) in writes.iter().zip(slots) {
             io.push((slot * u64::from(PAGE_SIZE), src.as_slice()));
@@ -893,6 +1003,23 @@ mod tests {
         let mut b = AlignedBlobBuf::zeroed();
         b.as_mut_slice()[100] = byte_at_100;
         b
+    }
+
+    #[test]
+    fn data_preallocation_rounds_in_adaptive_chunks() {
+        assert_eq!(round_up_slots(1), DATA_PREALLOC_SMALL_CHUNK_SLOTS);
+        assert_eq!(
+            round_up_slots(DATA_PREALLOC_SMALL_CHUNK_SLOTS + 1),
+            DATA_PREALLOC_SMALL_CHUNK_SLOTS * 2,
+        );
+        assert_eq!(
+            round_up_slots(DATA_PREALLOC_LARGE_AT_SLOTS),
+            DATA_PREALLOC_LARGE_AT_SLOTS,
+        );
+        assert_eq!(
+            round_up_slots(DATA_PREALLOC_LARGE_AT_SLOTS + 1),
+            DATA_PREALLOC_LARGE_AT_SLOTS + DATA_PREALLOC_LARGE_CHUNK_SLOTS,
+        );
     }
 
     /// Skip every test in this module when O_DIRECT isn't supported

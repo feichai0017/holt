@@ -298,14 +298,15 @@ come from that same-run baseline.
 | objstore | 1 503  |        1 511 | +1 %   | **1.13×** ahead | 1.22× ahead |
 | fs       | 1 492  |        1 482 | -1 %   | **1.05×** ahead | 1.09× ahead |
 
-A post-route-cache filtered smoke run (`cargo bench --bench main
--- {objstore,fs}_scale_put/{engine}/2M --quick --noplot
---output-format bencher`) gave this narrower 2 M-only view:
+A post-route-cache + path-boundary filtered smoke run (`cargo
+bench --bench main -- {objstore,fs}_scale_put/{engine}/2M
+--quick --noplot --output-format bencher`) gave this narrower
+2 M-only view:
 
 | 2 M put  | Holt | RocksDB | SQLite | vs RocksDB | vs SQLite |
 | -------- | ---: | ------: | -----: | ---------: | --------: |
-| objstore | 1 366 | 1 479 | 1 517 | **1.08×** ahead | **1.11×** ahead |
-| fs       | 1 618 | 1 572 | 1 660 | 0.97× | **1.03×** ahead |
+| objstore | 1 368 | 1 479 | 1 517 | **1.08×** ahead | **1.11×** ahead |
+| fs       | 1 573 | 1 572 | 1 660 | ~tie | **1.06×** ahead |
 
 The root cause of the v0.2.1 gap was **API + walker constant-
 factor overhead**, not the cross-blob descent cost we initially
@@ -372,11 +373,10 @@ is the regime where LSM and B-tree write paths are most
 competitive: WAL append + memtable/page update stay cheap
 regardless of working-set size, while ART-over-blobs pays
 cross-blob descent plus deeper Prefix chains on long path keys.
-The next real optimization target is tree-shape control: keep
-spillover boundaries aligned to high-locality path components so
-fs updates stop crossing through overly deep, low-reuse BlobNode
-prefixes. The larger claims are still on get/list/list_dir and
-metadata-native mixes.
+The path-boundary spillover heuristic moves the fs smoke from a
+small RocksDB loss to a tie by preferring healthy child blobs whose
+route boundary ends on `/`. The larger claims are still on
+get/list/list_dir and metadata-native mixes.
 
 #### What this means in practice
 

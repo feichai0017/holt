@@ -40,6 +40,14 @@ struct SubtreeFootprint {
 struct VictimCandidate {
     victim: Victim,
     footprint: SubtreeFootprint,
+    boundary: BoundaryQuality,
+    boundary_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BoundaryQuality {
+    Arbitrary,
+    PathComponent,
 }
 
 fn spillover_data_capacity() -> u32 {
@@ -222,10 +230,14 @@ impl SubtreeFootprint {
 /// - Choosing a subtree close to the target child fill ratio avoids
 ///   creating child blobs that are immediately full, which is what
 ///   turns path-shaped 2M+ put workloads into repeated blob hops.
+/// - Among healthy fill-ratio candidates, prefer boundaries that
+///   end on `/`. Object-store and filesystem keys are component-
+///   shaped; cutting a child blob at a component boundary improves
+///   top-route cache reuse and avoids long low-reuse prefix hops.
 #[allow(clippy::too_many_lines)] // intentional — one match over NodeType arms
 fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim> {
     let mut best: Option<VictimCandidate> = None;
-    collect_victim_candidates(frame, start_slot, &mut best)?;
+    collect_victim_candidates(frame, start_slot, 0, &mut best)?;
     best.map(|candidate| candidate.victim)
         .ok_or(Error::NotYetImplemented(
             "spillover: no non-Blob subtree to migrate",
@@ -236,6 +248,7 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
 fn collect_victim_candidates(
     frame: &BlobFrame<'_>,
     current: u16,
+    depth: usize,
     best: &mut Option<VictimCandidate>,
 ) -> Result<()> {
     let ntype = ntype_of(frame.as_ref(), current)?;
@@ -243,6 +256,7 @@ fn collect_victim_candidates(
         NodeType::Node4 => {
             let n = read_node4(frame.as_ref(), current)?;
             for i in 0..(n.count as usize).min(4) {
+                let child_depth = depth + 1;
                 visit_child_edge(
                     frame,
                     Victim {
@@ -252,6 +266,8 @@ fn collect_victim_candidates(
                         victim_slot: n.children[i] as u16,
                         via_header_root: false,
                     },
+                    boundary_quality_for_byte(n.keys[i]),
+                    child_depth,
                     best,
                 )?;
             }
@@ -259,6 +275,7 @@ fn collect_victim_candidates(
         NodeType::Node16 => {
             let n = read_node16(frame.as_ref(), current)?;
             for i in 0..(n.count as usize).min(16) {
+                let child_depth = depth + 1;
                 visit_child_edge(
                     frame,
                     Victim {
@@ -268,6 +285,8 @@ fn collect_victim_candidates(
                         victim_slot: n.children[i] as u16,
                         via_header_root: false,
                     },
+                    boundary_quality_for_byte(n.keys[i]),
+                    child_depth,
                     best,
                 )?;
             }
@@ -285,6 +304,7 @@ fn collect_victim_candidates(
                         "collect_victim_candidates: Node48 index out of range",
                     ));
                 }
+                let child_depth = depth + 1;
                 visit_child_edge(
                     frame,
                     Victim {
@@ -294,6 +314,8 @@ fn collect_victim_candidates(
                         victim_slot: n.children[ci] as u16,
                         via_header_root: false,
                     },
+                    boundary_quality_for_byte(b as u8),
+                    child_depth,
                     best,
                 )?;
             }
@@ -304,6 +326,7 @@ fn collect_victim_candidates(
                 if child == 0 {
                     continue;
                 }
+                let child_depth = depth + 1;
                 visit_child_edge(
                     frame,
                     Victim {
@@ -313,12 +336,17 @@ fn collect_victim_candidates(
                         victim_slot: child as u16,
                         via_header_root: false,
                     },
+                    boundary_quality_for_byte(b as u8),
+                    child_depth,
                     best,
                 )?;
             }
         }
         NodeType::Prefix => {
             let p = read_prefix(frame.as_ref(), current)?;
+            let plen = p.prefix_len as usize;
+            let prefix = &p.bytes[..plen.min(p.bytes.len())];
+            let child_depth = depth + plen;
             visit_child_edge(
                 frame,
                 Victim {
@@ -328,6 +356,8 @@ fn collect_victim_candidates(
                     victim_slot: p.child as u16,
                     via_header_root: false,
                 },
+                boundary_quality_for_prefix(prefix),
+                child_depth,
                 best,
             )?;
         }
@@ -342,6 +372,8 @@ fn collect_victim_candidates(
 fn visit_child_edge(
     frame: &BlobFrame<'_>,
     victim: Victim,
+    boundary: BoundaryQuality,
+    boundary_depth: usize,
     best: &mut Option<VictimCandidate>,
 ) -> Result<()> {
     let child_ntype = ntype_of(frame.as_ref(), victim.victim_slot)?;
@@ -354,7 +386,12 @@ fn visit_child_edge(
     }
 
     let footprint = subtree_footprint(frame, victim.victim_slot)?;
-    let candidate = VictimCandidate { victim, footprint };
+    let candidate = VictimCandidate {
+        victim,
+        footprint,
+        boundary,
+        boundary_depth,
+    };
     if best
         .as_ref()
         .is_none_or(|current| candidate_is_better(candidate, *current))
@@ -362,9 +399,24 @@ fn visit_child_edge(
         *best = Some(candidate);
     }
     if footprint.bytes > spillover_target_child_bytes() {
-        collect_victim_candidates(frame, victim.victim_slot, best)?;
+        collect_victim_candidates(frame, victim.victim_slot, boundary_depth, best)?;
     }
     Ok(())
+}
+
+fn boundary_quality_for_byte(byte: u8) -> BoundaryQuality {
+    if byte == b'/' {
+        BoundaryQuality::PathComponent
+    } else {
+        BoundaryQuality::Arbitrary
+    }
+}
+
+fn boundary_quality_for_prefix(prefix: &[u8]) -> BoundaryQuality {
+    prefix
+        .last()
+        .copied()
+        .map_or(BoundaryQuality::Arbitrary, boundary_quality_for_byte)
 }
 
 fn candidate_is_better(candidate: VictimCandidate, current: VictimCandidate) -> bool {
@@ -378,32 +430,62 @@ fn candidate_is_better(candidate: VictimCandidate, current: VictimCandidate) -> 
         return c_in_band;
     }
     if c_in_band {
-        return candidate_tie(c, b, c.bytes.abs_diff(target), b.bytes.abs_diff(target));
+        return candidate_tie_in_band(
+            candidate,
+            current,
+            c.bytes.abs_diff(target),
+            b.bytes.abs_diff(target),
+        );
     }
 
     let c_below = c.bytes < min;
     let b_below = b.bytes < min;
     if c_below && b_below {
-        return candidate_tie(c, b, b.bytes, c.bytes);
+        return candidate_tie(candidate, current, b.bytes, c.bytes);
     }
 
     let c_over = c.bytes > target;
     let b_over = b.bytes > target;
     if c_over && b_over {
-        return candidate_tie(c, b, c.bytes, b.bytes);
+        return candidate_tie(candidate, current, c.bytes, b.bytes);
     }
 
-    candidate_tie(c, b, c.bytes.abs_diff(target), b.bytes.abs_diff(target))
+    candidate_tie(
+        candidate,
+        current,
+        c.bytes.abs_diff(target),
+        b.bytes.abs_diff(target),
+    )
 }
 
-fn candidate_tie(
-    candidate: SubtreeFootprint,
-    current: SubtreeFootprint,
+fn candidate_tie_in_band(
+    candidate: VictimCandidate,
+    current: VictimCandidate,
     candidate_score: u32,
     current_score: u32,
 ) -> bool {
-    candidate_score < current_score
-        || (candidate_score == current_score && candidate.nodes > current.nodes)
+    if candidate.boundary != current.boundary {
+        return candidate.boundary == BoundaryQuality::PathComponent;
+    }
+    candidate_tie(candidate, current, candidate_score, current_score)
+}
+
+fn candidate_tie(
+    candidate: VictimCandidate,
+    current: VictimCandidate,
+    candidate_score: u32,
+    current_score: u32,
+) -> bool {
+    if candidate_score != current_score {
+        return candidate_score < current_score;
+    }
+    if candidate.boundary != current.boundary {
+        return candidate.boundary == BoundaryQuality::PathComponent;
+    }
+    if candidate.boundary_depth != current.boundary_depth {
+        return candidate.boundary_depth < current.boundary_depth;
+    }
+    candidate.footprint.nodes > current.footprint.nodes
 }
 
 /// Recursively free every slot of the subtree rooted at `root` in
@@ -562,6 +644,19 @@ mod tests {
     use crate::store::BlobFrame;
 
     fn candidate(bytes: u32, nodes: u32) -> VictimCandidate {
+        candidate_with_boundary(bytes, nodes, BoundaryQuality::Arbitrary, 16)
+    }
+
+    fn path_candidate(bytes: u32, nodes: u32) -> VictimCandidate {
+        candidate_with_boundary(bytes, nodes, BoundaryQuality::PathComponent, 16)
+    }
+
+    fn candidate_with_boundary(
+        bytes: u32,
+        nodes: u32,
+        boundary: BoundaryQuality,
+        boundary_depth: usize,
+    ) -> VictimCandidate {
         VictimCandidate {
             victim: Victim {
                 parent_slot: 0,
@@ -571,6 +666,8 @@ mod tests {
                 via_header_root: false,
             },
             footprint: SubtreeFootprint { nodes, bytes },
+            boundary,
+            boundary_depth,
         }
     }
 
@@ -608,6 +705,25 @@ mod tests {
         assert!(candidate_is_better(
             candidate(target - 4096, 20),
             candidate(target - 4096, 10),
+        ));
+    }
+
+    #[test]
+    fn spillover_scoring_prefers_path_boundary_within_target_band() {
+        let target = spillover_target_child_bytes();
+        assert!(candidate_is_better(
+            path_candidate(target - 32_000, 10),
+            candidate(target - 1024, 100),
+        ));
+    }
+
+    #[test]
+    fn spillover_scoring_keeps_fill_band_before_path_boundary() {
+        let min = spillover_min_child_bytes();
+        let target = spillover_target_child_bytes();
+        assert!(candidate_is_better(
+            candidate(target - 1024, 10),
+            path_candidate(min - 1024, 100),
         ));
     }
 
