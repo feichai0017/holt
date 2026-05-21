@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 
 use super::config::{Storage, TreeConfig};
 use super::errors::{Error, Result};
-use super::stats::{BlobStats, CheckpointerStats, JournalStats, TreeStats};
+use super::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
 use crate::concurrency::{CommitGate, MaintenanceGate};
 use crate::engine;
 use crate::engine::{RangeBuilder, RangeEntry};
@@ -1656,6 +1656,15 @@ impl Tree {
         let bm_max_cross_blob_depth = self.store.max_cross_blob_depth();
         let bm_spillovers = self.store.spillover_count();
         let bm_merges = self.store.merge_count();
+        let route = self.route_cache.stats();
+        let route_cache = RouteCacheStats {
+            entries: route.entries,
+            hits: route.hits,
+            misses: route.misses,
+            learns: route.learns,
+            evictions: route.evictions,
+            invalidations: route.invalidations,
+        };
         let journal = self.journal.as_ref().map(|j| {
             let s = j.stats();
             JournalStats {
@@ -1692,6 +1701,7 @@ impl Tree {
             bm_max_cross_blob_depth,
             bm_spillovers,
             bm_merges,
+            route_cache,
             journal,
             checkpointer,
         })

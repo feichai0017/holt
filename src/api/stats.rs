@@ -37,6 +37,32 @@ pub struct BlobStats {
     pub tombstone_leaf_cnt: u32,
 }
 
+/// Root-route-cache counters captured by [`Tree::stats`](crate::Tree::stats).
+///
+/// The route cache is a small root-to-first-blob crossing accelerator
+/// for path-shaped large trees. These counters diagnose whether
+/// writes are using stable cached prefixes or churning through
+/// learned routes.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RouteCacheStats {
+    /// Number of cached route entries currently resident.
+    pub entries: usize,
+    /// Cumulative successful route-cache lookups.
+    pub hits: u64,
+    /// Cumulative route-cache lookup misses, including root-version
+    /// mismatches and keys not covered by any cached prefix.
+    pub misses: u64,
+    /// Cumulative learned routes. Updating an existing cached prefix
+    /// counts as a learn because the route was refreshed from a live
+    /// root descent.
+    pub learns: u64,
+    /// Cumulative capacity replacements after the route cache filled.
+    pub evictions: u64,
+    /// Cumulative entries invalidated because the root blob version
+    /// changed under the cache.
+    pub invalidations: u64,
+}
+
 /// Tree-wide aggregate counters from [`Tree::stats`](crate::Tree::stats).
 ///
 /// `blobs` carries the per-blob breakdown in BFS order from the
@@ -107,6 +133,8 @@ pub struct TreeStats {
     /// `BlobNode` children folded back into parents by manual
     /// compact or background merge passes.
     pub bm_merges: u64,
+    /// Root route-cache counters for large path-shaped trees.
+    pub route_cache: RouteCacheStats,
     /// WAL/journal worker counters, or `None` for memory trees and
     /// caller-supplied stores opened without holt's WAL.
     pub journal: Option<JournalStats>,

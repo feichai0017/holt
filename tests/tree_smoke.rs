@@ -75,6 +75,27 @@ fn put_returns_previous_value_on_update() {
 }
 
 #[test]
+fn blind_same_size_put_updates_in_place() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    tree.put(b"k", b"aaaa").unwrap();
+    let before_record = tree.get_record(b"k").unwrap().unwrap();
+    let before_stats = tree.stats().unwrap();
+
+    tree.put(b"k", b"bbbb").unwrap();
+    let after_record = tree.get_record(b"k").unwrap().unwrap();
+    let after_stats = tree.stats().unwrap();
+
+    assert_eq!(after_record.value, b"bbbb");
+    assert!(
+        after_record.version > before_record.version,
+        "same-size update must still publish a fresh record version",
+    );
+    assert_eq!(after_stats.total_space_used, before_stats.total_space_used);
+    assert_eq!(after_stats.total_gap_space, before_stats.total_gap_space);
+    assert_eq!(after_stats.total_slots, before_stats.total_slots);
+}
+
+#[test]
 fn conditional_puts_use_record_versions() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     assert!(tree.get_version(b"k").unwrap().is_none());
@@ -839,6 +860,9 @@ fn stats_on_fresh_tree_reports_root_blob_only() {
     assert_eq!(s.blobs.len(), 1);
     assert_eq!(s.total_compactions, 0);
     assert_eq!(s.total_tombstones, 0);
+    assert_eq!(s.route_cache.entries, 0);
+    assert_eq!(s.route_cache.hits, 0);
+    assert_eq!(s.route_cache.misses, 0);
     // A freshly-initialised blob holds the EmptyRoot sentinel, so
     // it has consumed some bump-area bytes and at least one slot.
     assert!(s.total_space_used > 0);

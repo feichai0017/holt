@@ -49,6 +49,12 @@
 //! | `holt_bm_max_cross_blob_depth`          | gauge   | `TreeStats::bm_max_cross_blob_depth`   |
 //! | `holt_bm_spillovers_total`              | counter | `TreeStats::bm_spillovers`             |
 //! | `holt_bm_merges_total`                  | counter | `TreeStats::bm_merges`                 |
+//! | `holt_route_cache_entries`              | gauge   | `TreeStats::route_cache.entries`       |
+//! | `holt_route_cache_hits_total`           | counter | `TreeStats::route_cache.hits`          |
+//! | `holt_route_cache_misses_total`         | counter | `TreeStats::route_cache.misses`        |
+//! | `holt_route_cache_learns_total`         | counter | `TreeStats::route_cache.learns`        |
+//! | `holt_route_cache_evictions_total`      | counter | `TreeStats::route_cache.evictions`     |
+//! | `holt_route_cache_invalidations_total`  | counter | `TreeStats::route_cache.invalidations` |
 //! | `holt_journal_appends_total`             | counter | `JournalStats::appends`                |
 //! | `holt_journal_batches_total`             | counter | `JournalStats::batches`                |
 //! | `holt_journal_syncs_total`               | counter | `JournalStats::syncs`                  |
@@ -76,9 +82,9 @@ use crate::api::stats::TreeStats;
 #[allow(clippy::too_many_lines)] // one `metric(...)` call per emit — splitting hides the export shape
 #[must_use]
 pub fn render_prometheus(stats: &TreeStats) -> String {
-    // Pre-size for the typical payload (~2.5 KB) to avoid the
+    // Pre-size for the typical payload (~3 KB) to avoid the
     // first few `String::push_str` reallocations.
-    let mut out = String::with_capacity(2560);
+    let mut out = String::with_capacity(3072);
 
     metric(
         &mut out,
@@ -216,6 +222,48 @@ pub fn render_prometheus(stats: &TreeStats) -> String {
         "counter",
         stats.bm_merges,
     );
+    metric(
+        &mut out,
+        "holt_route_cache_entries",
+        "Number of root route-cache entries currently resident.",
+        "gauge",
+        stats.route_cache.entries as u64,
+    );
+    metric(
+        &mut out,
+        "holt_route_cache_hits_total",
+        "Cumulative successful root route-cache lookups.",
+        "counter",
+        stats.route_cache.hits,
+    );
+    metric(
+        &mut out,
+        "holt_route_cache_misses_total",
+        "Cumulative root route-cache misses.",
+        "counter",
+        stats.route_cache.misses,
+    );
+    metric(
+        &mut out,
+        "holt_route_cache_learns_total",
+        "Cumulative root route-cache learned routes.",
+        "counter",
+        stats.route_cache.learns,
+    );
+    metric(
+        &mut out,
+        "holt_route_cache_evictions_total",
+        "Cumulative root route-cache capacity replacements.",
+        "counter",
+        stats.route_cache.evictions,
+    );
+    metric(
+        &mut out,
+        "holt_route_cache_invalidations_total",
+        "Cumulative root route-cache entries invalidated by root-version changes.",
+        "counter",
+        stats.route_cache.invalidations,
+    );
 
     if let Some(journal) = &stats.journal {
         metric(
@@ -306,7 +354,7 @@ fn metric_f64(out: &mut String, name: &str, help: &str, ty: &str, value: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::stats::{CheckpointerStats, JournalStats, TreeStats};
+    use crate::api::stats::{CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
 
     fn stats_fixture(with_journal: bool, with_checkpointer: bool) -> TreeStats {
         TreeStats {
@@ -329,6 +377,14 @@ mod tests {
             bm_max_cross_blob_depth: 17,
             bm_spillovers: 2,
             bm_merges: 1,
+            route_cache: RouteCacheStats {
+                entries: 6,
+                hits: 70,
+                misses: 8,
+                learns: 9,
+                evictions: 2,
+                invalidations: 1,
+            },
             journal: with_journal.then_some(JournalStats {
                 appends: 20,
                 batches: 5,
@@ -358,6 +414,12 @@ mod tests {
         assert!(out.contains("holt_bm_walker_ops_total 4\n"));
         assert!(out.contains("holt_bm_avg_blob_hops 2.500000\n"));
         assert!(out.contains("holt_bm_spillovers_total 2\n"));
+        assert!(out.contains("holt_route_cache_entries 6\n"));
+        assert!(out.contains("holt_route_cache_hits_total 70\n"));
+        assert!(out.contains("holt_route_cache_misses_total 8\n"));
+        assert!(out.contains("holt_route_cache_learns_total 9\n"));
+        assert!(out.contains("holt_route_cache_evictions_total 2\n"));
+        assert!(out.contains("holt_route_cache_invalidations_total 1\n"));
         // ...non-monotonic gauges (sum-over-reachable-blobs) drop it.
         assert!(out.contains("# TYPE holt_slots gauge\n"));
         assert!(out.contains("holt_slots 42\n"));

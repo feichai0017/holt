@@ -162,7 +162,7 @@ pub use api::tree::Tree;
 pub use engine::{RangeBuilder, RangeEntry, RangeIter};
 
 // Stats snapshots returned by `Tree::stats`.
-pub use api::stats::{BlobStats, CheckpointerStats, JournalStats, TreeStats};
+pub use api::stats::{BlobStats, CheckpointerStats, JournalStats, RouteCacheStats, TreeStats};
 
 // Single-record atomic batches.
 pub use api::atomic::{AtomicBatch, Record, RecordVersion};

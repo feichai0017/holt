@@ -626,6 +626,27 @@ fn insert_into_leaf(
             // `Leaf::live` always pins `tombstone = 0` so both write
             // paths naturally clear the bit in the new leaf body.
             let was_tombstoned = existing_leaf.tombstone != 0;
+            if !wants_prev
+                && !was_tombstoned
+                && matches!(condition, InsertCondition::Always)
+                && new_value.len() == usize::from(existing_leaf.value_size)
+            {
+                let key_len_u32 = new_key.len() as u32;
+                let value_offset = existing_leaf.key_offset + 2 + key_len_u32;
+                let region = frame
+                    .bytes_at_mut(value_offset, u32::from(existing_leaf.value_size))
+                    .ok_or(Error::node_corrupt(
+                        "insert_into_leaf: same-size value range out of bounds",
+                    ))?;
+                region.copy_from_slice(new_value);
+                let new_leaf = Leaf::live(existing_leaf.key_offset, existing_leaf.value_size, seq);
+                write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
+                return Ok(InsertReturn {
+                    slot_after: leaf_slot,
+                    previous: None,
+                    mutated: true,
+                });
+            }
             // Only materialise the prev value on the returning API
             // (`Tree::insert`). The blind `Tree::put` path skips the
             // `leaf_extent` walk + `.to_vec()` entirely.
