@@ -38,7 +38,7 @@
 //! The supported import surface is the flat crate root:
 //! [`Tree`], [`TreeBuilder`], [`AtomicBatch`], [`Record`],
 //! [`RecordVersion`], range iterator types, stats snapshots, and
-//! the optional [`metrics`] renderer.
+//! the optional `metrics` renderer.
 //!
 //! All implementation modules are crate-private. This keeps the
 //! on-disk format, WAL codec, walker, and buffer-manager internals
