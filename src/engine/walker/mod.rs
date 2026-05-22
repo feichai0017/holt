@@ -60,6 +60,7 @@ mod writers;
 
 pub use erase::{erase_multi, erase_multi_conditional};
 pub use insert::{insert_multi, insert_multi_conditional};
+pub(crate) use insert::{insert_multi_batch_conditional, InsertBatchItem};
 pub(crate) use key::SearchKey;
 pub use lookup::lookup_multi_with;
 pub use merge::try_merge_children;

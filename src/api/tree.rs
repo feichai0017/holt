@@ -1094,11 +1094,9 @@ impl Tree {
         while i < pending.len() {
             if batch_insert_parts(&pending[i]).is_some() {
                 let run_len = same_shape_insert_run_len(pending, i);
-                for op in &pending[i..i + run_len] {
-                    let seq = base_seq + seq_offset;
-                    seq_offset += 1;
-                    self.apply_batch_insert_walker(op, seq)?;
-                }
+                let first_seq = base_seq + seq_offset;
+                self.apply_batch_insert_run_walker(&pending[i..i + run_len], first_seq)?;
+                seq_offset += run_len as u64;
                 if let Some(enc) = enc.as_deref_mut() {
                     let (key, value) = batch_insert_parts(&pending[i])
                         .expect("insert run begins with insert-like op");
@@ -1189,50 +1187,57 @@ impl Tree {
         Ok(())
     }
 
-    fn apply_batch_insert_walker(&self, op: &BatchOp, seq: u64) -> Result<()> {
-        let (key, value, condition) = match op {
-            BatchOp::Put { key, value } => (key, value, engine::InsertCondition::Always),
-            BatchOp::PutIfAbsent { key, value } => (key, value, engine::InsertCondition::IfAbsent),
-            BatchOp::CompareAndPut {
-                key,
-                expected,
-                value,
-            } => (
-                key,
-                value,
-                engine::InsertCondition::IfVersion(expected.as_u64()),
-            ),
-            BatchOp::Delete { .. }
-            | BatchOp::DeleteIfVersion { .. }
-            | BatchOp::AssertVersion { .. }
-            | BatchOp::AssertPrefixEmpty { .. }
-            | BatchOp::Rename { .. } => unreachable!("not an insert-like batch op"),
-        };
-
-        let search = engine::SearchKey::user(key);
-        let outcome = engine::insert_multi_conditional(
-            &self.store,
-            &self.root_pin,
-            Some(&self.route_cache),
-            search,
-            value,
-            seq,
-            false,
-            condition,
-        )?;
-        if !outcome.mutated {
-            let context = match condition {
-                engine::InsertCondition::Always => "atomic insert unexpectedly did not mutate",
-                engine::InsertCondition::IfAbsent => "atomic preflight missed put_if_absent guard",
-                engine::InsertCondition::IfVersion(_) => {
-                    "atomic preflight missed compare_and_put guard"
+    fn apply_batch_insert_run_walker(&self, ops: &[BatchOp], first_seq: u64) -> Result<()> {
+        let mut items = Vec::with_capacity(ops.len());
+        for (idx, op) in ops.iter().enumerate() {
+            let seq = first_seq + idx as u64;
+            let (key, value, condition) = match op {
+                BatchOp::Put { key, value } => (key, value, engine::InsertCondition::Always),
+                BatchOp::PutIfAbsent { key, value } => {
+                    (key, value, engine::InsertCondition::IfAbsent)
                 }
+                BatchOp::CompareAndPut {
+                    key,
+                    expected,
+                    value,
+                } => (
+                    key,
+                    value,
+                    engine::InsertCondition::IfVersion(expected.as_u64()),
+                ),
+                BatchOp::Delete { .. }
+                | BatchOp::DeleteIfVersion { .. }
+                | BatchOp::AssertVersion { .. }
+                | BatchOp::AssertPrefixEmpty { .. }
+                | BatchOp::Rename { .. } => unreachable!("not an insert-like batch op"),
             };
-            return Err(Error::Internal(context));
+            items.push(engine::InsertBatchItem::new(
+                engine::SearchKey::user(key),
+                value,
+                seq,
+                condition,
+            ));
         }
-        if outcome.root_dirty {
-            self.store
-                .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+
+        let mut applied = 0usize;
+        while applied < items.len() {
+            let outcome = engine::insert_multi_batch_conditional(
+                &self.store,
+                &self.root_pin,
+                Some(&self.route_cache),
+                &items[applied..],
+            )?;
+            if outcome.applied == 0 {
+                return Err(Error::Internal("insert batch walker made no progress"));
+            }
+            if outcome.root_dirty {
+                self.store.mark_dirty_cached(
+                    self.root_guid,
+                    items[applied].seq,
+                    self.root_pin.as_ref(),
+                );
+            }
+            applied += outcome.applied;
         }
         Ok(())
     }

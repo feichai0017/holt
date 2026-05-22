@@ -1237,6 +1237,34 @@ fn atomic_conditional_ops_commit_in_order() {
 }
 
 #[test]
+fn atomic_insert_run_handles_blob_spillover() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let value = vec![0xCD; 4 * 1024];
+
+    assert!(tree
+        .atomic(|batch| {
+            for i in 0..256u32 {
+                let key = format!("bulk/path/object-{i:04}");
+                batch.put(key.as_bytes(), &value);
+            }
+        })
+        .unwrap());
+
+    for i in 0..256u32 {
+        let key = format!("bulk/path/object-{i:04}");
+        assert_eq!(
+            tree.get(key.as_bytes()).unwrap().as_deref(),
+            Some(&value[..])
+        );
+    }
+    let stats = tree.stats().unwrap();
+    assert!(
+        stats.blob_count >= 2,
+        "large atomic insert run should force at least one spillover"
+    );
+}
+
+#[test]
 fn is_prefix_empty_tracks_live_keys() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     assert!(tree.is_prefix_empty(b"dir/").unwrap());

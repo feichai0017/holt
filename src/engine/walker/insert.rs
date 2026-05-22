@@ -227,6 +227,253 @@ pub fn insert_multi_conditional(
     outcome
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct InsertBatchItem<'a> {
+    pub(crate) key: SearchKey<'a>,
+    pub(crate) value: &'a [u8],
+    pub(crate) seq: u64,
+    condition: InsertCondition,
+}
+
+impl<'a> InsertBatchItem<'a> {
+    pub(crate) const fn new(
+        key: SearchKey<'a>,
+        value: &'a [u8],
+        seq: u64,
+        condition: InsertCondition,
+    ) -> Self {
+        Self {
+            key,
+            value,
+            seq,
+            condition,
+        }
+    }
+}
+
+pub(crate) struct InsertBatchOutcome {
+    pub(crate) root_dirty: bool,
+    pub(crate) applied: usize,
+}
+
+/// Apply a consecutive atomic-batch insert run while reusing the
+/// first pinned blob when possible. This deliberately stops at the
+/// first deeper BlobNode crossing or blob-space miss and lets the
+/// caller retry the remaining suffix through the normal
+/// single-operation walker. That keeps split/cross-blob correctness
+/// on the mature path while removing latch/pin churn from the common
+/// "many same-prefix metadata updates in one atomic batch" case.
+pub(crate) fn insert_multi_batch_conditional(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    items: &[InsertBatchItem<'_>],
+) -> Result<InsertBatchOutcome> {
+    if items.is_empty() {
+        return Ok(InsertBatchOutcome {
+            root_dirty: false,
+            applied: 0,
+        });
+    }
+    for item in items {
+        if item.key.len() > u16::MAX as usize {
+            return Err(Error::KeyTooLong {
+                len: item.key.len(),
+            });
+        }
+        if item.value.len() > u16::MAX as usize {
+            return Err(Error::ValueTooLong {
+                len: item.value.len(),
+            });
+        }
+    }
+
+    let batched = try_insert_batch_from_first_blob(bm, root_pin, route_cache, items)?;
+    if batched.applied != 0 {
+        return Ok(batched);
+    }
+
+    let first = items[0];
+    let outcome = insert_multi_conditional(
+        bm,
+        root_pin,
+        route_cache,
+        first.key,
+        first.value,
+        first.seq,
+        false,
+        first.condition,
+    )?;
+    if !outcome.mutated {
+        return Err(Error::Internal(
+            "insert batch condition unexpectedly failed",
+        ));
+    }
+    Ok(InsertBatchOutcome {
+        root_dirty: outcome.root_dirty,
+        applied: 1,
+    })
+}
+
+fn try_insert_batch_from_first_blob(
+    bm: &BufferManager,
+    root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
+    items: &[InsertBatchItem<'_>],
+) -> Result<InsertBatchOutcome> {
+    let first_key = items[0].key;
+
+    {
+        let root_read = root_pin.read();
+        let root_version = root_pin.content_version();
+        if let Some(route) = route_cache.and_then(|cache| cache.lookup(first_key, root_version)) {
+            let run_len = same_child_prefix_run_len(items, route.child_depth);
+            let child_pin = bm.pin(route.child_guid)?;
+            let child_guard = child_pin.write();
+            drop(root_read);
+
+            let outcome = insert_batch_in_pinned_blob(
+                bm,
+                child_guard,
+                child_pin.as_ref(),
+                route.child_guid,
+                false,
+                &items[..run_len],
+                route.child_depth,
+                2,
+            );
+            drop(child_pin);
+            return outcome;
+        }
+
+        let root_crossing = {
+            let frame = BlobFrameRef::wrap(root_read.as_slice());
+            let root_slot = frame.header().root_slot;
+            match lookup_at(frame, root_slot, first_key, 0)? {
+                LookupResult::Crossing(crossing) => Some(crossing),
+                LookupResult::Found(_) | LookupResult::NotFound => None,
+            }
+        };
+        if let Some(crossing) = root_crossing {
+            if let Some(cache) = route_cache {
+                cache.learn(
+                    first_key,
+                    root_version,
+                    crossing.child_guid,
+                    crossing.child_depth,
+                );
+            }
+            let run_len = same_child_prefix_run_len(items, crossing.child_depth);
+            let child_pin = bm.pin(crossing.child_guid)?;
+            let child_guard = child_pin.write();
+            drop(root_read);
+
+            let outcome = insert_batch_in_pinned_blob(
+                bm,
+                child_guard,
+                child_pin.as_ref(),
+                crossing.child_guid,
+                false,
+                &items[..run_len],
+                crossing.child_depth,
+                2,
+            );
+            drop(child_pin);
+            return outcome;
+        }
+        drop(root_read);
+    }
+
+    let mut guard = root_pin.write();
+    let root_guid = {
+        let frame = guard.frame();
+        frame.header().blob_guid
+    };
+    insert_batch_in_pinned_blob(bm, guard, root_pin.as_ref(), root_guid, true, items, 0, 1)
+}
+
+fn same_child_prefix_run_len(items: &[InsertBatchItem<'_>], child_depth: usize) -> usize {
+    let Some(prefix) = items[0].key.user_prefix(child_depth) else {
+        return 1;
+    };
+    let mut len = 1usize;
+    while len < items.len() {
+        match items[len].key.user_prefix(child_depth) {
+            Some(candidate) if candidate == prefix => len += 1,
+            _ => break,
+        }
+    }
+    len
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_batch_in_pinned_blob(
+    bm: &BufferManager,
+    mut guard: BlobWriteGuard<'_>,
+    current_entry: &CachedBlob,
+    current_guid: crate::layout::BlobGuid,
+    is_top_blob: bool,
+    items: &[InsertBatchItem<'_>],
+    depth: usize,
+    blob_hops_per_item: u64,
+) -> Result<InsertBatchOutcome> {
+    let mut applied = 0usize;
+    let mut dirty = false;
+    let mut needs_compaction = false;
+
+    for item in items {
+        let r = {
+            let mut frame = guard.frame();
+            let root_slot = frame.header().root_slot;
+            insert_at_step(
+                &mut frame,
+                root_slot,
+                item.key,
+                item.value,
+                depth,
+                item.seq,
+                false,
+                item.condition,
+                true,
+            )
+        };
+        match r {
+            Ok(InsertStep::Done(out)) => {
+                if !out.mutated {
+                    return Err(Error::Internal(
+                        "insert batch condition unexpectedly failed",
+                    ));
+                }
+                {
+                    let mut frame = guard.frame();
+                    frame.header_mut().root_slot = out.slot_after;
+                    needs_compaction |= blob_needs_compaction(frame.as_ref());
+                }
+                applied += 1;
+                dirty = true;
+                bm.note_walker_blob_hops(blob_hops_per_item, depth);
+            }
+            Ok(InsertStep::Crossing(_))
+            | Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => break,
+            Err(e) => return Err(e.with_blob_guid(current_guid)),
+        }
+    }
+
+    drop(guard);
+
+    if needs_compaction {
+        bm.note_compaction_candidate(current_guid);
+    }
+    if dirty && !is_top_blob {
+        bm.mark_dirty_cached(current_guid, items[0].seq, current_entry);
+    }
+
+    Ok(InsertBatchOutcome {
+        root_dirty: is_top_blob && dirty,
+        applied,
+    })
+}
+
 #[derive(Debug, Clone, Copy)]
 struct InsertBlobCrossing {
     child_guid: crate::layout::BlobGuid,
