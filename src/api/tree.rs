@@ -84,9 +84,8 @@ fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
 /// - **Writes** (`put`, `delete`) hold the per-blob `HybridLatch`
 ///   exclusively for the blobs they touch. Persistent trees enter
 ///   the writer-shared `commit_gate` while publishing dirty state
-///   and the journal record. `WalCommit::Write` appends directly;
-///   `WalCommit::Sync` waits for the journal worker after leaving
-///   the gate.
+///   and the journal record. If `TreeConfig::wal_sync` is set,
+///   writes wait for the journal worker after leaving the gate.
 /// - **Maintenance** (`compact`, background merge) takes short
 ///   exclusive windows on `maintenance_gate` while folding/deleting
 ///   cross-blob edges. Blob-local compaction runs on the shared
@@ -486,7 +485,7 @@ impl Tree {
                 let mut record =
                     Vec::with_capacity(encoded_insert_record_len(key.len(), value.len()));
                 encode_insert_record(&mut record, seq, 0, key, value);
-                let ack = journal.submit(record, self.cfg.wal_commit)?;
+                let ack = journal.submit(record, self.cfg.wal_sync)?;
                 (outcome, ack)
             } else {
                 (outcome, None)
@@ -586,7 +585,7 @@ impl Tree {
                 }
                 let mut record = Vec::with_capacity(encoded_erase_record_len(key.len()));
                 encode_erase_record(&mut record, seq, 0, key);
-                let ack = journal.submit(record, self.cfg.wal_commit)?;
+                let ack = journal.submit(record, self.cfg.wal_sync)?;
                 (outcome, ack)
             } else {
                 (outcome, None)
@@ -695,7 +694,7 @@ impl Tree {
             let mut record =
                 Vec::with_capacity(encoded_rename_object_record_len(src.len(), dst.len()));
             encode_rename_object_record(&mut record, seq, 0, src, dst, force);
-            journal.submit(record, self.cfg.wal_commit)?
+            journal.submit(record, self.cfg.wal_sync)?
         } else {
             let erase_out = engine::erase_multi(
                 &self.store,
@@ -808,7 +807,7 @@ impl Tree {
                 let mut enc = BatchEncoder::begin(&mut record, base_seq, 0);
                 self.apply_batch_walker_inline(&pending, base_seq, Some(&mut enc))?;
                 let _n = enc.finish();
-                journal.submit(record, self.cfg.wal_commit)?
+                journal.submit(record, self.cfg.wal_sync)?
             };
             if let Some(ack) = ack {
                 ack.wait()?;

@@ -11,26 +11,6 @@ use std::path::PathBuf;
 
 use crate::checkpoint::CheckpointConfig;
 
-/// Commit acknowledgement boundary for file-backed WAL writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WalCommit {
-    /// Return after the WAL command is accepted by the journal
-    /// worker queue. Highest foreground throughput, but an
-    /// immediate process crash can lose queued records unless a
-    /// checkpoint or later flush drains them first.
-    Enqueue,
-    /// Return after the WAL bytes have reached the OS page cache.
-    /// This matches the usual
-    /// `WAL on, sync=false` benchmark/profile: process-crash
-    /// recovery can replay the record, but power-loss durability is
-    /// not forced per operation.
-    Write,
-    /// Return after the journal worker has called `sync_data`.
-    /// This is the per-operation power-loss durability boundary;
-    /// concurrent writers can share one fsync through group commit.
-    Sync,
-}
-
 /// Where the tree's data lives.
 ///
 /// `File` is the production target. `Memory` is for tests,
@@ -63,15 +43,14 @@ pub struct TreeConfig {
     /// How many 512 KB blob frames to keep pinned in the buffer
     /// pool. Default 64 (= 32 MB resident).
     pub buffer_pool_size: usize,
-    /// Controls the WAL acknowledgement boundary on every
-    /// file-backed mutation. The default [`WalCommit::Enqueue`]
-    /// keeps foreground metadata writes on the async journal path.
-    /// Benchmarks that want RocksDB-style `WAL on, sync=false`
-    /// should set [`WalCommit::Write`] explicitly.
-    pub wal_commit: WalCommit,
+    /// If `true`, each file-backed mutation waits until the
+    /// journal worker calls `sync_data`. The default `false`
+    /// returns after the journal worker queue accepts the encoded
+    /// WAL record.
+    pub wal_sync: bool,
     /// **Memory-only** BM-commit toggle (no effect on
     /// file-backed trees — the WAL + `Tree::checkpoint` is the
-    /// durability path there; see [`Self::wal_commit`]).
+    /// durability path there; see [`Self::wal_sync`]).
     ///
     /// For memory trees: `true` (the default) drains the BM
     /// dirty set into the backing `BlobStore` after every `put` /
@@ -96,7 +75,7 @@ impl TreeConfig {
         Self {
             storage: Storage::File { dir: dir.into() },
             buffer_pool_size: 64,
-            wal_commit: WalCommit::Enqueue,
+            wal_sync: false,
             memory_flush_on_write: true,
             checkpoint: CheckpointConfig::default(),
         }
@@ -108,7 +87,7 @@ impl TreeConfig {
         Self {
             storage: Storage::Memory,
             buffer_pool_size: 64,
-            wal_commit: WalCommit::Enqueue,
+            wal_sync: false,
             memory_flush_on_write: true,
             checkpoint: CheckpointConfig {
                 enabled: false,

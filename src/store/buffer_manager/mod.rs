@@ -755,17 +755,22 @@ impl BufferManager {
     }
 
     fn mark_dirty_with_hint(&self, guid: BlobGuid, seq: u64, cached: Option<&CachedBlob>) {
-        if let Some(entry) = cached {
-            if !entry.dirty_hint_needs_map_publish(seq) {
-                return;
-            }
-        }
+        let hint_covers_seq = cached.is_some_and(|entry| !entry.dirty_hint_needs_map_publish(seq));
         let mut state = self.mutation_shard(guid).lock().unwrap();
         if state.pending_deletes.contains_key(&guid) {
             if let Some(entry) = cached {
                 entry.clear_dirty_hint();
             }
             return;
+        }
+        if hint_covers_seq && matches!(state.dirty.get(&guid), Some(cur) if *cur <= seq) {
+            return;
+        }
+        if hint_covers_seq {
+            if let Some(entry) = cached {
+                entry.clear_dirty_hint();
+                let _ = entry.dirty_hint_needs_map_publish(seq);
+            }
         }
         state
             .dirty
@@ -1613,6 +1618,24 @@ mod tests {
         assert_eq!(
             next[&guid], 30,
             "mark_dirty after snapshot must publish a fresh dirty entry",
+        );
+    }
+
+    #[test]
+    fn stale_dirty_hint_cannot_skip_dirty_map_publish() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0xD3; 16];
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let pin = bm.pin(guid).unwrap();
+
+        assert!(pin.dirty_hint_needs_map_publish(10));
+        bm.mark_dirty(guid, 20);
+
+        let snap = bm.snapshot_dirty();
+        assert_eq!(
+            snap[&guid], 20,
+            "a stale hint without a dirty-map entry must not hide a fresh write",
         );
     }
 

@@ -1,11 +1,9 @@
 //! WAL append coordinator.
 //!
 //! `WalWriter` owns the file format and append/truncate mechanics.
-//! This module owns concurrency around the WAL file. `Enqueue` and
-//! `Sync` records go through the worker; `Write` records use a
-//! foreground append fast path. The tree already serializes publish
-//! order with `commit_gate`, so synchronous no-fsync WAL append can
-//! avoid a channel hop and scheduler round trip.
+//! This module owns concurrency around the WAL file. All append
+//! records go through the worker, so foreground writers do not
+//! perform per-operation WAL file writes.
 
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use std::collections::VecDeque;
@@ -14,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::api::config::WalCommit;
 use crate::api::errors::{Error, Result};
 
 use super::writer::WalWriter;
@@ -55,9 +52,9 @@ struct AppendRequest {
 
 /// Completion handle for one acknowledged journal append.
 ///
-/// `WalCommit::Sync` waits until its batch has reached the
-/// `sync_data` durability boundary. `Enqueue` returns without an
-/// acknowledgement handle.
+/// Synchronous appends wait until their batch has reached the
+/// `sync_data` durability boundary. Asynchronous appends return
+/// without an acknowledgement handle.
 pub(crate) struct JournalAck {
     rx: AckRx,
 }
@@ -72,14 +69,12 @@ impl JournalAck {
 
 /// WAL append coordinator.
 ///
-/// `Enqueue` records are serialized by the background worker.
-/// `Write` records are appended directly by the foreground writer,
-/// and `Sync` waiters share one `sync_data` when they arrive inside
-/// the short group window.
+/// Async records are serialized by the background worker, and
+/// `wal_sync = true` waiters share one `sync_data` when they arrive
+/// inside the short group window.
 pub(crate) struct Journal {
     tx: Sender<JournalCommand>,
     handle: Mutex<Option<JoinHandle<()>>>,
-    writer: Arc<Mutex<WalWriter>>,
     appends: Arc<AtomicU64>,
     batches: Arc<AtomicU64>,
     syncs: Arc<AtomicU64>,
@@ -126,7 +121,6 @@ impl Journal {
         Ok(Self {
             tx,
             handle: Mutex::new(Some(handle)),
-            writer,
             appends: Arc::new(AtomicU64::new(0)),
             batches,
             syncs,
@@ -138,19 +132,8 @@ impl Journal {
     }
 
     /// Submit one fully encoded WAL record.
-    ///
-    /// `WalCommit::Write` takes the foreground fast path. The tree
-    /// calls this while holding `commit_gate`, so the direct append
-    /// preserves mutation/WAL order without routing through the
-    /// worker.
-    pub(crate) fn submit(&self, bytes: Vec<u8>, commit: WalCommit) -> Result<Option<JournalAck>> {
-        if matches!(commit, WalCommit::Write) {
-            self.append_write_direct(&bytes)?;
-            return Ok(None);
-        }
-
-        let needs_ack = !matches!(commit, WalCommit::Enqueue);
-        let (ack, rx) = if needs_ack {
+    pub(crate) fn submit(&self, bytes: Vec<u8>, sync: bool) -> Result<Option<JournalAck>> {
+        let (ack, rx) = if sync {
             let (ack, rx) = bounded(1);
             (Some(ack), Some(rx))
         } else {
@@ -161,29 +144,13 @@ impl Journal {
             .send(JournalCommand::Append {
                 bytes,
                 seq,
-                sync: matches!(commit, WalCommit::Sync),
+                sync,
                 ack,
             })
             .map_err(|_| Error::Internal("journal worker stopped before append"))?;
         self.appends.fetch_add(1, Ordering::Relaxed);
         self.wal_work.fetch_max(seq, Ordering::Release);
         Ok(rx.map(|rx| JournalAck { rx }))
-    }
-
-    fn append_write_direct(&self, bytes: &[u8]) -> Result<()> {
-        let seq = self.next_work.fetch_add(1, Ordering::AcqRel) + 1;
-        {
-            let mut writer = self
-                .writer
-                .lock()
-                .map_err(|_| Error::Internal("journal writer mutex poisoned"))?;
-            writer.append_encoded(bytes)?;
-            writer.drain_to_os()?;
-        }
-        self.appends.fetch_add(1, Ordering::Relaxed);
-        self.batches.fetch_add(1, Ordering::Relaxed);
-        self.wal_work.fetch_max(seq, Ordering::Release);
-        Ok(())
     }
 
     /// Highest WAL work id published by append paths.
@@ -449,9 +416,7 @@ mod tests {
         let path = dir.path().join("journal.wal");
         let journal = Journal::open_or_create(&path, 0).unwrap();
 
-        journal
-            .submit(vec![1, 2, 3, 4], WalCommit::Enqueue)
-            .unwrap();
+        journal.submit(vec![1, 2, 3, 4], false).unwrap();
         assert!(journal.needs_checkpoint());
         journal.flush_up_to(journal.wal_work()).unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() > FILE_HEADER_SIZE as u64);
@@ -475,7 +440,7 @@ mod tests {
         let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
 
         let ack = journal
-            .submit(vec![5, 6, 7, 8], WalCommit::Sync)
+            .submit(vec![5, 6, 7, 8], true)
             .unwrap()
             .expect("durable append returns an ack");
         ack.wait().unwrap();
@@ -491,19 +456,20 @@ mod tests {
     }
 
     #[test]
-    fn write_ack_drains_to_os_without_fsync() {
+    fn enqueue_append_is_flushed_by_later_barrier() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("journal.wal");
         let journal = Journal::open_or_create(&path, 0).unwrap();
 
-        let ack = journal.submit(vec![1, 3, 5, 7], WalCommit::Write).unwrap();
+        let ack = journal.submit(vec![1, 3, 5, 7], false).unwrap();
         assert!(ack.is_none());
 
+        journal.flush_up_to(journal.wal_work()).unwrap();
         assert!(std::fs::metadata(&path).unwrap().len() > FILE_HEADER_SIZE as u64);
-        assert!(journal.needs_flush());
-        assert_eq!(journal.stats().syncs, 0);
+        assert!(!journal.needs_flush());
+        assert_eq!(journal.stats().syncs, 1);
         assert_eq!(journal.stats().appends, 1);
-        assert_eq!(journal.stats().batches, 1);
+        assert!(journal.stats().batches >= 1);
     }
 
     #[test]
@@ -512,9 +478,7 @@ mod tests {
         let path = dir.path().join("journal.wal");
         {
             let journal = Journal::open_or_create(&path, 0).unwrap();
-            journal
-                .submit(vec![9, 8, 7, 6], WalCommit::Enqueue)
-                .unwrap();
+            journal.submit(vec![9, 8, 7, 6], false).unwrap();
             journal.flush_up_to(journal.wal_work()).unwrap();
             assert!(journal.needs_checkpoint());
         }

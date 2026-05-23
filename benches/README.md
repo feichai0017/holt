@@ -151,27 +151,22 @@ HOLT_STRESS_LIST_TAKE=1000 \
 HOLT_STRESS_DIR_TAKE=32 \
 cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 
-# Exercise Holt's product-default WAL acknowledgement boundary.
-HOLT_STRESS_WAL_COMMIT=enqueue \
+# Exercise per-operation WAL sync.
+HOLT_STRESS_WAL_SYNC=true \
 cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 ```
 
 Profile: single-threaded, warm-service, file-backed persistent
-engines with WAL enabled and no per-op fsync. Holt uses
-`TreeConfig::new(tempdir)` with `WalCommit::Write` and the default
-background checkpointer; RocksDB uses WAL on with `sync = false`;
-SQLite uses a file-backed WAL database with `synchronous = OFF`.
-This is the fair persistent hot path: WAL bytes are written before
-the operation returns, but power-loss durability is not forced per
-operation.
+engines with WAL enabled. Holt uses `TreeConfig::new(tempdir)` with
+the default async journal acknowledgement (`wal_sync = false`) and
+the default background checkpointer; RocksDB uses WAL on with
+`sync = false`; SQLite uses a file-backed WAL database with
+`synchronous = OFF`. This is the product-default persistent hot
+path, not a per-operation power-loss durability benchmark.
 sled can be selected as an embedded-KV peer, but its flush controls
 do not map exactly to this WAL-on/no-fsync matrix; the harness runs
 it in high-throughput mode with background flush disabled during
 the timed section.
-
-Set `HOLT_STRESS_WAL_COMMIT=enqueue` to measure Holt's product
-default, where foreground writes return after the journal worker
-accepts the record.
 
 ## Concurrent Harness
 
@@ -235,9 +230,9 @@ a cold data-file I/O benchmark:
 
 - **holt**: `TreeConfig::new(tempdir)` (FileBlobStore with
   `F_NOCACHE` on macOS / `O_DIRECT` on Linux) and
-  `WalCommit::Write`. Every mutation waits until its encoded WAL
-  record reaches the OS page cache; blobs only hit disk at
-  checkpoint.
+  `wal_sync = false`. Foreground mutations return after the journal
+  worker queue accepts the encoded WAL record; blobs only hit disk
+  at checkpoint.
 - **RocksDB**: temp-dir DB, `disable_wal = false`, `sync = false`.
   Each `put` appends to the WAL (buffered) plus the memtable.
 - **SQLite**: file-backed DB, `journal_mode=WAL`,

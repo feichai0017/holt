@@ -19,7 +19,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 use std::slice;
 
-use holt::{KeyRangeEntry, KeyRangeIter, RangeEntry, RangeIter, Tree, TreeBuilder, WalCommit};
+use holt::{KeyRangeEntry, KeyRangeIter, RangeEntry, RangeIter, Tree, TreeBuilder};
 
 /// Successful FFI call.
 pub const HOLT_OK: i32 = 0;
@@ -27,13 +27,6 @@ pub const HOLT_OK: i32 = 0;
 pub const HOLT_ITER_END: i32 = 1;
 /// FFI call failed; inspect `holt_last_error_message`.
 pub const HOLT_ERR: i32 = -1;
-
-/// WAL enqueue acknowledgement mode.
-pub const HOLT_WAL_ENQUEUE: u32 = 0;
-/// WAL write-to-OS-page-cache acknowledgement mode.
-pub const HOLT_WAL_WRITE: u32 = 1;
-/// WAL `sync_data` acknowledgement mode.
-pub const HOLT_WAL_SYNC: u32 = 2;
 
 /// `HoltEntry` is a key/value record.
 pub const HOLT_ENTRY_KEY: u32 = 1;
@@ -183,15 +176,6 @@ unsafe fn cstr_arg<'a>(ptr: *const c_char, name: &str) -> FfiResult<&'a CStr> {
     Ok(unsafe { CStr::from_ptr(ptr) })
 }
 
-fn wal_commit_from_raw(raw: u32) -> FfiResult<WalCommit> {
-    match raw {
-        HOLT_WAL_ENQUEUE => Ok(WalCommit::Enqueue),
-        HOLT_WAL_WRITE => Ok(WalCommit::Write),
-        HOLT_WAL_SYNC => Ok(WalCommit::Sync),
-        _ => Err(format!("holt ffi: unknown WAL commit mode {raw}")),
-    }
-}
-
 fn into_ffi_bytes(bytes: Vec<u8>) -> HoltBytes {
     if bytes.is_empty() {
         return HoltBytes::default();
@@ -241,7 +225,7 @@ pub extern "C" fn holt_last_error_message() -> *const c_char {
     LAST_ERROR.with(|cell| cell.borrow().as_ptr())
 }
 
-/// Open a file-backed tree with an explicit WAL acknowledgement mode.
+/// Open a file-backed tree with optional per-operation WAL sync.
 ///
 /// # Safety
 ///
@@ -249,16 +233,15 @@ pub extern "C" fn holt_last_error_message() -> *const c_char {
 /// must be a valid writable pointer. On success, the caller owns
 /// `*out` and must pass it to [`holt_tree_close`].
 #[no_mangle]
-pub unsafe extern "C" fn holt_tree_open_with_wal_commit(
+pub unsafe extern "C" fn holt_tree_open_with_wal_sync(
     path: *const c_char,
-    wal_commit: u32,
+    wal_sync: u8,
     out: *mut *mut HoltTree,
 ) -> i32 {
     boundary(|| {
         let path = unsafe { open_path(path) }?;
-        let wal_commit = wal_commit_from_raw(wal_commit)?;
         let tree = TreeBuilder::new(path)
-            .wal_commit(wal_commit)
+            .wal_sync(wal_sync != 0)
             .open()
             .map_err(|err| err.to_string())?;
         assign_tree(out, tree)
@@ -782,7 +765,7 @@ mod tests {
 
             let mut tree = ptr::null_mut();
             assert_eq!(
-                holt_tree_open_with_wal_commit(path.as_ptr(), HOLT_WAL_WRITE, &mut tree),
+                holt_tree_open_with_wal_sync(path.as_ptr(), 0, &mut tree),
                 HOLT_OK
             );
             assert_eq!(
@@ -794,7 +777,7 @@ mod tests {
 
             let mut reopened = ptr::null_mut();
             assert_eq!(
-                holt_tree_open_with_wal_commit(path.as_ptr(), HOLT_WAL_ENQUEUE, &mut reopened),
+                holt_tree_open_with_wal_sync(path.as_ptr(), 0, &mut reopened),
                 HOLT_OK
             );
             let mut record = HoltRecord::default();
@@ -928,19 +911,11 @@ mod tests {
     }
 
     #[test]
-    fn reports_invalid_open_mode_and_path() {
+    fn reports_invalid_open_path() {
         unsafe {
             let mut tree = ptr::null_mut();
-            let path = CString::new("unused").unwrap();
             assert_eq!(
-                holt_tree_open_with_wal_commit(path.as_ptr(), 99, &mut tree),
-                HOLT_ERR
-            );
-            let msg = CStr::from_ptr(holt_last_error_message()).to_str().unwrap();
-            assert!(msg.contains("unknown WAL commit mode 99"));
-
-            assert_eq!(
-                holt_tree_open_with_wal_commit(ptr::null(), HOLT_WAL_ENQUEUE, &mut tree),
+                holt_tree_open_with_wal_sync(ptr::null(), 0, &mut tree),
                 HOLT_ERR
             );
             let msg = CStr::from_ptr(holt_last_error_message()).to_str().unwrap();

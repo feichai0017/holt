@@ -223,8 +223,7 @@ pub struct JournalStats {
     /// Number of WAL append requests submitted by foreground
     /// mutation paths.
     pub appends: u64,
-    /// Number of WAL write groups: foreground `Write` appends plus
-    /// worker batches for `Enqueue` / `Sync`.
+    /// Number of WAL write groups emitted by the journal worker.
     pub batches: u64,
     /// Number of `sync_data` calls issued by WAL flush paths,
     /// including explicit checkpoint barriers.

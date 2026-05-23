@@ -305,7 +305,7 @@ The remaining v0.3 concurrency cleanup is now in place:
   enter the writer-shared `CommitGate` only for walker mutation +
   dirty publish + journal submission, then wait for the journal
   acknowledgement outside that gate.
-- `WalCommit::Sync` writers are batched by a short group
+- `wal_sync = true` writers are batched by a short group
   window; the journal worker appends every queued record and calls
   `sync_data` once for all sync waiters in the batch.
 - Manual and background checkpoint rounds use the same

@@ -29,7 +29,7 @@ checks the header-level ABI surface.
 
 Tree lifecycle:
 
-- `holt_tree_open_with_wal_commit(path, wal_commit, &tree)`
+- `holt_tree_open_with_wal_sync(path, wal_sync, &tree)`
 - `holt_tree_open_memory(&tree)`
 - `holt_tree_close(tree)`
 

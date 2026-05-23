@@ -106,13 +106,13 @@ layout, WAL, walker, and buffer-manager modules are not public API.
 Two storage modes; same `TreeBuilder`, one knob switches between them:
 
 ```rust
-use holt::{TreeBuilder, WalCommit};
+use holt::TreeBuilder;
 
 // File-backed production mode, Unix-only — Linux `O_DIRECT`,
 // macOS `F_NOCACHE`. The directory is created if missing.
 let tree = TreeBuilder::new("/var/lib/myapp/meta.holt")
     .buffer_pool_size(128)        // pinned 512 KB blobs (default 64)
-    .wal_commit(WalCommit::Enqueue) // default async journal acknowledgement
+    .wal_sync(false)              // default async journal acknowledgement
     .open()?;
 
 // In-memory — volatile, dies with the last handle. The path
@@ -251,15 +251,10 @@ tree.view(b"img/", |view| {
 ### Durability
 
 Per-op writes update the BufferManager cache and append one WAL
-record. The WAL acknowledgement boundary is explicit:
-
-- **`WalCommit::Enqueue`** — default. Return after the journal
-  worker queue accepts the encoded record.
-- **`WalCommit::Write`** — return after WAL bytes reach the OS
-  page cache, with no per-op `sync_data`. This direct append path is
-  the benchmark profile matching RocksDB `WAL on, sync=false`.
-- **`WalCommit::Sync`** — return after `sync_data`; concurrent
-  writers can share one fsync through group commit.
+record. By default (`wal_sync = false`), foreground writes return
+after the journal worker queue accepts the encoded record. Set
+`wal_sync = true` to wait for `sync_data`; concurrent writers can
+share one fsync through group commit.
 
 Disk-truth advances at:
 

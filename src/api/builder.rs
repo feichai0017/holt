@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::config::{Storage, TreeConfig, WalCommit};
+use super::config::{Storage, TreeConfig};
 use super::tree::Tree;
 use crate::api::errors::Result;
 use crate::checkpoint::CheckpointConfig;
@@ -15,7 +15,7 @@ use crate::store::blob_store::BlobStore;
 /// // Persistent (the default):
 /// let tree = holt::TreeBuilder::new("/var/lib/myapp")
 ///     .buffer_pool_size(128)
-///     .wal_commit(holt::WalCommit::Sync)
+///     .wal_sync(true)
 ///     .open()?;
 ///
 /// // In-memory (volatile, for tests / scratch):
@@ -51,9 +51,9 @@ impl TreeBuilder {
         self
     }
 
-    /// Set the file-backed WAL acknowledgement boundary.
-    pub fn wal_commit(mut self, mode: WalCommit) -> Self {
-        self.cfg.wal_commit = mode;
+    /// Set per-operation WAL `sync_data`.
+    pub fn wal_sync(mut self, enabled: bool) -> Self {
+        self.cfg.wal_sync = enabled;
         self
     }
 

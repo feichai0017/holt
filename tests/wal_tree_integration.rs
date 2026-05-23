@@ -2,9 +2,9 @@
 //!
 //! Cover:
 //! - Persistent put/delete/rename round-trip through reopen with
-//!   `WalCommit::Sync` (verifies WAL replay reconstructs
+//!   `wal_sync = true` (verifies WAL replay reconstructs
 //!   the logical state on a crash-without-checkpoint).
-//! - "Enqueue mode without background checkpoint loses unflushed" —
+//! - "Async WAL without background checkpoint loses unflushed" —
 //!   with manual checkpointing and no durable per-op journal wait, a
 //!   drop without `checkpoint()` leaves the disk WAL empty and reopen
 //!   sees the pre-mutation state.
@@ -17,7 +17,7 @@ use std::thread;
 
 use tempfile::tempdir;
 
-use holt::{Tree, TreeConfig, WalCommit};
+use holt::{Tree, TreeConfig};
 
 fn wal_path(dir: &Path) -> PathBuf {
     dir.join("journal.wal")
@@ -29,12 +29,12 @@ fn manual_checkpoint_cfg(dir: &std::path::Path) -> TreeConfig {
     cfg
 }
 
-/// `TreeConfig::new(dir)` plus `WalCommit::Sync` — tests that
+/// `TreeConfig::new(dir)` plus `wal_sync = true` — tests that
 /// simulate power-safe crash recovery without checkpoint need every
 /// record fsync'd before drop.
 fn durable_cfg(dir: &std::path::Path) -> TreeConfig {
     let mut cfg = manual_checkpoint_cfg(dir);
-    cfg.wal_commit = WalCommit::Sync;
+    cfg.wal_sync = true;
     cfg
 }
 
@@ -150,7 +150,7 @@ fn persistent_put_then_reopen_via_wal_replay() {
     let cfg = durable_cfg(dir.path());
 
     // Round 1: open, put, drop without checkpoint. Per-op WAL
-    // fsync is on (`WalCommit::Sync`), so every record
+    // fsync is on (`wal_sync = true`), so every record
     // is on disk before the drop.
     {
         let tree = Tree::open(cfg.clone()).unwrap();
@@ -366,7 +366,7 @@ fn conditional_writes_replay_through_wal() {
 
 #[test]
 fn enqueue_mode_loses_writes_without_checkpoint_or_fsync() {
-    // Under `WalCommit::Enqueue` with background checkpointing
+    // Under `wal_sync = false` with background checkpointing
     // disabled, the journal worker can still hold records in process
     // memory. A short workload + drop-without-checkpoint = nothing
     // durable — exactly the high-throughput trade-off.
@@ -565,7 +565,7 @@ fn many_round_trips_through_checkpoint_boundaries() {
 fn batch_persists_through_crash_and_replay() {
     // Tree::atomic emits one Batch WAL record; on reopen the replay
     // unpacks it transparently into per-inner callbacks so every
-    // op in the batch comes back. `WalCommit::Sync`
+    // op in the batch comes back. `wal_sync = true`
     // makes the simulated crash drop right after the batch flush.
     let dir = tempdir().unwrap();
     let cfg = durable_cfg(dir.path());
@@ -814,11 +814,11 @@ fn failed_atomic_guard_does_not_append_wal_or_publish() {
 
 #[test]
 fn batch_crash_before_flush_loses_whole_batch() {
-    // `WalCommit::Enqueue` with background checkpointing disabled:
+    // `wal_sync = false` with background checkpointing disabled:
     // if we drop without checkpoint, the OS may not have flushed the
     // batch record yet, so the whole batch is rolled back on reopen.
     let dir = tempdir().unwrap();
-    let cfg = manual_checkpoint_cfg(dir.path()); // WalCommit::Enqueue
+    let cfg = manual_checkpoint_cfg(dir.path()); // wal_sync = false
 
     {
         let tree = Tree::open(cfg.clone()).unwrap();
@@ -1019,7 +1019,7 @@ fn compact_does_not_leak_pre_wal_state_to_store() {
     // run compact (which races the WAL flush), drop without
     // checkpoint, reopen. Pre-fix, compact had already shoved
     // the put's bytes into the store; the put's WAL record
-    // never made it to disk (`WalCommit::Enqueue` and no
+    // never made it to disk (`wal_sync = false` and no
     // explicit checkpoint), so the open-time replay sees no
     // record and considers `next_seq` to start at 1 — but the
     // store has the put. Mixing those would surface as either
@@ -1349,7 +1349,7 @@ fn subtree_gone_replay_reconstructs_correctly() {
 #[test]
 fn cross_blob_writes_replay_correctly_through_wal_without_checkpoint() {
     // End-to-end test for the walker's W2D fix: under
-    // `WalCommit::Sync`, every record reaches disk
+    // `wal_sync = true`, every record reaches disk
     // before the op returns. The walker no longer commits any
     // child blob inline (the v0.2-pre `bm.commit(child_guid)` is
     // now `bm.mark_dirty(child_guid, seq)`), so the on-disk
@@ -1432,7 +1432,7 @@ fn concurrent_writers_and_bg_checkpoint_preserve_acked_ops() {
     {
         let tree = Arc::new(
             TreeBuilder::new(dir.path())
-                .wal_commit(WalCommit::Sync) // per-op durable
+                .wal_sync(true) // per-op durable
                 .checkpoint(CheckpointConfig {
                     enabled: true,
                     idle_interval: Duration::from_millis(5),
@@ -1497,7 +1497,7 @@ fn concurrent_writers_and_manual_checkpoints_preserve_acked_ops() {
     let payload = vec![b'y'; PAYLOAD_LEN];
 
     {
-        let cfg = durable_cfg(dir.path()); // WalCommit::Sync
+        let cfg = durable_cfg(dir.path()); // true
         let tree = Arc::new(Tree::open(cfg).unwrap());
         let done = Arc::new(AtomicBool::new(false));
 
@@ -1576,7 +1576,7 @@ fn concurrent_writers_with_deletes_and_bg_checkpoint() {
     {
         let tree = Arc::new(
             TreeBuilder::new(dir.path())
-                .wal_commit(WalCommit::Sync)
+                .wal_sync(true)
                 .checkpoint(CheckpointConfig {
                     enabled: true,
                     idle_interval: Duration::from_millis(5),

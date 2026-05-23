@@ -5,7 +5,7 @@
 //! sled in the push-time CI path.
 
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use holt::{Tree, TreeConfig, WalCommit};
+use holt::{Tree, TreeConfig};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use tempfile::TempDir;
 
@@ -67,7 +67,7 @@ fn gen_fs_dataset() -> Vec<(Vec<u8>, Vec<u8>)> {
 fn make_tree() -> (Tree, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let mut cfg = TreeConfig::new(dir.path());
-    cfg.wal_commit = WalCommit::Write;
+    cfg.wal_sync = false;
     cfg.buffer_pool_size = 32;
     let tree = Tree::open(cfg).expect("holt open");
     (tree, dir)

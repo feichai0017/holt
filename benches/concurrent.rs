@@ -23,7 +23,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use holt::{Tree, TreeConfig, WalCommit};
+use holt::{Tree, TreeConfig};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rocksdb::{Options, WriteBatch, WriteOptions, DB};
 use tempfile::TempDir;
@@ -233,7 +233,7 @@ fn main() {
         cfg.ops.iter().map(|op| op.name()).collect::<Vec<_>>().join(","),
     );
     println!(
-        "profile=multi_thread,warm_service,persistent_wal,wal_commit=write,no_per_op_fsync,checkpoint=enabled,latency_sample_stride={LATENCY_SAMPLE_STRIDE}"
+        "profile=multi_thread,warm_service,persistent_wal,wal_sync=false,checkpoint=enabled,latency_sample_stride={LATENCY_SAMPLE_STRIDE}"
     );
 
     let samples = make_thread_samples(&cfg);
@@ -248,7 +248,7 @@ fn main() {
 fn run_holt(cfg: &Config, samples: &[Arc<[OpSample]>]) {
     let dir = TempDir::new().expect("holt tempdir");
     let mut tree_cfg = TreeConfig::new(dir.path());
-    tree_cfg.wal_commit = WalCommit::Write;
+    tree_cfg.wal_sync = false;
     tree_cfg.buffer_pool_size = cfg.buffer_pool_size;
     let tree = Arc::new(Tree::open(tree_cfg).expect("holt open"));
     preload_holt(&tree, cfg.workload, cfg.n_keys);

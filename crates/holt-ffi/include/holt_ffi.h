@@ -18,12 +18,6 @@ enum {
 };
 
 enum {
-  HOLT_WAL_ENQUEUE = 0,
-  HOLT_WAL_WRITE = 1,
-  HOLT_WAL_SYNC = 2
-};
-
-enum {
   HOLT_ENTRY_KEY = 1,
   HOLT_ENTRY_COMMON_PREFIX = 2
 };
@@ -48,7 +42,7 @@ typedef struct HoltEntry {
 
 const char *holt_last_error_message(void);
 
-int32_t holt_tree_open_with_wal_commit(const char *path, uint32_t wal_commit, HoltTree **out);
+int32_t holt_tree_open_with_wal_sync(const char *path, uint8_t wal_sync, HoltTree **out);
 int32_t holt_tree_open_memory(HoltTree **out);
 void holt_tree_close(HoltTree *tree);
 

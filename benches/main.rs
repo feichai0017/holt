@@ -37,7 +37,7 @@
 //! | Mode       | holt                                        | RocksDB                              | SQLite                                              | sled |
 //! |------------|---------------------------------------------|--------------------------------------|-----------------------------------------------------|------|
 //! | memory     | `TreeConfig::memory()`, `memory_flush_on_write=false` | `disable_wal=true`, `sync=false`     | `journal_mode=MEMORY`, `synchronous=OFF`, `:memory:` | temp DB, high-throughput, no background flush |
-//! | persistent | `TreeConfig::new(dir)`, `WalCommit::Write` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=OFF`, file-backed | temp-dir DB, high-throughput, background checkpoint |
+//! | persistent | `TreeConfig::new(dir)`, `wal_sync=false` | `WAL=on`, `sync=false`               | `journal_mode=WAL`, `synchronous=OFF`, file-backed | temp-dir DB, high-throughput, background checkpoint |
 //!
 //! The `*_persist_*` groups are intentionally hot-service
 //! measurements. They do **not** claim to measure cold data-file
@@ -61,7 +61,7 @@ use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rusqlite::{params, Connection};
 use tempfile::TempDir;
 
-use holt::{RangeEntry, Tree, TreeConfig, WalCommit};
+use holt::{RangeEntry, Tree, TreeConfig};
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
 use sled::{Batch as SledBatch, Db as SledDb, Mode as SledMode};
 
@@ -159,7 +159,7 @@ fn make_holt() -> Tree {
 fn make_holt_persistent() -> (Tree, TempDir) {
     let dir = TempDir::new().expect("tempdir");
     let mut cfg = TreeConfig::new(dir.path());
-    cfg.wal_commit = WalCommit::Write;
+    cfg.wal_sync = false;
     let tree = Tree::open(cfg).expect("holt persistent open");
     (tree, dir)
 }

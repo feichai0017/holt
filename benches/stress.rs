@@ -13,15 +13,13 @@
 //! ```
 //!
 //! Profile: single-threaded, warm service, file-backed WAL enabled,
-//! and no per-op fsync. Holt uses `WalCommit::Write`, so each
-//! mutation waits for WAL bytes to reach the OS page cache, not
-//! for `sync_data`.
+//! no per-op fsync by default, and the background checkpointer on.
 
 use std::env;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use holt::{KeyRangeEntry, RangeEntry, Tree, TreeConfig, WalCommit};
+use holt::{KeyRangeEntry, RangeEntry, Tree, TreeConfig};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rocksdb::{Options, WriteBatch, WriteOptions, DB};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -124,20 +122,11 @@ impl Workload {
     }
 }
 
-fn parse_wal_commit(s: &str) -> WalCommit {
+fn parse_bool_env(name: &str, s: &str) -> bool {
     match s {
-        "enqueue" | "async" | "default" => WalCommit::Enqueue,
-        "write" | "wal" => WalCommit::Write,
-        "sync" | "fsync" => WalCommit::Sync,
-        other => panic!("unknown HOLT_STRESS_WAL_COMMIT `{other}`; use enqueue, write, or sync"),
-    }
-}
-
-fn wal_commit_name(mode: WalCommit) -> &'static str {
-    match mode {
-        WalCommit::Enqueue => "enqueue",
-        WalCommit::Write => "write",
-        WalCommit::Sync => "sync",
+        "1" | "true" | "yes" | "on" | "sync" | "fsync" => true,
+        "0" | "false" | "no" | "off" | "enqueue" | "async" => false,
+        other => panic!("unknown {name} value `{other}`; use true/false"),
     }
 }
 
@@ -150,7 +139,7 @@ struct StressConfig {
     list_take: usize,
     dir_take: usize,
     buffer_pool_size: usize,
-    wal_commit: WalCommit,
+    wal_sync: bool,
     engines: Vec<String>,
 }
 
@@ -177,10 +166,10 @@ impl StressConfig {
             list_take: env_usize("HOLT_STRESS_LIST_TAKE", DEFAULT_LIST_TAKE),
             dir_take: env_usize("HOLT_STRESS_DIR_TAKE", DEFAULT_DIR_TAKE),
             buffer_pool_size: env_usize("HOLT_STRESS_BUFFER_POOL", DEFAULT_BUFFER_POOL),
-            wal_commit: env::var("HOLT_STRESS_WAL_COMMIT")
+            wal_sync: env::var("HOLT_STRESS_WAL_SYNC")
                 .as_deref()
-                .map(parse_wal_commit)
-                .unwrap_or(WalCommit::Write),
+                .map(|s| parse_bool_env("HOLT_STRESS_WAL_SYNC", s))
+                .unwrap_or(false),
             engines,
         }
     }
@@ -212,8 +201,8 @@ fn main() {
         cfg.engines.join(","),
     );
     println!(
-        "profile=single_thread,warm_service,persistent_wal,wal_commit={},no_per_op_fsync,checkpoint=enabled",
-        wal_commit_name(cfg.wal_commit)
+        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled",
+        cfg.wal_sync
     );
 
     let samples = make_samples(cfg.workload, cfg.n_keys, cfg.point_ops);
@@ -234,7 +223,7 @@ fn main() {
 fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     let dir = TempDir::new().expect("holt tempdir");
     let mut tree_cfg = TreeConfig::new(dir.path());
-    tree_cfg.wal_commit = cfg.wal_commit;
+    tree_cfg.wal_sync = cfg.wal_sync;
     tree_cfg.buffer_pool_size = cfg.buffer_pool_size;
     let tree = Tree::open(tree_cfg).expect("holt open");
     preload_holt(&tree, cfg.workload, cfg.n_keys);
