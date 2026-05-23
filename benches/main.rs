@@ -49,9 +49,9 @@
 //! ## Running
 //!
 //! ```sh
-//! cargo bench --bench main                     # full ~5 min sweep
-//! cargo bench --bench main -- --quick --noplot # ~1 min smoke
-//! cargo bench --bench main -- kv_get           # single scenario
+//! cargo bench --manifest-path benches/Cargo.toml --bench main
+//! cargo bench --manifest-path benches/Cargo.toml --bench main -- --quick --noplot
+//! cargo bench --manifest-path benches/Cargo.toml --bench main -- kv_get
 //! ```
 
 use std::hint::black_box;

@@ -28,19 +28,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # `rocksdb` is a dev-dependency (criterion bench harness pulls
-      # it in for the apples-to-apples comparison). Its C++ build
-      # needs libclang + LLVM headers.
-      - name: Install LLVM (Ubuntu)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-
-      - name: Install LLVM (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install llvm
-          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -78,9 +65,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install LLVM
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -134,9 +118,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install LLVM
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -210,38 +191,28 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install LLVM (Ubuntu)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-
-      - name: Install LLVM (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install llvm
-          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
-
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # Filter to holt-only persist scenarios so the run stays
-      # focused (the full matrix also benches rocksdb / sqlite for
-      # the apples-to-apples comparison — those numbers belong in
-      # a separate "compare" job, not the regression gate).
+      # Run the lightweight Holt-only regression benchmark from the
+      # independent benchmark package. The public comparator harness
+      # still lives under benches/, but CI keeps RocksDB / SQLite /
+      # sled out of the regression gate.
       - name: cargo bench (default backend)
         run: |
           set -o pipefail
-          cargo bench --bench main --locked -- \
+          cargo bench --manifest-path benches/Cargo.toml \
+            --bench regression --no-default-features --locked -- \
             --warm-up-time 1 --measurement-time 2 \
-            "persist_put/holt|persist_get/holt|persist_mixed/holt" \
             2>&1 | tee bench-default.txt
 
       - name: cargo bench (io-uring backend, Linux only)
         if: runner.os == 'Linux'
         run: |
           set -o pipefail
-          cargo bench --bench main --features io-uring --locked -- \
+          cargo bench --manifest-path benches/Cargo.toml \
+            --bench regression --no-default-features --features io-uring --locked -- \
             --warm-up-time 1 --measurement-time 2 \
-            "persist_put/holt|persist_get/holt|persist_mixed/holt" \
             2>&1 | tee bench-uring.txt
 
       - name: Post results to job summary
@@ -280,9 +251,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install LLVM
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2

@@ -24,13 +24,6 @@ jobs:
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install LLVM (rocksdb dev-dep needs llvm-config)
-        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
-
-      # Without this cache every release builds the rocksdb /
-      # librocksdb-sys / criterion / etc. dev-deps from scratch —
-      # that's 12-15 min of pure C++ compile on a hosted runner
-      # before any test even starts. With the cache: ~30s.
       - uses: Swatinem/rust-cache@v2
 
       - name: Run the release test suite

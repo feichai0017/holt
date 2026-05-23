@@ -2,10 +2,12 @@
 
 End-to-end Criterion microbenchmarks comparing **holt** against
 **RocksDB** (`rocksdb` crate, bundled `librocksdb-sys`) and
-**SQLite** (`rusqlite`, bundled libsqlite3). The public benchmark
-surface is intentionally small: one harness, three workload
-shapes, and operation mixes that reflect metadata engines rather
-than generic key/value stores.
+**SQLite** (`rusqlite`, bundled libsqlite3). The current harness
+can also include **sled** as a Rust embedded-KV peer, but the
+Linux v0.3.0 tables below predate sled rows. The public benchmark
+surface is intentionally small: one harness, three workload shapes,
+and operation mixes that reflect metadata engines rather than
+generic key/value stores.
 
 The Criterion tables below are the v0.3.0 Linux release snapshot.
 The 50 M large-tree stress section is a v0.3.1 local macOS
@@ -14,15 +16,16 @@ snapshot. Keep those environments separate when quoting numbers.
 ## Reproducing
 
 ```bash
-cargo bench --features io-uring --bench main -- --output-format bencher
+cargo bench --manifest-path benches/Cargo.toml \
+  --features io-uring --bench main -- --output-format bencher
 ```
 
 Use filters for shorter runs:
 
 ```bash
-cargo bench --bench main -- _metadata_mix --output-format bencher
-cargo bench --bench main -- _list_dir --output-format bencher
-cargo bench --bench main -- _scale_ --output-format bencher
+cargo bench --manifest-path benches/Cargo.toml --bench main -- _metadata_mix --output-format bencher
+cargo bench --manifest-path benches/Cargo.toml --bench main -- _list_dir --output-format bencher
+cargo bench --manifest-path benches/Cargo.toml --bench main -- _scale_ --output-format bencher
 ```
 
 Each sample is one logical operation. Lower is better. All three
@@ -193,7 +196,7 @@ HOLT_STRESS_POINT_OPS=2000000 \
 HOLT_STRESS_LIST_OPS=500000 \
 HOLT_STRESS_LIST_TAKE=100 \
 HOLT_STRESS_DIR_TAKE=8 \
-cargo bench --bench stress -- objstore
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 
 TMPDIR="/Volumes/mac Ds - Data/tmp/holt-stress-50m" \
 HOLT_STRESS_N=50000000 \
@@ -201,7 +204,7 @@ HOLT_STRESS_POINT_OPS=2000000 \
 HOLT_STRESS_LIST_OPS=500000 \
 HOLT_STRESS_LIST_TAKE=100 \
 HOLT_STRESS_DIR_TAKE=8 \
-cargo bench --bench stress -- fs
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- fs
 ```
 
 ### Object-store metadata stress

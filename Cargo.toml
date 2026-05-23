@@ -3,6 +3,7 @@ name = "holt"
 version = "0.3.1"
 edition = "2021"
 rust-version = "1.82"
+autobenches = false
 description = "An adaptive-radix-tree metadata storage engine for path-shaped keys, with per-blob concurrency and crash-safe persistence."
 license = "MIT"
 authors = ["the holt contributors"]
@@ -15,7 +16,7 @@ categories = ["database-implementations", "data-structures", "filesystem"]
 
 [workspace]
 members = [".", "crates/holt-ffi"]
-exclude = ["fuzz", "verified"]
+exclude = ["benches", "fuzz", "verified"]
 
 [dependencies]
 # Bounded MPSC + `select!` between a timer and a stop-channel —
@@ -55,13 +56,6 @@ io-uring = { version = "0.7", optional = true }
 [dev-dependencies]
 rand = "0.9"
 tempfile = "3"
-criterion = { version = "0.8", features = ["html_reports"] }
-rocksdb = { version = "0.24", default-features = false }
-# `bundled` ships a vendored libsqlite3 so contributors don't need
-# a system SQLite — keeps the bench comparator apples-to-apples
-# across machines.
-rusqlite = { version = "0.39", features = ["bundled"] }
-sled = "0.34"
 proptest = { version = "1", default-features = false, features = ["std", "fork", "timeout"] }
 
 [features]
@@ -108,18 +102,3 @@ path = "examples/session_store.rs"
 [[example]]
 name = "s3_metadata"
 path = "examples/s3_metadata.rs"
-
-[[bench]]
-name = "main"
-harness = false
-path = "benches/main.rs"
-
-[[bench]]
-name = "stress"
-harness = false
-path = "benches/stress.rs"
-
-[[bench]]
-name = "concurrent"
-harness = false
-path = "benches/concurrent.rs"

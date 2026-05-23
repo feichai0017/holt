@@ -76,8 +76,9 @@ with prefix, `start_after`, and S3 delimiter rollup.
 See [`CHANGELOG.md`](CHANGELOG.md) for the v0.3 release notes and
 [`ROADMAP.md`](ROADMAP.md) for post-0.3 direction.
 
-`cargo bench --bench main` runs a side-by-side comparison with
-RocksDB and SQLite across three metadata workload shapes — see
+`cargo bench --manifest-path benches/Cargo.toml --bench main`
+runs a side-by-side comparison with RocksDB, SQLite, and sled
+across three metadata workload shapes — see
 [`benches/README.md`](benches/README.md) for the methodology and
 headline numbers.
 

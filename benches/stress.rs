@@ -9,7 +9,7 @@
 //! HOLT_STRESS_N=20000000 \
 //! HOLT_STRESS_POINT_OPS=1000000 \
 //! HOLT_STRESS_LIST_OPS=1000000 \
-//! cargo bench --bench stress -- objstore
+//! cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 //! ```
 //!
 //! Profile: single-threaded, warm service, file-backed WAL enabled,

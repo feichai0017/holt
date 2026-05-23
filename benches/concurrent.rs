@@ -9,7 +9,7 @@
 //! HOLT_CONCURRENT_N=20000000 \
 //! HOLT_CONCURRENT_THREADS=1,2,4,8 \
 //! HOLT_CONCURRENT_OPS_PER_THREAD=250000 \
-//! cargo bench --bench concurrent -- objstore
+//! cargo bench --manifest-path benches/Cargo.toml --bench concurrent -- objstore
 //! ```
 //!
 //! Profile: warm service, file-backed WAL enabled, no per-op fsync.

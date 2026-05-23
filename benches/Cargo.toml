@@ -1,0 +1,42 @@
+[package]
+name = "holt-bench"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+publish = false
+
+[workspace]
+
+[dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+holt = { path = ".." }
+rand = "0.9"
+tempfile = "3"
+rocksdb = { version = "0.24", default-features = false, optional = true }
+rusqlite = { version = "0.39", features = ["bundled"], optional = true }
+sled = { version = "0.34", optional = true }
+
+[features]
+default = ["comparators"]
+comparators = ["dep:rocksdb", "dep:rusqlite", "dep:sled"]
+io-uring = ["holt/io-uring"]
+
+[[bench]]
+name = "regression"
+harness = false
+path = "regression.rs"
+
+[[bench]]
+name = "main"
+harness = false
+path = "main.rs"
+
+[[bench]]
+name = "stress"
+harness = false
+path = "stress.rs"
+
+[[bench]]
+name = "concurrent"
+harness = false
+path = "concurrent.rs"

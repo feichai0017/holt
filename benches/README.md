@@ -5,6 +5,11 @@ Criterion-based microbenchmarks comparing **holt** against
 metadata workload — `kv` (anti-pattern baseline), `objstore`,
 and `fs` (holt's design target).
 
+Benchmarks live in an independent, non-published Cargo package at
+`benches/Cargo.toml`. The root `holt` crate intentionally does not
+depend on comparator engines, so supply-chain checks and release
+builds stay focused on the library users actually consume.
+
 ## Scenarios
 
 | Group | Key shape | Value shape | Models |
@@ -60,36 +65,36 @@ pressure case used to judge path-put scalability.
 
 ```sh
 # Full criterion sweep (~5 min on M3 Pro):
-cargo bench --bench main
+cargo bench --manifest-path benches/Cargo.toml --bench main
 
 # Quick smoke pass (~1 minute):
-cargo bench --bench main -- --quick --noplot
+cargo bench --manifest-path benches/Cargo.toml --bench main -- --quick --noplot
 
 # Scale curve only (Group B):
-cargo bench --bench main -- kv_scale
+cargo bench --manifest-path benches/Cargo.toml --bench main -- kv_scale
 
 # A single scenario:
-cargo bench --bench main -- kv_get
+cargo bench --manifest-path benches/Cargo.toml --bench main -- kv_get
 
 # Just the range scans (the load-bearing metadata-engine test):
-cargo bench --bench main -- _list
+cargo bench --manifest-path benches/Cargo.toml --bench main -- _list
 
 # Just the metadata-native mutation/mix groups:
-cargo bench --bench main -- _create_delete
-cargo bench --bench main -- _rename
-cargo bench --bench main -- _metadata_mix
+cargo bench --manifest-path benches/Cargo.toml --bench main -- _create_delete
+cargo bench --manifest-path benches/Cargo.toml --bench main -- _rename
+cargo bench --manifest-path benches/Cargo.toml --bench main -- _metadata_mix
 
 # Large-tree stress harness: fixed 20M preload, million-scale ops.
 # Run this explicitly; it is intentionally not part of Criterion.
 HOLT_STRESS_N=20000000 \
 HOLT_STRESS_POINT_OPS=1000000 \
 HOLT_STRESS_LIST_OPS=1000000 \
-cargo bench --bench stress -- objstore
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 
 HOLT_STRESS_N=20000000 \
 HOLT_STRESS_POINT_OPS=1000000 \
 HOLT_STRESS_LIST_OPS=1000000 \
-cargo bench --bench stress -- fs
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- fs
 ```
 
 HTML criterion reports land in `target/criterion/`.
@@ -123,21 +128,23 @@ Useful knobs:
 
 ```sh
 # Run only Holt while tuning tree shape.
-HOLT_STRESS_ENGINES=holt cargo bench --bench stress -- objstore
+HOLT_STRESS_ENGINES=holt \
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 
 # Add sled as a Rust embedded-KV peer.
-HOLT_STRESS_ENGINES=holt,rocksdb,sled cargo bench --bench stress -- objstore
+HOLT_STRESS_ENGINES=holt,rocksdb,sled \
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 
 # Smoke-test the harness quickly.
 HOLT_STRESS_N=10000 \
 HOLT_STRESS_POINT_OPS=1000 \
 HOLT_STRESS_LIST_OPS=100 \
-cargo bench --bench stress -- fs
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- fs
 
 # Change list fanout without changing the 20M preload.
 HOLT_STRESS_LIST_TAKE=1000 \
 HOLT_STRESS_DIR_TAKE=32 \
-cargo bench --bench stress -- objstore
+cargo bench --manifest-path benches/Cargo.toml --bench stress -- objstore
 ```
 
 Profile: single-threaded, warm-service, file-backed persistent
@@ -165,13 +172,13 @@ HOLT_CONCURRENT_N=2000000 \
 HOLT_CONCURRENT_OPS_PER_THREAD=100000 \
 HOLT_CONCURRENT_THREADS=1,2,4,8 \
 HOLT_CONCURRENT_OPS=get,put,mixed90,mixed50,list_dir \
-cargo bench --bench concurrent -- objstore
+cargo bench --manifest-path benches/Cargo.toml --bench concurrent -- objstore
 
 HOLT_CONCURRENT_N=2000000 \
 HOLT_CONCURRENT_OPS_PER_THREAD=100000 \
 HOLT_CONCURRENT_THREADS=1,2,4,8 \
 HOLT_CONCURRENT_OPS=get,put,mixed90,mixed50,list_dir \
-cargo bench --bench concurrent -- fs
+cargo bench --manifest-path benches/Cargo.toml --bench concurrent -- fs
 ```
 
 Profile: warm-service, file-backed persistent engines with WAL
