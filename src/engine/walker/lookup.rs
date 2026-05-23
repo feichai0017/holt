@@ -6,6 +6,7 @@
 
 use crate::api::errors::{Error, Result};
 use crate::engine::simd;
+use crate::engine::RouteCache;
 use crate::layout::{
     BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
 };
@@ -73,6 +74,7 @@ pub(super) fn lookup_at<'a>(
 pub fn lookup_multi_with<R, F>(
     bm: &BufferManager,
     root_pin: &Arc<CachedBlob>,
+    route_cache: Option<&RouteCache>,
     key: SearchKey<'_>,
     mut consume: F,
 ) -> Result<Option<R>>
@@ -82,10 +84,41 @@ where
     // Outer loop: each iteration is one full attempt; we restart
     // here when an optimistic snapshot is invalidated.
     'restart: loop {
+        if let Some(cache) = route_cache {
+            let root_version = root_pin.content_version();
+            if let Some(route) = cache.lookup(key, root_version) {
+                let pin = bm.pin(route.child_guid)?;
+                pin.prefetch_header();
+                let guard = pin.read_optimistic();
+                let frame = BlobFrameRef::wrap(guard.as_slice());
+                let start_slot = frame.header().root_slot;
+                let result = lookup_at(frame, start_slot, key, route.child_depth);
+                if !guard.validate() || !root_pin.validate_content_version(root_version) {
+                    bm.note_optimistic_restart();
+                    continue 'restart;
+                }
+                match result {
+                    Err(e) => return Err(e),
+                    Ok(LookupResult::Found(hit)) => return Ok(Some(consume(hit))),
+                    Ok(LookupResult::NotFound) => return Ok(None),
+                    Ok(LookupResult::Crossing(crossing)) => {
+                        match lookup_from_blob_crossing(bm, key, crossing, &mut consume)? {
+                            CrossBlobLookup::Done(result) => return Ok(result),
+                            CrossBlobLookup::Restart => {
+                                bm.note_optimistic_restart();
+                                continue 'restart;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Hop 0: the cached root blob — `Tree` keeps this pinned
         // for its lifetime so we skip BM's pin-Mutex on the
         // common case where every op starts at the root.
         let crossing = {
+            let root_version = root_pin.content_version();
             let guard = root_pin.read_optimistic();
             let frame = BlobFrameRef::wrap(guard.as_slice());
             let root_slot = frame.header().root_slot;
@@ -93,7 +126,7 @@ where
 
             // Validate AFTER consuming any borrowed data from the
             // frame so a torn read can't escape past this point.
-            if !guard.validate() {
+            if !guard.validate() || !root_pin.validate_content_version(root_version) {
                 bm.note_optimistic_restart();
                 continue 'restart;
             }
@@ -101,7 +134,12 @@ where
                 Err(e) => return Err(e),
                 Ok(LookupResult::Found(hit)) => return Ok(Some(consume(hit))),
                 Ok(LookupResult::NotFound) => return Ok(None),
-                Ok(LookupResult::Crossing(c)) => c,
+                Ok(LookupResult::Crossing(crossing)) => {
+                    if let Some(cache) = route_cache {
+                        cache.learn(key, root_version, crossing.child_guid, crossing.child_depth);
+                    }
+                    crossing
+                }
             }
         };
         // (No drop needed for `root_pin`: it's a borrow held by
@@ -110,27 +148,48 @@ where
         // Cross-blob hops. Same pattern; on a torn read we restart
         // the whole walk from the root (the parent BlobNode that
         // pointed us here may also have moved).
-        let mut current_guid = crossing.child_guid;
-        let mut depth = crossing.child_depth;
-        loop {
-            let pin = bm.pin(current_guid)?;
-            pin.prefetch_header();
-            let guard = pin.read_optimistic();
-            let frame = BlobFrameRef::wrap(guard.as_slice());
-            let start_slot = frame.header().root_slot;
-            let result = lookup_at(frame, start_slot, key, depth);
-            if !guard.validate() {
+        match lookup_from_blob_crossing(bm, key, crossing, &mut consume)? {
+            CrossBlobLookup::Done(result) => return Ok(result),
+            CrossBlobLookup::Restart => {
                 bm.note_optimistic_restart();
-                continue 'restart;
             }
-            match result {
-                Err(e) => return Err(e),
-                Ok(LookupResult::Found(hit)) => return Ok(Some(consume(hit))),
-                Ok(LookupResult::NotFound) => return Ok(None),
-                Ok(LookupResult::Crossing(c)) => {
-                    current_guid = c.child_guid;
-                    depth = c.child_depth;
-                }
+        }
+    }
+}
+
+enum CrossBlobLookup<R> {
+    Done(Option<R>),
+    Restart,
+}
+
+fn lookup_from_blob_crossing<R, F>(
+    bm: &BufferManager,
+    key: SearchKey<'_>,
+    crossing: BlobNodeCrossing,
+    consume: &mut F,
+) -> Result<CrossBlobLookup<R>>
+where
+    F: FnMut(LookupHit<'_>) -> R,
+{
+    let mut current_guid = crossing.child_guid;
+    let mut depth = crossing.child_depth;
+    loop {
+        let pin = bm.pin(current_guid)?;
+        pin.prefetch_header();
+        let guard = pin.read_optimistic();
+        let frame = BlobFrameRef::wrap(guard.as_slice());
+        let start_slot = frame.header().root_slot;
+        let result = lookup_at(frame, start_slot, key, depth);
+        if !guard.validate() {
+            return Ok(CrossBlobLookup::Restart);
+        }
+        match result {
+            Err(e) => return Err(e),
+            Ok(LookupResult::Found(hit)) => return Ok(CrossBlobLookup::Done(Some(consume(hit)))),
+            Ok(LookupResult::NotFound) => return Ok(CrossBlobLookup::Done(None)),
+            Ok(LookupResult::Crossing(crossing)) => {
+                current_guid = crossing.child_guid;
+                depth = crossing.child_depth;
             }
         }
     }

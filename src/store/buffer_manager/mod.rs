@@ -755,22 +755,24 @@ impl BufferManager {
     }
 
     fn mark_dirty_with_hint(&self, guid: BlobGuid, seq: u64, cached: Option<&CachedBlob>) {
-        let hint_covers_seq = cached.is_some_and(|entry| !entry.dirty_hint_needs_map_publish(seq));
+        let Some(cached) = cached else {
+            // No dirty entry without the newer cache image: that
+            // would violate I1 and make checkpoint unable to
+            // snapshot the bytes it is asked to flush.
+            return;
+        };
+        let hint_covers_seq = !cached.dirty_hint_needs_map_publish(seq);
         let mut state = self.mutation_shard(guid).lock().unwrap();
         if state.pending_deletes.contains_key(&guid) {
-            if let Some(entry) = cached {
-                entry.clear_dirty_hint();
-            }
+            cached.clear_dirty_hint();
             return;
         }
         if hint_covers_seq && matches!(state.dirty.get(&guid), Some(cur) if *cur <= seq) {
             return;
         }
         if hint_covers_seq {
-            if let Some(entry) = cached {
-                entry.clear_dirty_hint();
-                let _ = entry.dirty_hint_needs_map_publish(seq);
-            }
+            cached.clear_dirty_hint();
+            let _ = cached.dirty_hint_needs_map_publish(seq);
         }
         state
             .dirty
@@ -1590,13 +1592,33 @@ mod tests {
 
     #[test]
     fn mark_dirty_keeps_lowest_seq() {
-        let bm = BufferManager::new(Arc::new(MemoryBlobStore::new()), 4);
-        bm.mark_dirty([0x01; 16], 50);
-        bm.mark_dirty([0x01; 16], 30);
-        bm.mark_dirty([0x01; 16], 99);
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x01; 16];
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+        let _pin = bm.pin(guid).unwrap();
+
+        bm.mark_dirty(guid, 50);
+        bm.mark_dirty(guid, 30);
+        bm.mark_dirty(guid, 99);
         assert_eq!(bm.dirty_count(), 1);
         let snap = bm.snapshot_dirty();
-        assert_eq!(snap[&[0x01; 16]], 30);
+        assert_eq!(snap[&guid], 30);
+    }
+
+    #[test]
+    fn mark_dirty_without_cache_image_does_not_publish_orphan() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0xAB; 16];
+        inner.write_blob(guid, &make_buf(1)).unwrap();
+        let bm = BufferManager::new(inner, 4);
+
+        bm.mark_dirty(guid, 10);
+
+        assert!(
+            bm.snapshot_dirty().is_empty(),
+            "dirty map must not contain an entry without a cache image",
+        );
     }
 
     #[test]
@@ -1668,7 +1690,13 @@ mod tests {
 
     #[test]
     fn snapshot_dirty_drains_atomically() {
-        let bm = BufferManager::new(Arc::new(MemoryBlobStore::new()), 4);
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        for guid in [[0x01; 16], [0x02; 16], [0x03; 16]] {
+            inner.write_blob(guid, &make_buf(1)).unwrap();
+        }
+        let bm = BufferManager::new(inner, 4);
+        let _p1 = bm.pin([0x01; 16]).unwrap();
+        let _p2 = bm.pin([0x02; 16]).unwrap();
         bm.mark_dirty([0x01; 16], 10);
         bm.mark_dirty([0x02; 16], 20);
 
@@ -1681,6 +1709,7 @@ mod tests {
         assert_eq!(bm.dirty_count(), 0);
 
         // Concurrent mark_dirty lands in the fresh empty map.
+        let _p3 = bm.pin([0x03; 16]).unwrap();
         bm.mark_dirty([0x03; 16], 99);
         assert_eq!(bm.dirty_count(), 1);
         let next = bm.snapshot_dirty();
@@ -1689,7 +1718,8 @@ mod tests {
 
     #[test]
     fn snapshot_dirty_drains_every_bookkeeping_shard() {
-        let bm = BufferManager::new(Arc::new(MemoryBlobStore::new()), 4);
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let bm = BufferManager::new(Arc::clone(&inner), BOOKKEEPING_SHARDS);
         let mut guids: [Option<BlobGuid>; BOOKKEEPING_SHARDS] = [None; BOOKKEEPING_SHARDS];
 
         for i in 0..20_000u64 {
@@ -1708,7 +1738,10 @@ mod tests {
             "test generator should hit every bookkeeping shard"
         );
         for (shard, guid) in guids.iter().enumerate() {
-            bm.mark_dirty(guid.expect("filled"), shard as u64 + 1);
+            let guid = guid.expect("filled");
+            inner.write_blob(guid, &make_buf(1)).unwrap();
+            let _pin = bm.pin(guid).unwrap();
+            bm.mark_dirty(guid, shard as u64 + 1);
         }
 
         let snap = bm.snapshot_dirty();
@@ -1764,7 +1797,14 @@ mod tests {
 
     #[test]
     fn restore_dirty_merges_keeping_min() {
-        let bm = BufferManager::new(Arc::new(MemoryBlobStore::new()), 4);
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        for guid in [[0x01; 16], [0x02; 16], [0x03; 16]] {
+            inner.write_blob(guid, &make_buf(1)).unwrap();
+        }
+        let bm = BufferManager::new(inner, 4);
+        let _p1 = bm.pin([0x01; 16]).unwrap();
+        let _p2 = bm.pin([0x02; 16]).unwrap();
+        let _p3 = bm.pin([0x03; 16]).unwrap();
         // Pretend a flush snapshot drained these:
         let mut snap = HashMap::new();
         snap.insert([0x01; 16], 10);
@@ -1940,7 +1980,9 @@ mod tests {
     #[test]
     fn write_blob_through_trait_clears_dirty() {
         let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        inner.write_blob([0x88; 16], &make_buf(1)).unwrap();
         let bm = BufferManager::new(inner, 4);
+        let _pin = bm.pin([0x88; 16]).unwrap();
 
         bm.mark_dirty([0x88; 16], 100);
         assert_eq!(bm.dirty_count(), 1);

@@ -881,6 +881,45 @@ fn stats_reflects_inserts() {
 }
 
 #[test]
+fn point_get_uses_route_cache_on_multi_blob_tree() {
+    let tree = Tree::open(TreeConfig::memory()).unwrap();
+    let value = vec![0xAB; 256];
+    for i in 0..2400u32 {
+        let key = format!("bucket-000/tenant-00/path/sub/file-{i:08}.bin");
+        tree.put(key.as_bytes(), &value).unwrap();
+    }
+    assert!(
+        tree.stats().unwrap().blob_count >= 2,
+        "test precondition: path-shaped keys should spill into child blobs",
+    );
+
+    let before = tree.stats().unwrap().route_cache;
+    assert_eq!(
+        tree.get(b"bucket-000/tenant-00/path/sub/file-00000000.bin")
+            .unwrap()
+            .as_deref(),
+        Some(&value[..]),
+    );
+    let after_first = tree.stats().unwrap().route_cache;
+    assert!(
+        after_first.hits > before.hits || after_first.learns > before.learns,
+        "first read should either hit an existing route or learn one",
+    );
+
+    assert_eq!(
+        tree.get(b"bucket-000/tenant-00/path/sub/file-00000001.bin")
+            .unwrap()
+            .as_deref(),
+        Some(&value[..]),
+    );
+    let after_second = tree.stats().unwrap().route_cache;
+    assert!(
+        after_second.hits > after_first.hits,
+        "second read under the same routed prefix should hit the route cache",
+    );
+}
+
+#[test]
 fn compact_on_empty_tree_skips_noop_rewrite() {
     let tree = Tree::open(TreeConfig::memory()).unwrap();
     let before = tree.stats().unwrap();

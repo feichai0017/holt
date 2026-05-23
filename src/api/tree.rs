@@ -390,17 +390,27 @@ impl Tree {
     pub fn get_version(&self, key: &[u8]) -> Result<Option<RecordVersion>> {
         let _maintenance = self.maintenance_gate.enter_shared();
         let search = engine::SearchKey::user(key);
-        engine::lookup_multi_with(&self.store, &self.root_pin, search, |hit| {
-            RecordVersion::new(hit.seq)
-        })
+        engine::lookup_multi_with(
+            &self.store,
+            &self.root_pin,
+            Some(&self.route_cache),
+            search,
+            |hit| RecordVersion::new(hit.seq),
+        )
     }
 
     fn lookup_record_unlocked(&self, key: &[u8]) -> Result<Option<Record>> {
         let search = engine::SearchKey::user(key);
-        engine::lookup_multi_with(&self.store, &self.root_pin, search, |hit| Record {
-            value: hit.value.to_vec(),
-            version: RecordVersion::new(hit.seq),
-        })
+        engine::lookup_multi_with(
+            &self.store,
+            &self.root_pin,
+            Some(&self.route_cache),
+            search,
+            |hit| Record {
+                value: hit.value.to_vec(),
+                version: RecordVersion::new(hit.seq),
+            },
+        )
     }
 
     /// Insert or replace `(key, value)`. Returns `Ok(())`.
@@ -644,10 +654,13 @@ impl Tree {
         let _r = self.rename_lock.lock().unwrap();
 
         // Probe src across all blobs — zero-copy via BM pin.
-        let Some(value) =
-            engine::lookup_multi_with(&self.store, &self.root_pin, src_search, |hit| {
-                hit.value.to_vec()
-            })?
+        let Some(value) = engine::lookup_multi_with(
+            &self.store,
+            &self.root_pin,
+            Some(&self.route_cache),
+            src_search,
+            |hit| hit.value.to_vec(),
+        )?
         else {
             return Err(Error::NotFound);
         };
@@ -659,7 +672,14 @@ impl Tree {
 
         // Probe dst across all blobs unless overwrite is allowed.
         if !force
-            && engine::lookup_multi_with(&self.store, &self.root_pin, dst_search, |_| ())?.is_some()
+            && engine::lookup_multi_with(
+                &self.store,
+                &self.root_pin,
+                Some(&self.route_cache),
+                dst_search,
+                |_| (),
+            )?
+            .is_some()
         {
             return Err(Error::DstExists);
         }
@@ -1178,10 +1198,13 @@ impl Tree {
     ) -> Result<()> {
         let src_search = engine::SearchKey::user(src);
         let dst_search = engine::SearchKey::user(dst);
-        let Some(value) =
-            engine::lookup_multi_with(&self.store, &self.root_pin, src_search, |hit| {
-                hit.value.to_vec()
-            })?
+        let Some(value) = engine::lookup_multi_with(
+            &self.store,
+            &self.root_pin,
+            Some(&self.route_cache),
+            src_search,
+            |hit| hit.value.to_vec(),
+        )?
         else {
             return Err(Error::NotFound);
         };
@@ -1189,7 +1212,14 @@ impl Tree {
             return Ok(());
         }
         if !force
-            && engine::lookup_multi_with(&self.store, &self.root_pin, dst_search, |_| ())?.is_some()
+            && engine::lookup_multi_with(
+                &self.store,
+                &self.root_pin,
+                Some(&self.route_cache),
+                dst_search,
+                |_| (),
+            )?
+            .is_some()
         {
             return Err(Error::DstExists);
         }
@@ -2038,20 +2068,22 @@ fn replay_wal(path: &std::path::Path, bm: &Arc<BufferManager>, root_guid: BlobGu
                 let dst_search = engine::SearchKey::user(dst_key);
                 // Existence probes pass a `|_| ()` closure so the
                 // walker doesn't even allocate / copy the value.
-                if engine::lookup_multi_with(bm, &root_pin, src_search, |_| ())?.is_none() {
+                if engine::lookup_multi_with(bm, &root_pin, None, src_search, |_| ())?.is_none() {
                     // Already reconciled in a prior replay pass —
                     // skip. `highest` was bumped above so the
                     // post-replay `next_seq` still advances past
                     // this record's seq.
                     return Ok(());
                 }
-                if !force && engine::lookup_multi_with(bm, &root_pin, dst_search, |_| ())?.is_some()
+                if !force
+                    && engine::lookup_multi_with(bm, &root_pin, None, dst_search, |_| ())?.is_some()
                 {
                     return Ok(());
                 }
-                let value =
-                    engine::lookup_multi_with(bm, &root_pin, src_search, |hit| hit.value.to_vec())?
-                        .unwrap_or_default();
+                let value = engine::lookup_multi_with(bm, &root_pin, None, src_search, |hit| {
+                    hit.value.to_vec()
+                })?
+                .unwrap_or_default();
                 let erase_out = engine::erase_multi(bm, &root_pin, None, src_search, seq)?;
                 let insert_out =
                     engine::insert_multi(bm, &root_pin, None, dst_search, &value, seq)?;

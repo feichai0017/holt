@@ -66,7 +66,7 @@ impl View {
     pub fn get_version(&self, key: &[u8]) -> Result<Option<RecordVersion>> {
         self.ensure_in_scope(key)?;
         let search = engine::SearchKey::user(key);
-        engine::lookup_multi_with(&self.store, &self.root_pin, search, |hit| {
+        engine::lookup_multi_with(&self.store, &self.root_pin, None, search, |hit| {
             RecordVersion::new(hit.seq)
         })
     }
@@ -113,7 +113,7 @@ impl View {
 
     fn lookup_record(&self, key: &[u8]) -> Result<Option<Record>> {
         let search = engine::SearchKey::user(key);
-        engine::lookup_multi_with(&self.store, &self.root_pin, search, |hit| Record {
+        engine::lookup_multi_with(&self.store, &self.root_pin, None, search, |hit| Record {
             value: hit.value.to_vec(),
             version: RecordVersion::new(hit.seq),
         })
