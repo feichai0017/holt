@@ -9,12 +9,20 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-23
+
 ### Added
 
 - Added scoped read transactions via `Tree::view(prefix, |view| ...)`.
   A view captures the prefix's reachable blob frames, releases the
   live tree, and serves point reads plus record/key range scans from
   that stable frame set.
+- Added a Verus model under `verified/` for the ART shape invariants
+  that matter most to the persistent tree: node capacity classes,
+  grow/shrink thresholds, prefix splits, delimiter rollup bounds,
+  and leaf extent alignment.
+- Added `sled` as an optional benchmark comparator in the standalone
+  benchmark package.
 
 ### Changed
 
@@ -25,6 +33,13 @@ fine-grained per-commit history is in `git log`.
 - Narrowed the supported public import surface to crate-root
   re-exports (`holt::{Tree, TreeBuilder, RangeEntry, ...}`); the
   internal `api` module is no longer public.
+- Split benchmarks into a non-published `holt-bench` package under
+  `benches/Cargo.toml`. Normal `holt` users no longer pull
+  Criterion, RocksDB, SQLite, sled, or their transitive dependencies
+  when depending on the crate.
+- Replaced the push-time CI benchmark with a Holt-only regression
+  target. Full RocksDB/SQLite/sled comparisons remain available
+  through the standalone benchmark package.
 
 ## [0.3.1] — 2026-05-23
 
