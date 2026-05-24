@@ -11,6 +11,9 @@ use std::path::PathBuf;
 
 use crate::checkpoint::CheckpointConfig;
 
+const DEFAULT_FILE_BUFFER_POOL_SIZE: usize = 256;
+const DEFAULT_MEMORY_BUFFER_POOL_SIZE: usize = 64;
+
 /// Where the tree's data lives.
 ///
 /// `File` is the production target. `Memory` is for tests,
@@ -40,8 +43,9 @@ pub enum Storage {
 pub struct TreeConfig {
     /// Where the tree's data lives.
     pub storage: Storage,
-    /// How many 512 KB blob frames to keep pinned in the buffer
-    /// pool. Default 64 (= 32 MB resident).
+    /// How many 512 KB blob frames to keep resident in the
+    /// buffer pool. File-backed trees default to 256 (= 128 MiB);
+    /// memory trees default to 64 (= 32 MiB).
     pub buffer_pool_size: usize,
     /// If `true`, each file-backed mutation waits until the
     /// journal worker calls `sync_data`. The default `false`
@@ -74,7 +78,7 @@ impl TreeConfig {
     pub fn new<P: Into<PathBuf>>(dir: P) -> Self {
         Self {
             storage: Storage::File { dir: dir.into() },
-            buffer_pool_size: 64,
+            buffer_pool_size: DEFAULT_FILE_BUFFER_POOL_SIZE,
             wal_sync: false,
             memory_flush_on_write: true,
             checkpoint: CheckpointConfig::default(),
@@ -86,7 +90,7 @@ impl TreeConfig {
     pub fn memory() -> Self {
         Self {
             storage: Storage::Memory,
-            buffer_pool_size: 64,
+            buffer_pool_size: DEFAULT_MEMORY_BUFFER_POOL_SIZE,
             wal_sync: false,
             memory_flush_on_write: true,
             checkpoint: CheckpointConfig {
@@ -111,5 +115,22 @@ impl TreeConfig {
             Storage::File { dir } => Some(dir.join("journal.wal")),
             Storage::Memory => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_backed_default_buffer_pool_is_service_sized() {
+        let cfg = TreeConfig::new("/tmp/holt");
+        assert_eq!(cfg.buffer_pool_size, 256);
+    }
+
+    #[test]
+    fn memory_default_buffer_pool_stays_small() {
+        let cfg = TreeConfig::memory();
+        assert_eq!(cfg.buffer_pool_size, 64);
     }
 }

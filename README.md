@@ -111,7 +111,7 @@ use holt::TreeBuilder;
 // File-backed production mode, Unix-only — Linux `O_DIRECT`,
 // macOS `F_NOCACHE`. The directory is created if missing.
 let tree = TreeBuilder::new("/var/lib/myapp/meta.holt")
-    .buffer_pool_size(128)        // pinned 512 KB blobs (default 64)
+    .buffer_pool_size(512)        // optional: 512 blobs = 256 MiB
     .wal_sync(false)              // default async journal acknowledgement
     .open()?;
 
@@ -120,6 +120,9 @@ let tree = TreeBuilder::new("/var/lib/myapp/meta.holt")
 // mode. Good for tests, sidecar caches, ephemeral session stores.
 let tree = TreeBuilder::new("scratch").memory().open()?;
 ```
+
+File-backed trees default to 256 resident 512 KB blobs (128 MiB).
+In-memory trees keep the smaller 64-blob default (32 MiB).
 
 ### Single-key CRUD
 

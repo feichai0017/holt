@@ -704,16 +704,15 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
 //
 // Runs get + put across four dataset sizes (20 k, 100 k, 500 k,
 // 2 M) to expose how each engine's hot-path scales.
-// The 500 k tier is intentionally chosen to exceed holt's
-// default 64-blob buffer pool (≈ 32 MB resident), so we see
-// real cache-miss + spillover behaviour rather than a
-// fully-resident microbench.
+// The scale bench uses an explicit 64-blob buffer pool
+// (≈ 32 MB resident), so the 500 k tier sees real cache-miss
+// + spillover behaviour rather than a fully-resident microbench.
 //
 // One representative workload per scale to keep total runtime
 // bounded (Criterion's default 100 samples × 5 s warm-up over 4
 // sizes × 3 engines × 2 ops = 24 sub-benches).
 //
-// At 2M the dataset is ~192 MB — 6× the default buffer pool —
+// At 2M the dataset is ~192 MB — about 6× that bench-local pool —
 // so every miss pays the full read_blob + descent cost, and the
 // numbers reflect a working set the cache cannot hold.
 

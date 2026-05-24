@@ -7,11 +7,7 @@ fn main() {
 
     // Default is persistent. Add `.memory()` to flip to in-memory.
     // (We use memory here so the example doesn't litter the cwd.)
-    let tree = TreeBuilder::new("scratch")
-        .memory()
-        .buffer_pool_size(64)
-        .open()
-        .expect("open");
+    let tree = TreeBuilder::new("scratch").memory().open().expect("open");
 
     println!("Tree opened: {tree:?}\n");
 

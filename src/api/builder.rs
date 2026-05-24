@@ -14,7 +14,7 @@ use crate::store::blob_store::BlobStore;
 /// ```ignore
 /// // Persistent (the default):
 /// let tree = holt::TreeBuilder::new("/var/lib/myapp")
-///     .buffer_pool_size(128)
+///     .buffer_pool_size(512)
 ///     .wal_sync(true)
 ///     .open()?;
 ///

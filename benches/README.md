@@ -58,8 +58,8 @@ spillover/compact retries, not just single-blob descent.
 A second group — **scale curve** (`kv_scale_get` / `kv_scale_put`)
 — parameterizes over `{ 20 000, 100 000, 500 000, 2 000 000 }`
 keys. The 500 k tier (~48 MB payload) already exceeds the
-default 32 MB buffer pool; the 2 M tier is the large-tree
-pressure case used to judge path-put scalability.
+scale harness's explicit 32 MB buffer pool; the 2 M tier is the
+large-tree pressure case used to judge path-put scalability.
 
 ## Running
 
