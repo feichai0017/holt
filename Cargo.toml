@@ -1,6 +1,6 @@
 [package]
 name = "holt"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 rust-version = "1.82"
 autobenches = false
@@ -19,32 +19,15 @@ members = [".", "crates/holt-ffi"]
 exclude = ["benches", "fuzz", "verified"]
 
 [dependencies]
-# Bounded MPSC + `select!` between a timer and a stop-channel —
-# used by the background checkpointer threads (planner / I/O /
-# eviction). Std's `mpsc` lacks bounded sends and `select!`.
+# Bounded channels for the background checkpointer threads.
 crossbeam-channel = "0.5"
-# Sharded concurrent HashMap — backs the BufferManager's blob
-# cache. Replaces v0.1's `Mutex<HashMap>` so concurrent pins on
-# different blobs hit different shards (no single global lock on
-# the hot read path).
+# Sharded blob cache map for the BufferManager.
 dashmap = "6"
-# Hardware-accelerated CRC32 (IEEE 802.3) for the WAL record
-# footer. Auto-detects PCLMULQDQ on x86_64 and the CRC32
-# instruction on AArch64 at runtime, falling back to a
-# slice-by-16 table-driven impl on older / non-x86 cores.
-# v0.1 shipped a hand-rolled 256-entry byte-at-a-time table
-# (≈1.5 GB/s); `crc32fast` hits ≈8-12 GB/s on Skylake+ and
-# ≈10 GB/s on Apple Silicon, dropping per-record overhead from
-# ~110 ns to ~20 ns.
+# Hardware-accelerated CRC32 for WAL record footers.
 crc32fast = { version = "1.4", default-features = false }
-# Inline storage for short range prefixes/start markers. Keeps
-# `scan_keys(prefix).visit(...)` allocation-free on the common
-# metadata path while still spilling for unusually long prefixes.
+# Inline storage for short range prefixes/start markers.
 smallvec = "1"
-# Structured event emission on `spillover` / `merge_blob` /
-# `compact_blob` / WAL flush / checkpoint round. Optional so
-# users who don't run a `tracing` subscriber don't pay any
-# closure-construction cost.
+# Optional structured events for rare structural paths.
 tracing = { version = "0.1", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
@@ -60,21 +43,11 @@ proptest = { version = "1", default-features = false, features = ["std", "fork",
 
 [features]
 default = ["io-uring"]
-# Linux-only fast path: route FileBlobStore reads + writes
-# through io_uring instead of pread/pwrite syscalls. On non-Linux
-# targets this feature is a no-op because the dependency is cfg-gated.
-# Use `--no-default-features` on Linux to force the syscall path.
+# Linux-only file-store fast path. Non-Linux builds ignore it.
 io-uring = ["dep:io-uring"]
-# Enables `tracing` instrumentation on the rare-but-important
-# events: spillover, merge_blob, compact_blob, WAL flush /
-# truncate, checkpoint round start/end, BM evict. Subscribers
-# receive structured fields (blob_guid, byte counts, durations);
-# users who don't enable a subscriber pay zero runtime cost
-# beyond the cfg-gated span constructor.
+# Enables `tracing` instrumentation on structural and I/O events.
 tracing = ["dep:tracing"]
-# Enables the `holt::metrics` module — renders `TreeStats`
-# into Prometheus text format for `/metrics` endpoints. Pure
-# Rust, no external crates pulled in.
+# Enables the `holt::metrics` Prometheus text renderer.
 metrics = []
 
 [profile.release]

@@ -9,6 +9,15 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-05-24
+
+### Changed
+
+- Prepared a patch release that keeps the v0.3.2 architecture and
+  public API intact.
+- Trimmed stale test scaffolding and shortened manifest comments
+  that had drifted from the current implementation.
+
 ## [0.3.2] — 2026-05-23
 
 ### Added

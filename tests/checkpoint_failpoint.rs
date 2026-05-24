@@ -19,8 +19,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tempfile::tempdir;
-
 use holt::{AlignedBlobBuf, BlobStore, CheckpointConfig, MemoryBlobStore, Tree, TreeConfig};
 
 // ---------- failpoint store ----------
@@ -426,17 +424,9 @@ fn pre_delete_sync_failure_restores_pending() {
 
 #[test]
 fn bg_checkpointer_recovers_from_transient_failure() {
-    // Same shape but with the background checkpointer driving
-    // the round, not manual `tree.checkpoint`. Verify the
-    // bg loop eventually drains everything.
     let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let fp = Arc::new(FailpointBlobStore::new(Arc::clone(&inner)));
     let fp_clone: Arc<dyn BlobStore> = fp.clone();
-
-    let dir = tempdir().unwrap();
-    // Use TreeBuilder with WAL + bg checkpointer to exercise
-    // the full round path.
-    let _ = dir; // we use open_with_blob_store (no WAL), so dir unused
 
     let mut cfg = TreeConfig::memory();
     cfg.memory_flush_on_write = false;
