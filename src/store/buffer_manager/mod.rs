@@ -1,4 +1,4 @@
-//! `BufferManager` — LRU-bounded blob cache.
+//! `BufferManager` — frequency-aware blob cache.
 //!
 //! Sits between a [`Tree`](crate::Tree) and its underlying
 //! [`BlobStore`]. Itself implements `BlobStore`, so it's a transparent
@@ -96,11 +96,11 @@
 //!
 //! Two paths drop cold cache entries:
 //!
-//! - **Inline overflow** ([`Self::try_evict_lru`]) — fires inside
+//! - **Inline overflow** ([`Self::try_evict_for_point_insert`]) — fires inside
 //!   [`Self::insert_into_cache`] when the new entry pushes the
-//!   cache past `capacity`. Picks the entry with the oldest
-//!   `last_touched` tick whose `Arc::strong_count == 1` (no
-//!   outside pin).
+//!   cache past `capacity`. Point inserts use a TinyLFU-style
+//!   sketch to prefer evicting one-hit leaf blobs over frequently
+//!   reused metadata blobs, with `last_touched` as the tie-breaker.
 //! - **Background sweep** ([`crate::checkpoint`] eviction
 //!   thread) — periodic overflow trim for entries that were still
 //!   pinned during inline eviction. It uses the same
@@ -120,6 +120,7 @@
 //! would otherwise be a per-blob bottleneck on multi-threaded
 //! workloads.
 
+mod admission;
 mod cached_blob;
 mod mutation;
 
@@ -134,6 +135,7 @@ use crate::layout::BlobGuid;
 
 use super::blob_store::{AlignedBlobBuf, BlobStore};
 
+use admission::TinyLFU;
 pub use cached_blob::{BlobWriteGuard, CachedBlob};
 use mutation::{
     bookkeeping_shard_idx, pop_candidate_batch, CandidateKind, MutationState, BOOKKEEPING_SHARDS,
@@ -169,7 +171,7 @@ enum PinAccess {
     Silent,
 }
 
-/// LRU-bounded blob cache; see the module docs.
+/// Frequency-aware blob cache; see the module docs.
 pub struct BufferManager {
     store: Arc<dyn BlobStore>,
     capacity: usize,
@@ -178,9 +180,14 @@ pub struct BufferManager {
     /// concurrent `pin` / `get_cached` on different blobs hit
     /// different shards — no single global mutex on the hot read
     /// path. The background eviction thread + each entry's
-    /// `last_touched` tick give "approximate LRU" without needing
-    /// an O(n) front-of-deque touch on every hit.
+    /// `last_touched` tick give recency, while `admission` keeps
+    /// one-shot point misses from displacing frequently reused
+    /// metadata blobs.
     cache: DashMap<BlobGuid, Arc<CachedBlob>>,
+    /// Approximate point-access frequency sketch. Scan and silent
+    /// accesses deliberately do not update this so long list walks
+    /// cannot pollute the point-read admission policy.
+    admission: TinyLFU,
     /// Small protected tier for route-anchor blobs learned from
     /// the route cache. Dirty and pending-delete state still lives
     /// in `mutation`; this tier only prevents ordinary clean-cache
@@ -208,7 +215,7 @@ pub struct BufferManager {
     /// `clock.fetch_add(1)`; the eviction thread compares the
     /// current clock to each entry's stamp to find candidates that
     /// haven't been used in the last N ticks. The same field also
-    /// drives inline overflow eviction (`try_evict_lru`).
+    /// feeds the recency side of inline overflow eviction.
     ///
     /// Uses `Relaxed` ordering throughout — strict happens-before
     /// isn't required, only "more recent stamps look more recent".
@@ -260,6 +267,7 @@ impl BufferManager {
             capacity,
             route_resident_budget: route_resident_budget(capacity),
             cache: DashMap::new(),
+            admission: TinyLFU::new(),
             route_resident: DashMap::new(),
             mutation: std::array::from_fn(|_| Mutex::new(MutationState::default())),
             pending_delete_total: AtomicUsize::new(0),
@@ -389,6 +397,9 @@ impl BufferManager {
         // by the caller; see `eviction::run_scan`).
         self.cache
             .remove_if(&guid, |_, entry| {
+                if self.is_route_resident(guid) {
+                    return false;
+                }
                 if Arc::strong_count(entry) > 1 {
                     return false;
                 }
@@ -513,7 +524,7 @@ impl BufferManager {
     /// Internal: look up `guid` in the cache under a declared
     /// access pattern.
     ///
-    /// `Point` is the hot get/put path and refreshes LRU recency.
+    /// `Point` is the hot get/put path and refreshes recency.
     /// `Scan` counts cache telemetry but deliberately does not
     /// promote the entry, so a large range/list walk cannot rescue
     /// blobs that point lookups would otherwise evict. `Silent` is
@@ -523,12 +534,16 @@ impl BufferManager {
             if !matches!(access, PinAccess::Silent) {
                 self.cache_misses.fetch_add(1, Ordering::Relaxed);
             }
+            if matches!(access, PinAccess::Point) {
+                self.admission.record(guid);
+            }
             return None;
         };
         let arc = Arc::clone(entry.value());
         drop(entry);
         match access {
             PinAccess::Point => {
+                self.admission.record(guid);
                 let tick = self.clock.fetch_add(1, Ordering::Relaxed);
                 arc.last_touched.store(tick, Ordering::Relaxed);
                 self.cache_hits.fetch_add(1, Ordering::Relaxed);
@@ -608,7 +623,7 @@ impl BufferManager {
         // where every cache entry is currently pinned (every
         // `Arc::strong_count > 1`). Yielding gives concurrent
         // readers / writers a chance to drop their pins so the
-        // next `try_evict_lru` finds a victim. If after the
+        // next eviction attempt finds a victim. If after the
         // retry budget the cache still can't shrink, we let it
         // exceed capacity rather than failing the load — the
         // background sweep will catch up. `RETRY_BUDGET` is a
@@ -619,7 +634,7 @@ impl BufferManager {
         let mut entry_spins = self.cache.len();
         while self.cache.len() > self.capacity {
             let evicted = match access {
-                PinAccess::Point => self.try_evict_lru(),
+                PinAccess::Point => self.try_evict_for_point_insert(guid),
                 PinAccess::Scan | PinAccess::Silent => self.try_evict_scan_cold(),
             };
             if evicted {
@@ -639,11 +654,11 @@ impl BufferManager {
         entry
     }
 
-    /// Internal: walk the cache for the entry with the oldest
-    /// `last_touched` tick whose `Arc::strong_count == 1` (i.e.
-    /// no outside pin) and whose dirty / pending-delete bookkeeping
-    /// is empty, and evict it. Returns `true` if an entry was
-    /// dropped.
+    /// Internal: walk the cache for an unpinned clean victim and
+    /// evict it. Point inserts prefer the lowest TinyLFU frequency
+    /// and use `last_touched` as a tie-breaker; scan/silent
+    /// overflow keeps the stricter "never evict point-touched
+    /// blobs" path by requiring `last_touched == 0`.
     ///
     /// O(n) in the cache size, but called only on insert overflow
     /// — the background eviction thread handles steady-state
@@ -659,15 +674,18 @@ impl BufferManager {
     /// it; in memory mode the cache mutation was lost outright,
     /// in persistent mode the WAL truncate gate stuck closed
     /// forever. Matches `try_evict_cold`'s guard for the bg sweep.
-    fn try_evict_lru(&self) -> bool {
-        self.try_evict_lru_until(u64::MAX)
+    fn try_evict_for_point_insert(&self, candidate: BlobGuid) -> bool {
+        self.try_evict_until(
+            u64::MAX,
+            Some((candidate, self.admission.estimate(candidate))),
+        )
     }
 
     fn try_evict_scan_cold(&self) -> bool {
-        self.try_evict_lru_until(0)
+        self.try_evict_until(0, None)
     }
 
-    fn try_evict_lru_until(&self, max_last_touched: u64) -> bool {
+    fn try_evict_until(&self, max_last_touched: u64, candidate: Option<(BlobGuid, u8)>) -> bool {
         // Snapshot the dirty + pending-delete key sets under one
         // lock acquisition each, then scan the cache against the
         // snapshots. Holding the locks across the whole cache walk
@@ -685,7 +703,7 @@ impl BufferManager {
             out
         };
 
-        let mut victim: Option<(BlobGuid, u64)> = None;
+        let mut victim: Option<(BlobGuid, u8, u64)> = None;
         for kv in &self.cache {
             if Arc::strong_count(kv.value()) > 1 {
                 continue;
@@ -698,15 +716,27 @@ impl BufferManager {
             if tick > max_last_touched {
                 continue;
             }
+            let freq = if candidate.is_some() {
+                self.admission.estimate(guid)
+            } else {
+                0
+            };
             match victim {
-                None => victim = Some((guid, tick)),
-                Some((_, vmin)) if tick < vmin => {
-                    victim = Some((guid, tick));
+                None => victim = Some((guid, freq, tick)),
+                Some((_, vfreq, vtick)) if (freq, tick) < (vfreq, vtick) => {
+                    victim = Some((guid, freq, tick));
                 }
                 _ => {}
             }
         }
-        if let Some((guid, _)) = victim {
+        if let (Some((candidate_guid, candidate_freq)), Some((victim_guid, victim_freq, _))) =
+            (candidate, victim)
+        {
+            if victim_guid != candidate_guid && victim_freq > candidate_freq {
+                return false;
+            }
+        }
+        if let Some((guid, _, _)) = victim {
             // `remove_if` re-checks strong_count + dirty + pending
             // under the shard lock — guards against a pin acquired
             // (or a fresh dirty / pending-delete mark) between our
@@ -714,6 +744,9 @@ impl BufferManager {
             return self
                 .cache
                 .remove_if(&guid, |_, e| {
+                    if self.is_route_resident(guid) {
+                        return false;
+                    }
                     if Arc::strong_count(e) > 1 {
                         return false;
                     }
@@ -760,7 +793,7 @@ impl BufferManager {
     }
 
     /// Pin for range/list scans. Hits and misses remain visible in
-    /// cache telemetry, but scan access does not refresh LRU
+    /// cache telemetry, but scan access does not refresh
     /// recency. This keeps large directory/object-list walks from
     /// evicting hot point-read blobs.
     pub(crate) fn pin_scan(&self, guid: BlobGuid) -> Result<Arc<CachedBlob>> {
@@ -1437,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_hits_do_not_refresh_lru_recency() {
+    fn scan_hits_do_not_refresh_recency() {
         let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         for i in 0..3u8 {
             let mut guid = [0u8; 16];
@@ -1466,7 +1499,7 @@ mod tests {
     }
 
     #[test]
-    fn lru_eviction_at_capacity() {
+    fn frequency_aware_eviction_stays_at_capacity() {
         let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         for i in 0..10u8 {
             let mut g = [0u8; 16];
@@ -1497,7 +1530,37 @@ mod tests {
     }
 
     #[test]
-    fn route_resident_anchor_survives_inline_lru() {
+    fn tinylfu_keeps_frequent_point_blob_against_one_hit_stream() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        for i in 0..12u8 {
+            let mut g = [0u8; 16];
+            g[0] = i;
+            inner.write_blob(g, &make_buf(i)).unwrap();
+        }
+
+        let bm = BufferManager::new(inner, 2);
+        let hot = [0u8; 16];
+        for _ in 0..8 {
+            drop(bm.pin(hot).unwrap());
+        }
+
+        for i in 1..12u8 {
+            let mut cold = [0u8; 16];
+            cold[0] = i;
+            drop(bm.pin(cold).unwrap());
+            assert!(
+                bm.cache.contains_key(&hot),
+                "frequent point blob should survive one-hit stream pressure",
+            );
+            assert!(
+                bm.cached_count() <= 2,
+                "unprotected one-hit blobs should be reclaimed immediately",
+            );
+        }
+    }
+
+    #[test]
+    fn route_resident_anchor_survives_inline_eviction() {
         let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         for i in 0..9u8 {
             let mut g = [0u8; 16];
@@ -1542,7 +1605,7 @@ mod tests {
         assert!(bm.is_route_resident([2; 16]));
     }
 
-    /// Regression: prior to the v0.2.1 fix, `try_evict_lru` only
+    /// Regression: prior to the v0.2.1 fix, inline eviction only
     /// checked `Arc::strong_count == 1` — it would happily evict
     /// a dirty cache image, leaving the dirty entry orphaned in
     /// the dirty map. That broke invariant I1 (dirty ⟺ cache
@@ -1550,7 +1613,7 @@ mod tests {
     /// (memory mode) / stuck the WAL truncate gate forever
     /// (persistent mode).
     #[test]
-    fn lru_eviction_skips_dirty_entries() {
+    fn inline_eviction_skips_dirty_entries() {
         let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
         // Pre-populate the inner store with three blobs whose
         // bytes we'll be able to distinguish.
@@ -1604,7 +1667,7 @@ mod tests {
 
         assert!(
             bm.cache.contains_key(&g_a),
-            "dirty entry A's cache image must survive inline LRU eviction",
+            "dirty entry A's cache image must survive inline eviction",
         );
         assert!(
             bm.cache.contains_key(&g_c),

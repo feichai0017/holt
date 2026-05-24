@@ -3,9 +3,10 @@
 //!
 //! ## Why a separate thread
 //!
-//! Inline LRU runs on the insertion path. The eviction thread
-//! handles overflow that could not be reclaimed immediately, for
-//! example because entries were pinned at insert time.
+//! Inline frequency-aware eviction runs on the insertion path.
+//! The eviction thread handles overflow that could not be
+//! reclaimed immediately, for example because entries were pinned
+//! at insert time.
 //!
 //! The thread runs on its own cadence and uses each entry's
 //! `last_touched` tick to pick old entries. It first checks cache
