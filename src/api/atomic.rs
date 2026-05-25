@@ -10,8 +10,8 @@
 //!
 //! Atomicity contract is documented on `Tree::atomic` — short
 //! version: logical preconditions are checked before mutation,
-//! concurrent readers/writers cannot observe intermediate batch
-//! state, and replay sees all-or-nothing.
+//! concurrent writers and range/view readers cannot observe
+//! intermediate batch state, and replay sees all-or-nothing.
 
 /// Value plus the live record version observed by one lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]

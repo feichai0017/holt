@@ -104,23 +104,25 @@ fn blob_fill_per_mille(space_used: u32, blob_data_capacity: u64) -> u32 {
 ///   interleaved writer changes a frame, the iterator discards its
 ///   stack and performs a marker-aware seek from the last emitted
 ///   key / delimiter lower bound.
-/// - **Writes** (`put`, `delete`) hold the per-blob `HybridLatch`
-///   exclusively for the blobs they touch and lock-couple across
-///   `BlobNode` crossings. Persistent trees enter the writer-shared
-///   `commit_gate` while publishing dirty state and the journal
-///   record. If `TreeConfig::wal_sync` is set, writes wait for the
-///   journal worker after leaving the gate.
+/// - **Writes** (`put`, `delete`) enter the shared side of
+///   `maintenance_gate`, lock the key's endpoint shard, then hold the
+///   per-blob `HybridLatch` exclusively for the blobs they touch.
+///   Persistent trees enter the writer-shared `commit_gate` while
+///   publishing dirty state and the journal record. If
+///   `TreeConfig::wal_sync` is set, writes wait for the journal worker
+///   after leaving both gates.
 /// - **Maintenance** (`compact`, background merge) takes short
 ///   exclusive windows on `maintenance_gate` while folding/deleting
 ///   cross-blob edges. Blob-local compaction runs on the shared
-///   side under per-blob latches. Point reads and single-key writes
-///   rely on parent/child blob latches instead of this tree-wide
-///   gate; range scans and atomic predicate preflight still enter
-///   the shared/exclusive sides.
+///   side under per-blob latches. Point reads rely on parent/child
+///   blob latches instead of this tree-wide gate; range scans and
+///   foreground writers enter the shared side, while `atomic` and
+///   scoped `view` capture enter the exclusive side.
 /// - **`rename`** locks the two endpoint shards for `src` and
-///   `dst` in canonical order so overlapping renames serialize,
-///   while disjoint endpoint pairs can run concurrently. `put` /
-///   `delete` / `get` never take these endpoint locks.
+///   `dst` in canonical order after entering the shared maintenance
+///   side. `put` / `delete` lock their single endpoint shard, so a
+///   rename cannot interleave with writes touching either endpoint.
+///   `get` never takes these endpoint locks.
 #[derive(Clone)]
 pub struct Tree {
     cfg: TreeConfig,
@@ -148,12 +150,11 @@ pub struct Tree {
     route_cache: Arc<engine::RouteCache>,
     /// Tree-wide structural-maintenance gate.
     ///
-    /// Range and atomic predicate paths enter the shared/exclusive
-    /// sides while they may cross `BlobNode` boundaries. `compact()`
-    /// and the background merge pass enter the exclusive side only
-    /// around folding a child blob back into its parent and queuing
-    /// the child for delete. Point reads and single-key writes rely
-    /// on parent/child blob latches instead of this tree-wide gate.
+    /// Range and foreground write paths enter the shared side while
+    /// they may cross `BlobNode` boundaries. `atomic()` and
+    /// `view()` enter the exclusive side to make predicate/apply and
+    /// topology/copy phases linear. Point reads rely only on
+    /// parent/child blob latches.
     maintenance_gate: Arc<Gate>,
     /// Monotonically-increasing sequence stamped on every record.
     /// On open the tree replays the WAL and resumes at
@@ -515,55 +516,60 @@ impl Tree {
         condition: engine::InsertCondition,
     ) -> Result<engine::InsertOutcome> {
         let search = engine::SearchKey::user(key);
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
-        let (outcome, journal_ack) = if let Some(journal) = &self.journal {
-            let _commit = self.commit_gate.enter_writer();
-            let outcome = engine::insert_multi_conditional(
-                &self.store,
-                &self.root_pin,
-                Some(&self.route_cache),
-                search,
-                value,
-                seq,
-                condition,
-            )?;
-            if outcome.mutated {
+        let (outcome, journal_ack) = {
+            let _mutation = self.maintenance_gate.enter_shared();
+            let _endpoint = self.endpoint_locks.lock_key(key);
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+
+            if let Some(journal) = &self.journal {
+                let _commit = self.commit_gate.enter_writer();
+                let outcome = engine::insert_multi_conditional(
+                    &self.store,
+                    &self.root_pin,
+                    Some(&self.route_cache),
+                    search,
+                    value,
+                    seq,
+                    condition,
+                )?;
+                if outcome.mutated {
+                    if outcome.root_dirty {
+                        self.store
+                            .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+                    }
+                    let mut record =
+                        journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
+                    encode_insert_record(&mut record, seq, 0, key, value);
+                    let ack = journal.submit(record, self.cfg.wal_sync)?;
+                    (outcome, ack)
+                } else {
+                    (outcome, None)
+                }
+            } else {
+                // No WAL — no journal/checkpoint publish boundary to
+                // race with. `memory_flush_on_write` (if set)
+                // flushes dirty + pending-delete sets inline before
+                // returning.
+                let outcome = engine::insert_multi_conditional(
+                    &self.store,
+                    &self.root_pin,
+                    Some(&self.route_cache),
+                    search,
+                    value,
+                    seq,
+                    condition,
+                )?;
                 if outcome.root_dirty {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                 }
-                let mut record =
-                    journal.record_buffer(encoded_insert_record_len(key.len(), value.len()));
-                encode_insert_record(&mut record, seq, 0, key, value);
-                let ack = journal.submit(record, self.cfg.wal_sync)?;
-                (outcome, ack)
-            } else {
+                if outcome.mutated && self.cfg.memory_flush_on_write {
+                    self.flush_dirty_inline()?;
+                    self.flush_pending_deletes_inline()?;
+                }
                 (outcome, None)
             }
-        } else {
-            // No WAL — no journal/checkpoint publish boundary to
-            // race with. `memory_flush_on_write` (if set)
-            // flushes dirty + pending-delete sets inline before
-            // returning.
-            let outcome = engine::insert_multi_conditional(
-                &self.store,
-                &self.root_pin,
-                Some(&self.route_cache),
-                search,
-                value,
-                seq,
-                condition,
-            )?;
-            if outcome.root_dirty {
-                self.store
-                    .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
-            }
-            if outcome.mutated && self.cfg.memory_flush_on_write {
-                self.flush_dirty_inline()?;
-                self.flush_pending_deletes_inline()?;
-            }
-            (outcome, None)
         };
         if let Some(ack) = journal_ack {
             ack.wait()?;
@@ -613,58 +619,63 @@ impl Tree {
         // A no-op delete (key absent) still burns the seq; that's
         // fine — `next_seq` is monotonic and the unused seq doesn't
         // appear in any WAL record or dirty entry.
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
-        let (outcome, journal_ack) = if let Some(journal) = &self.journal {
-            let _commit = self.commit_gate.enter_writer();
-            let outcome = engine::erase_multi_conditional(
-                &self.store,
-                &self.root_pin,
-                Some(&self.route_cache),
-                search,
-                seq,
-                condition,
-            )?;
-            if outcome.mutated {
-                // Only mark the root if the root blob changed.
-                // Cross-blob erases mark their child blob inside
-                // the walker; absent-key no-ops mark nothing.
-                if outcome.root_dirty {
+        let (outcome, journal_ack) = {
+            let _mutation = self.maintenance_gate.enter_shared();
+            let _endpoint = self.endpoint_locks.lock_key(key);
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+
+            if let Some(journal) = &self.journal {
+                let _commit = self.commit_gate.enter_writer();
+                let outcome = engine::erase_multi_conditional(
+                    &self.store,
+                    &self.root_pin,
+                    Some(&self.route_cache),
+                    search,
+                    seq,
+                    condition,
+                )?;
+                if outcome.mutated {
+                    // Only mark the root if the root blob changed.
+                    // Cross-blob erases mark their child blob inside
+                    // the walker; absent-key no-ops mark nothing.
+                    if outcome.root_dirty {
+                        self.store
+                            .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+                    }
+                    let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
+                    encode_erase_record(&mut record, seq, 0, key);
+                    let ack = journal.submit(record, self.cfg.wal_sync)?;
+                    (outcome, ack)
+                } else {
+                    (outcome, None)
+                }
+                // No-op delete (key wasn't there) is not logged.
+            } else {
+                let outcome = engine::erase_multi_conditional(
+                    &self.store,
+                    &self.root_pin,
+                    Some(&self.route_cache),
+                    search,
+                    seq,
+                    condition,
+                )?;
+                if outcome.mutated && outcome.root_dirty {
                     self.store
                         .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
                 }
-                let mut record = journal.record_buffer(encoded_erase_record_len(key.len()));
-                encode_erase_record(&mut record, seq, 0, key);
-                let ack = journal.submit(record, self.cfg.wal_sync)?;
-                (outcome, ack)
-            } else {
+                if outcome.mutated && self.cfg.memory_flush_on_write {
+                    // Flush every blob the walker touched (root + any
+                    // children) — no WAL means this is the sole
+                    // durability path. snapshot_dirty drains all
+                    // entries; we commit each through the store.
+                    self.flush_dirty_inline()?;
+                    // Plus drain any deferred deletes queued by a
+                    // conservative parent-unlink path.
+                    self.flush_pending_deletes_inline()?;
+                }
                 (outcome, None)
             }
-            // No-op delete (key wasn't there) is not logged.
-        } else {
-            let outcome = engine::erase_multi_conditional(
-                &self.store,
-                &self.root_pin,
-                Some(&self.route_cache),
-                search,
-                seq,
-                condition,
-            )?;
-            if outcome.mutated && outcome.root_dirty {
-                self.store
-                    .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
-            }
-            if outcome.mutated && self.cfg.memory_flush_on_write {
-                // Flush every blob the walker touched (root + any
-                // children) — no WAL means this is the sole
-                // durability path. snapshot_dirty drains all
-                // entries; we commit each through the store.
-                self.flush_dirty_inline()?;
-                // Plus drain any deferred deletes queued by a
-                // conservative parent-unlink path.
-                self.flush_pending_deletes_inline()?;
-            }
-            (outcome, None)
         };
         if let Some(ack) = journal_ack {
             ack.wait()?;
@@ -680,109 +691,108 @@ impl Tree {
     /// - When `force` is `true`, any existing leaf at `dst` is
     ///   overwritten.
     ///
-    /// Atomic with respect to renames touching the same endpoint
-    /// lock shards; unrelated endpoint pairs can proceed in
-    /// parallel. Concurrent `put` / `delete` on disjoint subtrees
-    /// are not blocked. The op emits a single `RenameObject` WAL
-    /// record so its erase + insert phases recover atomically on
-    /// replay.
+    /// Atomic with respect to writes touching either endpoint shard;
+    /// unrelated endpoints can proceed in parallel. The op emits a
+    /// single `RenameObject` WAL record so its erase + insert phases
+    /// recover atomically on replay.
     pub fn rename(&self, src: &[u8], dst: &[u8], force: bool) -> Result<()> {
         let src_search = engine::SearchKey::user(src);
         let dst_search = engine::SearchKey::user(dst);
 
-        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
-        let _endpoints = self.endpoint_locks.lock_pair(src, dst);
+        let journal_ack = {
+            let _mutation = self.maintenance_gate.enter_shared();
+            let _endpoints = self.endpoint_locks.lock_pair(src, dst);
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
-        // Probe src across all blobs — zero-copy via BM pin.
-        let Some(value) = engine::lookup_multi_with(
-            &self.store,
-            &self.root_pin,
-            Some(&self.route_cache),
-            src_search,
-            |hit| hit.value.to_vec(),
-        )?
-        else {
-            return Err(Error::NotFound);
-        };
-
-        // Same key? No-op (seq is already bumped).
-        if src == dst {
-            return Ok(());
-        }
-
-        // Probe dst across all blobs unless overwrite is allowed.
-        if !force
-            && engine::lookup_multi_with(
+            // Probe src across all blobs — zero-copy via BM pin.
+            let Some(value) = engine::lookup_multi_with(
                 &self.store,
                 &self.root_pin,
                 Some(&self.route_cache),
-                dst_search,
-                |_| (),
+                src_search,
+                |hit| hit.value.to_vec(),
             )?
-            .is_some()
-        {
-            return Err(Error::DstExists);
-        }
+            else {
+                return Err(Error::NotFound);
+            };
 
-        // W2D-strict protocol: walker + mark_dirty + journal
-        // submission all happen under `commit_gate`. Sharing one
-        // `seq` across both erase + insert phases keeps the rename
-        // atomic from the dirty-tracking perspective — failing
-        // halfway leaves a coherent partial-dirty set rather than
-        // two separately-staged ops.
-        let journal_ack = if let Some(journal) = &self.journal {
-            let _commit = self.commit_gate.enter_writer();
-            let erase_out = engine::erase_multi(
-                &self.store,
-                &self.root_pin,
-                Some(&self.route_cache),
-                src_search,
-                seq,
-            )?;
-            let insert_out = engine::insert_multi(
-                &self.store,
-                &self.root_pin,
-                Some(&self.route_cache),
-                dst_search,
-                &value,
-                seq,
-            )?;
-            if erase_out.root_dirty || insert_out.root_dirty {
-                self.store
-                    .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+            // Same key? No-op (seq is already bumped).
+            if src == dst {
+                return Ok(());
             }
-            let mut record =
-                journal.record_buffer(encoded_rename_object_record_len(src.len(), dst.len()));
-            encode_rename_object_record(&mut record, seq, 0, src, dst, force);
-            journal.submit(record, self.cfg.wal_sync)?
-        } else {
-            let erase_out = engine::erase_multi(
-                &self.store,
-                &self.root_pin,
-                Some(&self.route_cache),
-                src_search,
-                seq,
-            )?;
-            let insert_out = engine::insert_multi(
-                &self.store,
-                &self.root_pin,
-                Some(&self.route_cache),
-                dst_search,
-                &value,
-                seq,
-            )?;
-            if erase_out.root_dirty || insert_out.root_dirty {
-                self.store
-                    .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+
+            // Probe dst across all blobs unless overwrite is allowed.
+            if !force
+                && engine::lookup_multi_with(
+                    &self.store,
+                    &self.root_pin,
+                    Some(&self.route_cache),
+                    dst_search,
+                    |_| (),
+                )?
+                .is_some()
+            {
+                return Err(Error::DstExists);
             }
-            if self.cfg.memory_flush_on_write {
-                // Walker may have dirtied child blobs across the
-                // erase + insert sequence — drain the full set.
-                // The erase half can also queue SubtreeGone deletes.
-                self.flush_dirty_inline()?;
-                self.flush_pending_deletes_inline()?;
+
+            // W2D-strict protocol: walker + mark_dirty + journal
+            // submission all happen under `commit_gate`. Sharing one
+            // `seq` across both erase + insert phases keeps the rename
+            // atomic from the dirty-tracking perspective.
+            if let Some(journal) = &self.journal {
+                let _commit = self.commit_gate.enter_writer();
+                let erase_out = engine::erase_multi(
+                    &self.store,
+                    &self.root_pin,
+                    Some(&self.route_cache),
+                    src_search,
+                    seq,
+                )?;
+                let insert_out = engine::insert_multi(
+                    &self.store,
+                    &self.root_pin,
+                    Some(&self.route_cache),
+                    dst_search,
+                    &value,
+                    seq,
+                )?;
+                if erase_out.root_dirty || insert_out.root_dirty {
+                    self.store
+                        .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+                }
+                let mut record =
+                    journal.record_buffer(encoded_rename_object_record_len(src.len(), dst.len()));
+                encode_rename_object_record(&mut record, seq, 0, src, dst, force);
+                journal.submit(record, self.cfg.wal_sync)?
+            } else {
+                let erase_out = engine::erase_multi(
+                    &self.store,
+                    &self.root_pin,
+                    Some(&self.route_cache),
+                    src_search,
+                    seq,
+                )?;
+                let insert_out = engine::insert_multi(
+                    &self.store,
+                    &self.root_pin,
+                    Some(&self.route_cache),
+                    dst_search,
+                    &value,
+                    seq,
+                )?;
+                if erase_out.root_dirty || insert_out.root_dirty {
+                    self.store
+                        .mark_dirty_cached(self.root_guid, seq, self.root_pin.as_ref());
+                }
+                if self.cfg.memory_flush_on_write {
+                    // Walker may have dirtied child blobs across the
+                    // erase + insert sequence — drain the full set.
+                    // The erase half can also queue SubtreeGone deletes.
+                    self.flush_dirty_inline()?;
+                    self.flush_pending_deletes_inline()?;
+                }
+                None
             }
-            None
         };
         if let Some(ack) = journal_ack {
             ack.wait()?;
@@ -805,9 +815,12 @@ impl Tree {
     ///   detected before any walker mutation. A failing rename
     ///   returns `Err`; a failed conditional guard returns
     ///   `Ok(false)`. Neither publishes partial user mutations.
-    /// - **Runtime visibility**: readers and writers are blocked
-    ///   while the batch applies, so no concurrent operation can
-    ///   observe an intermediate batch state.
+    /// - **Runtime visibility**: foreground writes, range scans, and
+    ///   view capture are blocked while the batch applies, so they
+    ///   cannot observe an intermediate batch state. Point reads stay
+    ///   optimistic and wait-free; if they overlap the batch, each
+    ///   individual key read linearizes either before or after the
+    ///   corresponding leaf mutation.
     /// - **Crash atomicity**: yes. The single WAL record is the
     ///   recovery commit point; replay sees the whole batch or none.
     ///
@@ -2250,7 +2263,7 @@ mod tests {
     }
 
     #[test]
-    fn single_key_writes_do_not_enter_maintenance_gate() {
+    fn single_key_writes_wait_behind_maintenance_exclusive() {
         let tree = TreeBuilder::new("ignored").memory().open().unwrap();
         tree.put(b"src", b"old").unwrap();
 
@@ -2270,11 +2283,40 @@ mod tests {
         });
 
         let got = done_rx.recv_timeout(Duration::from_secs(1));
+        assert!(
+            got.is_err(),
+            "single-key writers must wait behind an exclusive mutation gate"
+        );
         drop(exclusive);
+        let got = done_rx.recv_timeout(Duration::from_secs(1));
         handle.join().unwrap();
         let (k1, renamed) = got.unwrap();
         assert_eq!(k1.as_deref(), Some(&b"v1"[..]));
         assert_eq!(renamed.as_deref(), Some(&b"v2"[..]));
+    }
+
+    #[test]
+    fn single_key_writes_take_endpoint_shard() {
+        let tree = TreeBuilder::new("ignored").memory().open().unwrap();
+        let endpoint = tree.endpoint_locks.lock_key(b"same/key");
+        let worker_tree = tree.clone();
+        let (done_tx, done_rx) = sync_channel(0);
+        let handle = thread::spawn(move || {
+            worker_tree.put(b"same/key", b"value").unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "put must wait behind the key endpoint shard"
+        );
+        drop(endpoint);
+        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            tree.get(b"same/key").unwrap().as_deref(),
+            Some(&b"value"[..])
+        );
     }
 
     #[test]

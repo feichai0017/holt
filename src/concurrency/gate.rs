@@ -8,9 +8,11 @@
 
 use std::hint::spin_loop;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 const WRITE_BIT: usize = 1usize << (usize::BITS - 1);
 const COUNT_MASK: usize = WRITE_BIT - 1;
+const ADAPTIVE_SPINS: u32 = 64;
 
 #[derive(Debug)]
 pub(crate) struct Gate {
@@ -32,27 +34,28 @@ impl Gate {
     }
 
     pub(crate) fn enter_shared(&self) -> GateReadGuard<'_> {
+        let mut spins = 0;
         loop {
-            let cur = self.state.load(Ordering::Acquire);
-            if cur & WRITE_BIT != 0 || cur & COUNT_MASK == COUNT_MASK {
-                spin_loop();
-                continue;
-            }
-            if self
-                .state
-                .compare_exchange_weak(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
+            let cur = self.state.load(Ordering::Relaxed);
+            if cur & WRITE_BIT == 0
+                && cur & COUNT_MASK != COUNT_MASK
+                && self
+                    .state
+                    .compare_exchange_weak(cur, cur + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
             {
                 return GateReadGuard { gate: self };
             }
+            adaptive_wait(&mut spins);
         }
     }
 
     pub(crate) fn enter_exclusive(&self) -> GateWriteGuard<'_> {
+        let mut spins = 0;
         loop {
-            let cur = self.state.load(Ordering::Acquire);
+            let cur = self.state.load(Ordering::Relaxed);
             if cur & WRITE_BIT != 0 {
-                spin_loop();
+                adaptive_wait(&mut spins);
                 continue;
             }
             if self
@@ -60,11 +63,13 @@ impl Gate {
                 .compare_exchange_weak(cur, cur | WRITE_BIT, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                let mut drain_spins = 0;
                 while self.state.load(Ordering::Acquire) & COUNT_MASK != 0 {
-                    spin_loop();
+                    adaptive_wait(&mut drain_spins);
                 }
                 return GateWriteGuard { gate: self };
             }
+            adaptive_wait(&mut spins);
         }
     }
 
@@ -79,6 +84,15 @@ impl Gate {
     #[cfg(test)]
     fn writer_pending_for_test(&self) -> bool {
         self.state.load(Ordering::Acquire) & WRITE_BIT != 0
+    }
+}
+
+fn adaptive_wait(spins: &mut u32) {
+    if *spins < ADAPTIVE_SPINS {
+        *spins += 1;
+        spin_loop();
+    } else {
+        thread::yield_now();
     }
 }
 
