@@ -95,7 +95,7 @@ The supported user surface is deliberately small:
 `TreeBuilder`, `Tree`, `TreeConfig`, `Storage`, `RangeBuilder`,
 `RangeEntry`, `RangeIter`, `KeyRangeBuilder`, `KeyRangeEntry`,
 `KeyRangeIter`, `AtomicBatch`, `Record`, `RecordVersion`,
-`CheckpointConfig`,
+`KeyPathBuf`, `KeyPrefixBuf`, `KeyPathError`, `CheckpointConfig`,
 `TreeStats` / related stats structs, `Error` / `Result`, and the
 custom-store surface (`BlobStore`, `MemoryBlobStore`,
 `FileBlobStore`, `AlignedBlobBuf`, `BlobGuid`). Internal
@@ -123,6 +123,35 @@ let tree = TreeBuilder::new("scratch").memory().open()?;
 
 File-backed trees default to 256 resident 512 KB blobs (128 MiB).
 In-memory trees keep the smaller 64-blob default (32 MiB).
+
+### Path-shaped keys
+
+The core API takes byte keys. For object-store and filesystem-like
+metadata, `KeyPathBuf` builds canonical slash-separated keys without
+hand-written string formatting. It is optional: callers with opaque
+keys can keep passing raw bytes.
+
+```rust
+use holt::KeyPathBuf;
+
+let mut key = KeyPathBuf::with_namespace(b"o")?;
+key.push(b"photos")?;
+key.push(b"users")?;
+key.push(b"alice")?;
+key.push(b"01.jpg")?;
+
+tree.put(key.as_bytes(), b"object_meta")?;
+
+let mut prefix = KeyPathBuf::with_namespace(b"o")?;
+prefix.push(b"photos")?;
+prefix.push(b"users")?;
+let prefix = prefix.into_prefix();
+
+for entry in tree.scan_keys(prefix.as_bytes()).delimiter(b'/') {
+    println!("{:?}", entry?);
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
 
 ### Single-key CRUD
 

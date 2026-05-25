@@ -37,8 +37,9 @@
 //!
 //! The supported import surface is the flat crate root:
 //! [`Tree`], [`TreeBuilder`], [`AtomicBatch`], [`Record`],
-//! [`RecordVersion`], [`View`], range iterator types, stats
-//! snapshots, and the optional `metrics` renderer.
+//! [`RecordVersion`], [`View`], [`KeyPathBuf`], [`KeyPrefixBuf`],
+//! range iterator types, stats snapshots, and the optional
+//! `metrics` renderer.
 //!
 //! All implementation modules are crate-private. This keeps the
 //! on-disk format, WAL codec, walker, and buffer-manager internals
@@ -152,6 +153,7 @@ pub mod metrics;
 pub use api::builder::TreeBuilder;
 pub use api::config::{Storage, TreeConfig};
 pub use api::errors::{Error, Result};
+pub use api::key::{KeyPathBuf, KeyPathError, KeyPrefixBuf};
 pub use api::tree::Tree;
 pub use api::view::{View, ViewKeyRangeBuilder, ViewRangeBuilder};
 

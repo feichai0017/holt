@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use holt::{RangeEntry, Result, Tree, TreeBuilder};
+use holt::{KeyPathBuf, RangeEntry, Result, Tree, TreeBuilder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryKind {
@@ -284,11 +284,15 @@ fn child_name(prefix: &[u8], key: &[u8]) -> String {
 
 fn dirent_key(path: &str) -> Vec<u8> {
     assert!(path.starts_with('/'), "path must be absolute");
-    if path == "/" {
-        b"d/".to_vec()
-    } else {
-        format!("d{path}").into_bytes()
+    let mut key = KeyPathBuf::with_namespace(b"d").expect("dirent namespace is valid");
+    let path = path.strip_prefix('/').expect("checked absolute path");
+    if !path.is_empty() {
+        for segment in path.split('/') {
+            key.push(segment.as_bytes())
+                .expect("example paths use canonical non-empty segments");
+        }
     }
+    key.into_bytes()
 }
 
 fn child_prefix(path: &str) -> Vec<u8> {
@@ -300,7 +304,11 @@ fn child_prefix(path: &str) -> Vec<u8> {
 }
 
 fn inode_key(inode: u64) -> Vec<u8> {
-    format!("i/{inode:016x}").into_bytes()
+    let inode = format!("{inode:016x}");
+    let mut key = KeyPathBuf::with_namespace(b"i").expect("inode namespace is valid");
+    key.push(inode.as_bytes())
+        .expect("hex inode id is a valid key segment");
+    key.into_bytes()
 }
 
 impl Dirent {

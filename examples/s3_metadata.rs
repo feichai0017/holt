@@ -12,7 +12,7 @@
 //! text encoding so the mapping stays readable; a real service would
 //! usually use protobuf, bincode, or a fixed binary layout.
 
-use holt::{RangeEntry, RecordVersion, Result, Tree, TreeBuilder};
+use holt::{KeyPathBuf, RangeEntry, RecordVersion, Result, Tree, TreeBuilder};
 
 #[derive(Debug, Clone, Copy)]
 struct ObjectMeta<'a> {
@@ -232,7 +232,7 @@ fn list_objects_v2(
     delimiter: Option<u8>,
     start_after: Option<&str>,
 ) -> Result<Vec<String>> {
-    let object_prefix = object_key(bucket, prefix);
+    let object_prefix = object_prefix(bucket, prefix);
     let mut range = tree.range().prefix(&object_prefix);
     if let Some(delimiter) = delimiter {
         range = range.delimiter(delimiter);
@@ -281,25 +281,71 @@ fn parse_size(value: &[u8]) -> u64 {
 }
 
 fn object_key(bucket: &str, object: &str) -> Vec<u8> {
-    format!("o/{bucket}/{object}").into_bytes()
+    push_path_segments(object_root(bucket), object).into_bytes()
 }
 
 fn upload_meta_key(bucket: &str, upload_id: &str) -> Vec<u8> {
-    format!("u/{bucket}/{upload_id}/meta").into_bytes()
+    let mut key = object_upload_root(bucket, upload_id);
+    key.push(b"meta")
+        .expect("example upload key segments are valid");
+    key.into_bytes()
 }
 
 fn upload_parts_prefix(bucket: &str, upload_id: &str) -> Vec<u8> {
-    format!("u/{bucket}/{upload_id}/parts/").into_bytes()
+    let mut key = object_upload_root(bucket, upload_id);
+    key.push(b"parts")
+        .expect("example upload key segments are valid");
+    key.into_prefix().into_bytes()
 }
 
 fn upload_part_key(bucket: &str, upload_id: &str, part_no: u32) -> Vec<u8> {
-    format!("u/{bucket}/{upload_id}/parts/{part_no:05}").into_bytes()
+    let part = format!("{part_no:05}");
+    let mut key = object_upload_root(bucket, upload_id);
+    key.push(b"parts")
+        .expect("example upload key segments are valid");
+    key.push(part.as_bytes())
+        .expect("example upload key segments are valid");
+    key.into_bytes()
 }
 
 fn strip_object_key<'a>(bucket: &str, key: &'a [u8]) -> &'a str {
-    let prefix = format!("o/{bucket}/");
+    let prefix = object_prefix(bucket, "");
     let object = key
-        .strip_prefix(prefix.as_bytes())
+        .strip_prefix(prefix.as_slice())
         .expect("key belongs to bucket");
     std::str::from_utf8(object).expect("example keys are utf8")
+}
+
+fn object_prefix(bucket: &str, prefix: &str) -> Vec<u8> {
+    let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
+    let key = if prefix.is_empty() {
+        object_root(bucket)
+    } else {
+        push_path_segments(object_root(bucket), prefix)
+    };
+    key.into_prefix().into_bytes()
+}
+
+fn object_root(bucket: &str) -> KeyPathBuf {
+    let mut key = KeyPathBuf::with_namespace(b"o").expect("example key segments are valid");
+    key.push(bucket.as_bytes())
+        .expect("example key segments are valid");
+    key
+}
+
+fn object_upload_root(bucket: &str, upload_id: &str) -> KeyPathBuf {
+    let mut key = KeyPathBuf::with_namespace(b"u").expect("example upload key segments are valid");
+    key.push(bucket.as_bytes())
+        .expect("example upload key segments are valid");
+    key.push(upload_id.as_bytes())
+        .expect("example upload key segments are valid");
+    key
+}
+
+fn push_path_segments(mut key: KeyPathBuf, path: &str) -> KeyPathBuf {
+    for segment in path.split('/') {
+        key.push(segment.as_bytes())
+            .expect("example path key segments are valid");
+    }
+    key
 }
