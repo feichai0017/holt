@@ -15,6 +15,7 @@ use crate::layout::{
 };
 use crate::store::{BlobFrameRef, BufferManager};
 
+use super::super::simd;
 use super::cast;
 use super::readers::resolve_typed;
 
@@ -285,27 +286,40 @@ fn scan_prefix_subtree(
         }
         NodeType::Node48 => {
             let n = cast::<Node48>(body);
-            for byte in 0..=u8::MAX {
-                let idx = n.index[byte as usize];
-                if idx == 0 {
-                    continue;
-                }
+            let mut byte = 0usize;
+            while let Some(next_byte) = simd::find_next_nonzero_byte(&n.index, byte) {
+                byte = next_byte + 1;
+                let idx = n.index[next_byte];
                 let ci = idx as usize - 1;
                 if ci >= 48 {
                     return Err(Error::node_corrupt(
                         "walker::scan::scan_prefix_subtree: Node48 index out of range",
                     ));
                 }
-                scan_prefix_branch(frame, byte, n.children[ci] as u16, path, prefix, out)?;
+                scan_prefix_branch(
+                    frame,
+                    next_byte as u8,
+                    n.children[ci] as u16,
+                    path,
+                    prefix,
+                    out,
+                )?;
             }
             Ok(())
         }
         NodeType::Node256 => {
             let n = cast::<Node256>(body);
-            for (byte, child) in n.children.iter().enumerate() {
-                if *child != 0 {
-                    scan_prefix_branch(frame, byte as u8, *child as u16, path, prefix, out)?;
-                }
+            let mut byte = 0usize;
+            while let Some(next_byte) = simd::find_next_nonzero_u32(&n.children, byte) {
+                byte = next_byte + 1;
+                scan_prefix_branch(
+                    frame,
+                    next_byte as u8,
+                    n.children[next_byte] as u16,
+                    path,
+                    prefix,
+                    out,
+                )?;
             }
             Ok(())
         }
@@ -373,11 +387,10 @@ fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> 
         }
         NodeType::Node48 => {
             let n = cast::<Node48>(body);
-            for i in 0..256usize {
-                let idx = n.index[i];
-                if idx == 0 {
-                    continue;
-                }
+            let mut byte = 0usize;
+            while let Some(next_byte) = simd::find_next_nonzero_byte(&n.index, byte) {
+                byte = next_byte + 1;
+                let idx = n.index[next_byte];
                 let ci = idx as usize - 1;
                 if ci >= 48 {
                     return Err(Error::node_corrupt(
@@ -390,10 +403,10 @@ fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> 
         }
         NodeType::Node256 => {
             let n = cast::<Node256>(body);
-            for c in n.children {
-                if c != 0 {
-                    scan_subtree(frame, c as u16, out)?;
-                }
+            let mut byte = 0usize;
+            while let Some(next_byte) = simd::find_next_nonzero_u32(&n.children, byte) {
+                byte = next_byte + 1;
+                scan_subtree(frame, n.children[next_byte] as u16, out)?;
             }
             Ok(())
         }

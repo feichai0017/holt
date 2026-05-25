@@ -195,12 +195,9 @@ pub(super) fn inner_update_child(
         }
         NodeType::Node16 => {
             let mut n = read_node16(frame.as_ref(), slot)?;
-            let count = (n.count as usize).min(16);
-            for i in 0..count {
-                if n.keys[i] == byte {
-                    n.children[i] = new_child;
-                    return write_struct_to_slot(frame, slot, &n);
-                }
+            if let Some(i) = simd::node16_find_byte(&n.keys, n.count, byte) {
+                n.children[i as usize] = new_child;
+                return write_struct_to_slot(frame, slot, &n);
             }
             Err(Error::node_corrupt(
                 "inner_update_child: byte not found in Node16",
@@ -441,16 +438,12 @@ pub(super) fn shrink_node48_to_node16(
     let out = frame.alloc_node(NodeType::Node16)?;
     let mut n = Node16::empty();
     n.count = old.count;
-    // Walk index[] in byte order so the destination Node16's
-    // `keys[]` stays sorted (Node16 lookup expects ascending order
-    // — both SIMD and scalar paths bail at the first key > byte).
     let mut i = 0usize;
-    for byte in 0..256usize {
-        let idx = old.index[byte];
-        if idx == 0 {
-            continue;
-        }
-        n.keys[i] = byte as u8;
+    let mut byte = 0usize;
+    while let Some(next_byte) = simd::find_next_nonzero_byte(&old.index, byte) {
+        byte = next_byte + 1;
+        let idx = old.index[next_byte];
+        n.keys[i] = next_byte as u8;
         n.children[i] = old.children[idx as usize - 1];
         i += 1;
     }
@@ -473,13 +466,12 @@ pub(super) fn shrink_node256_to_node48(
     // of the destination `children[]`; rewrite `index[byte]` to
     // point at the new packed position.
     let mut packed = 0usize;
-    for byte in 0..256usize {
-        let child = old.children[byte];
-        if child == 0 {
-            continue;
-        }
+    let mut byte = 0usize;
+    while let Some(next_byte) = simd::find_next_nonzero_u32(&old.children, byte) {
+        byte = next_byte + 1;
+        let child = old.children[next_byte];
         n.children[packed] = child;
-        n.index[byte] = (packed + 1) as u8;
+        n.index[next_byte] = (packed + 1) as u8;
         packed += 1;
     }
     debug_assert_eq!(packed, old.count as usize);

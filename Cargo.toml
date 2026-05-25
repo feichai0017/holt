@@ -24,7 +24,7 @@ crossbeam-channel = "0.5"
 # Sharded blob cache map for the BufferManager.
 dashmap = "6"
 # Hardware-accelerated CRC32 for WAL record footers.
-crc32fast = { version = "1.4", default-features = false }
+crc32fast = "1.4"
 # Inline storage for short range prefixes/start markers.
 smallvec = "1"
 # Optional structured events for rare structural paths.

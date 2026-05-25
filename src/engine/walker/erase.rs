@@ -19,7 +19,7 @@ use super::writers::{
     SHRINK_NODE48_TO_NODE16_AT,
 };
 use super::SearchKey;
-use crate::engine::RouteCache;
+use crate::engine::{simd, RouteCache};
 use crate::store::BlobWriteGuard;
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
@@ -652,16 +652,11 @@ fn inner_remove_child_and_collapse(
         NodeType::Node16 => {
             let mut n = read_node16(frame.as_ref(), slot)?;
             let count = (n.count as usize).min(16);
-            let mut idx = None;
-            for i in 0..count {
-                if n.keys[i] == byte {
-                    idx = Some(i);
-                    break;
-                }
-            }
-            let i = idx.ok_or(Error::node_corrupt(
-                "inner_remove_child_and_collapse: byte not present (Node16)",
-            ))?;
+            let i = simd::node16_find_byte(&n.keys, n.count, byte)
+                .map(usize::from)
+                .ok_or(Error::node_corrupt(
+                    "inner_remove_child_and_collapse: byte not present (Node16)",
+                ))?;
             for j in i..count - 1 {
                 n.keys[j] = n.keys[j + 1];
                 n.children[j] = n.children[j + 1];
@@ -698,14 +693,10 @@ fn inner_remove_child_and_collapse(
             }
             if n.count == 1 {
                 let (surviving_byte, surviving_child) = {
-                    let mut found = (0u8, 0u32);
-                    for b in 0..256usize {
-                        if n.index[b] != 0 {
-                            found = (b as u8, n.children[(n.index[b] as usize) - 1]);
-                            break;
-                        }
-                    }
-                    found
+                    let b = simd::find_next_nonzero_byte(&n.index, 0).ok_or(
+                        Error::node_corrupt("inner_remove_child_and_collapse: empty Node48"),
+                    )?;
+                    (b as u8, n.children[(n.index[b] as usize) - 1])
                 };
                 frame.free_node(slot)?;
                 let new_slot =
@@ -735,14 +726,10 @@ fn inner_remove_child_and_collapse(
             }
             if n.count == 1 {
                 let (surviving_byte, surviving_child) = {
-                    let mut found = (0u8, 0u32);
-                    for (i, c) in n.children.iter().enumerate() {
-                        if *c != 0 {
-                            found = (i as u8, *c);
-                            break;
-                        }
-                    }
-                    found
+                    let b = simd::find_next_nonzero_u32(&n.children, 0).ok_or(
+                        Error::node_corrupt("inner_remove_child_and_collapse: empty Node256"),
+                    )?;
+                    (b as u8, n.children[b])
                 };
                 frame.free_node(slot)?;
                 let new_slot =

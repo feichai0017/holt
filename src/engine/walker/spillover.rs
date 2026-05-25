@@ -15,6 +15,7 @@ use crate::layout::{
 };
 use crate::store::{BlobFrame, BufferManager};
 
+use super::super::simd;
 use super::cast;
 use super::migrate::make_blob_from_node_in;
 use super::readers::{
@@ -192,18 +193,18 @@ fn subtree_footprint(frame: &BlobFrame<'_>, root: u16) -> Result<SubtreeFootprin
         }
         NodeType::Node48 => {
             let n = cast::<Node48>(body);
-            for c in &n.children {
-                if *c != 0 {
-                    out = out.saturating_add(subtree_footprint(frame, *c as u16)?);
-                }
+            let mut i = 0usize;
+            while let Some(next_i) = simd::find_next_nonzero_u32(&n.children, i) {
+                i = next_i + 1;
+                out = out.saturating_add(subtree_footprint(frame, n.children[next_i] as u16)?);
             }
         }
         NodeType::Node256 => {
             let n = cast::<Node256>(body);
-            for c in &n.children {
-                if *c != 0 {
-                    out = out.saturating_add(subtree_footprint(frame, *c as u16)?);
-                }
+            let mut i = 0usize;
+            while let Some(next_i) = simd::find_next_nonzero_u32(&n.children, i) {
+                i = next_i + 1;
+                out = out.saturating_add(subtree_footprint(frame, n.children[next_i] as u16)?);
             }
         }
     }
@@ -293,11 +294,10 @@ fn collect_victim_candidates(
         }
         NodeType::Node48 => {
             let n = read_node48(frame.as_ref(), current)?;
-            for b in 0..256usize {
-                let idx = n.index[b];
-                if idx == 0 {
-                    continue;
-                }
+            let mut b = 0usize;
+            while let Some(next_b) = simd::find_next_nonzero_byte(&n.index, b) {
+                b = next_b + 1;
+                let idx = n.index[next_b];
                 let ci = idx as usize - 1;
                 if ci >= 48 {
                     return Err(Error::node_corrupt(
@@ -310,11 +310,11 @@ fn collect_victim_candidates(
                     Victim {
                         parent_slot: current,
                         kind: VictimEdgeKind::Inner(NodeType::Node48),
-                        byte: b as u8,
+                        byte: next_b as u8,
                         victim_slot: n.children[ci] as u16,
                         via_header_root: false,
                     },
-                    boundary_quality_for_byte(b as u8),
+                    boundary_quality_for_byte(next_b as u8),
                     child_depth,
                     best,
                 )?;
@@ -322,21 +322,21 @@ fn collect_victim_candidates(
         }
         NodeType::Node256 => {
             let n = read_node256(frame.as_ref(), current)?;
-            for (b, &child) in n.children.iter().enumerate() {
-                if child == 0 {
-                    continue;
-                }
+            let mut b = 0usize;
+            while let Some(next_b) = simd::find_next_nonzero_u32(&n.children, b) {
+                b = next_b + 1;
+                let child = n.children[next_b];
                 let child_depth = depth + 1;
                 visit_child_edge(
                     frame,
                     Victim {
                         parent_slot: current,
                         kind: VictimEdgeKind::Inner(NodeType::Node256),
-                        byte: b as u8,
+                        byte: next_b as u8,
                         victim_slot: child as u16,
                         via_header_root: false,
                     },
-                    boundary_quality_for_byte(b as u8),
+                    boundary_quality_for_byte(next_b as u8),
                     child_depth,
                     best,
                 )?;
@@ -523,18 +523,18 @@ pub(super) fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
         }
         NodeType::Node48 => {
             let n = cast::<Node48>(&body_copy);
-            for c in &n.children {
-                if *c != 0 {
-                    free_subtree(frame, *c as u16)?;
-                }
+            let mut i = 0usize;
+            while let Some(next_i) = simd::find_next_nonzero_u32(&n.children, i) {
+                i = next_i + 1;
+                free_subtree(frame, n.children[next_i] as u16)?;
             }
         }
         NodeType::Node256 => {
             let n = cast::<Node256>(&body_copy);
-            for c in &n.children {
-                if *c != 0 {
-                    free_subtree(frame, *c as u16)?;
-                }
+            let mut i = 0usize;
+            while let Some(next_i) = simd::find_next_nonzero_u32(&n.children, i) {
+                i = next_i + 1;
+                free_subtree(frame, n.children[next_i] as u16)?;
             }
         }
     }
