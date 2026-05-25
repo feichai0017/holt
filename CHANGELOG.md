@@ -9,6 +9,42 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-25
+
+### Added
+
+- Added route-anchor residency so root and hot prefix anchor blobs can
+  stay protected from ordinary leaf eviction under large metadata
+  working sets.
+- Added blob shape-debt counters and richer runtime telemetry for cache
+  hit/miss behavior, WAL queue/write/flush progress, checkpoint debt,
+  dirty blobs, route-cache behavior, and admission/eviction decisions.
+- Added the nightly validation workflow, soak harness, and expanded
+  fuzz/property/CI coverage for reopen, checkpoint, range, atomic, and
+  crash-oriented metadata behavior.
+- Added `KeyPath` / `KeyPathBuf` helpers for constructing byte paths
+  without making path semantics part of the storage engine core.
+
+### Changed
+
+- Reworked route-cache invalidation and scan eviction so prefix-heavy
+  metadata reads disturb the buffer pool less at scale.
+- Added TinyLFU admission for file-backed cache pressure and raised the
+  default file-backed buffer pool budget to match the intended metadata
+  working-set profile.
+- Tightened same-size leaf updates, SIMD hot paths, and concurrency gate
+  internals.
+- Simplified checkpoint barrier code, split BufferManager policy helpers,
+  and clarified WAL progress metrics.
+- Hid uninitialized blob-buffer allocation from the public API surface.
+
+### Fixed
+
+- Fixed atomic batch write isolation so `Tree::atomic` preflight and apply
+  are protected from concurrent foreground writes.
+- Kept the release and CI dependency stack current, including
+  `actions/upload-artifact` v7 and `rand` 0.10 for the root test crate.
+
 ## [0.3.3] — 2026-05-24
 
 ### Changed
