@@ -2274,7 +2274,7 @@ fn random_kv_insert_after_child_blob_compact_stays_consistent() {
     // on that child. The retry must re-enter via the child blob's
     // freshly-rewritten `header.root_slot`, not through any
     // parent-stored entry slot.
-    use rand::{rngs::StdRng, RngCore, SeedableRng};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_CAFE_BABE);
     let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..20_000)
         .map(|_| {
