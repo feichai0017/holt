@@ -13,8 +13,8 @@ Run on every push and pull request:
 | Unit/integration | `cargo test --workspace --all-features --lib --tests --examples --locked` | API semantics, walker behavior, WAL replay, checkpoint recovery, view/range behavior, atomic batches |
 | Doctests/examples | `cargo test --workspace --all-features --doc --locked`; example binaries | Public API examples stay buildable |
 | Lint | `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings` | Formatting and warning-free code |
-| Fuzz smoke | `cargo +nightly fuzz run atomic_model -- -runs=512` | Keeps the fuzz target building and exercises random API traces |
-| Soak smoke | `tools/soak --mode normal` with a short run | Keeps the lifecycle harness buildable and catches obvious reopen regressions |
+| Fuzz smoke | `cargo +nightly fuzz run atomic_model -- -runs=512`; `cargo +nightly fuzz run db_model -- -runs=256` | Keeps the fuzz targets building and exercises random API traces |
+| Soak smoke | `tools/soak --mode normal`; `tools/soak --mode db-normal` with short runs | Keeps the lifecycle harness buildable and catches obvious reopen regressions |
 | Coverage | `cargo llvm-cov ...` | Prevents accidental coverage drops |
 | Regression bench | `benches/ regression` | Catches large local performance regressions without comparator dependencies |
 
@@ -27,14 +27,15 @@ Run on every push and pull request:
 | `fault-matrix` | Checkpoint write/delete/flush failpoints and WAL integration tests |
 | `property-matrix` | Higher-count proptest oracle runs |
 | `soak-normal` | Multi-thread lifecycle soak across async WAL, sync WAL, and constrained buffer-pool cases |
+| `soak-db-normal` | Multi-thread named-tree DB lifecycle soak with cross-tree atomic batches, DB views, checkpoint, and reopen |
 | `soak-crash` | Repeated `SIGKILL` with `wal_sync=true`; every acknowledged write must survive reopen |
-| `fuzz-long` | Time-bounded libFuzzer campaign over the atomic/WAL/range/view model |
+| `fuzz-long` | Time-bounded libFuzzer campaigns over the single-tree and multi-tree DB models |
 | `verified-model` | Manual Verus run for ART shape specs when a Verus binary is available |
 
 ## Fuzz Model
 
-`fuzz/fuzz_targets/atomic_model.rs` compares Holt against a `BTreeMap`
-oracle. The model covers:
+`fuzz/fuzz_targets/atomic_model.rs` compares one `Tree` against a
+`BTreeMap` oracle. The model covers:
 
 - `put`, `delete`, `get`;
 - `checkpoint` and `reopen` with `wal_sync=true`;
@@ -49,13 +50,25 @@ Long campaigns should preserve the minimized corpus under
 `fuzz/corpus/atomic_model` only when the corpus entry represents a
 useful new edge case.
 
+`fuzz/fuzz_targets/db_model.rs` compares `DB` against a catalog plus
+per-tree `BTreeMap` oracle. The model covers:
+
+- named tree create/drop/list/open semantics;
+- dropped-tree fencing across checkpoint and reopen;
+- cross-tree `DB::atomic` batches;
+- per-tree point operations through DB-opened tree handles;
+- DB-level scoped `View` snapshots;
+- record scans, delimiter key scans, checkpoint, and WAL replay.
+
 ## Soak Harness
 
 `tools/soak` is the long-lifecycle validator.
 
-Normal mode checks multi-threaded mixed operations, checkpoint, reopen,
-and final oracle equality. Crash mode checks durability only for writes
-that Holt acknowledged and the child recorded in the fsynced ack log.
+Normal mode checks single-tree multi-threaded mixed operations,
+checkpoint, reopen, and final oracle equality. `db-normal` repeats the
+lifecycle check through named trees, cross-tree atomic batches, and DB
+views. Crash mode checks durability only for writes that Holt
+acknowledged and the child recorded in the fsynced ack log.
 
 Recommended release gate:
 
@@ -63,6 +76,11 @@ Recommended release gate:
 cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
   --mode normal --dir target/holt-soak-release --reset \
   --duration-secs 21600 --keys 10000000 --ops 20000000 \
+  --threads 8 --buffer-pool 256 --wal-sync false
+
+cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+  --mode db-normal --dir target/holt-soak-db-release --reset \
+  --duration-secs 21600 --keys 1000000 --ops 5000000 \
   --threads 8 --buffer-pool 256 --wal-sync false
 
 cargo run --manifest-path tools/soak/Cargo.toml --locked -- \

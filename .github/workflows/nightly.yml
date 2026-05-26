@@ -139,6 +139,30 @@ jobs:
             --kill-min-ms 50 \
             --kill-max-ms 2000
 
+  soak-db-normal:
+    name: DB normal soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: holt-soak db-normal
+        run: |
+          cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+            --mode db-normal \
+            --dir target/holt-soak-db-nightly \
+            --reset \
+            --duration-secs "$SOAK_SECONDS" \
+            --keys 500000 \
+            --ops 1000000 \
+            --threads 8 \
+            --buffer-pool 128 \
+            --wal-sync false
+
   fuzz-long:
     name: fuzz campaign
     runs-on: ubuntu-latest
@@ -157,6 +181,9 @@ jobs:
 
       - name: cargo fuzz run atomic_model
         run: cargo +nightly fuzz run atomic_model -- -max_total_time="$FUZZ_SECONDS"
+
+      - name: cargo fuzz run db_model
+        run: cargo +nightly fuzz run db_model -- -max_total_time="$FUZZ_SECONDS"
 
   verified-model:
     name: Verus model

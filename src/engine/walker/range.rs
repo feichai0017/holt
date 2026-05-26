@@ -21,7 +21,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::api::atomic::RecordVersion;
@@ -294,6 +294,8 @@ pub struct RangeBuilder {
     root_pin: Arc<CachedBlob>,
     root_guid: BlobGuid,
     maintenance_gate: Arc<Gate>,
+    mutation_gate: Option<Arc<Gate>>,
+    dropped: Option<Arc<AtomicBool>>,
     prefix: KeyBuf,
     start_after: Option<KeyBuf>,
     delimiter: Option<u8>,
@@ -315,9 +317,33 @@ impl RangeBuilder {
             root_pin,
             root_guid,
             maintenance_gate,
+            mutation_gate: None,
+            dropped: None,
             prefix: KeyBuf::new(),
             start_after: None,
             delimiter: None,
+        }
+    }
+
+    pub(crate) fn with_liveness(mut self, dropped: Arc<AtomicBool>) -> Self {
+        self.dropped = Some(dropped);
+        self
+    }
+
+    pub(crate) fn with_mutation_gate(mut self, mutation_gate: Arc<Gate>) -> Self {
+        self.mutation_gate = Some(mutation_gate);
+        self
+    }
+
+    fn ensure_live(&self) -> Result<()> {
+        if self
+            .dropped
+            .as_ref()
+            .is_some_and(|dropped| dropped.load(Ordering::Acquire))
+        {
+            Err(Error::TreeDropped)
+        } else {
+            Ok(())
         }
     }
 
@@ -363,6 +389,8 @@ impl RangeBuilder {
             root_pin: self.root_pin,
             root_guid: self.root_guid,
             maintenance_gate: self.maintenance_gate,
+            mutation_gate: self.mutation_gate,
+            dropped: self.dropped,
             stack: Vec::with_capacity(8),
             curr_key: Vec::with_capacity(self.prefix.len().saturating_add(64)),
             emit_buf: Vec::with_capacity(self.prefix.len().saturating_add(64)),
@@ -449,6 +477,7 @@ impl KeyRangeBuilder {
         }
 
         let mut builder = self;
+        builder.inner.ensure_live()?;
         let prefix = builder.inner.prefix.as_slice();
         let start_after = builder.inner.start_after.as_deref();
         let delimiter = builder.inner.delimiter;
@@ -479,7 +508,9 @@ impl KeyRangeBuilder {
             .and_then(|_| builder.inner.start_after.clone());
         let epoch_before = builder.epoch.as_ref().map(|e| e.load(Ordering::Acquire));
         let maintenance_gate = Arc::clone(&builder.inner.maintenance_gate);
+        let mutation_gate = builder.inner.mutation_gate.clone();
         let _maintenance = maintenance_gate.enter_shared();
+        let _tree_mutation = mutation_gate.as_ref().map(|gate| gate.enter_shared());
         let mut iter = KeyRangeIter {
             inner: builder
                 .inner
@@ -573,6 +604,8 @@ pub struct RangeIter {
     root_pin: Arc<CachedBlob>,
     root_guid: BlobGuid,
     maintenance_gate: Arc<Gate>,
+    mutation_gate: Option<Arc<Gate>>,
+    dropped: Option<Arc<AtomicBool>>,
     /// Descent stack. Empty = no init done (if `!initialized`) or
     /// exhausted (if `terminated`).
     stack: Vec<Frame>,
@@ -881,10 +914,12 @@ impl RangeIter {
             }
             let step = if enter_gate {
                 let maintenance_gate = Arc::clone(&self.maintenance_gate);
+                let mutation_gate = self.mutation_gate.clone();
                 let _maintenance = maintenance_gate.enter_shared();
-                self.next_step()
+                let _tree_mutation = mutation_gate.as_ref().map(|gate| gate.enter_shared());
+                self.ensure_live().and_then(|()| self.next_step())
             } else {
-                self.next_step()
+                self.ensure_live().and_then(|()| self.next_step())
             };
             match step {
                 Ok(RangeAdvance::Done) => {
@@ -917,6 +952,18 @@ impl RangeIter {
             }
         }
         self.advance_to_next_entry()
+    }
+
+    fn ensure_live(&self) -> Result<()> {
+        if self
+            .dropped
+            .as_ref()
+            .is_some_and(|dropped| dropped.load(Ordering::Acquire))
+        {
+            Err(Error::TreeDropped)
+        } else {
+            Ok(())
+        }
     }
 
     fn visit_key_entries_unlocked<F>(&mut self, limit: usize, mut visit: F) -> Result<usize>

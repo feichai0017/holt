@@ -86,6 +86,10 @@ fn db_named_trees_are_isolated_but_share_handles() {
         db.open_tree("missing"),
         Err(holt::Error::TreeNotFound { .. })
     ));
+    assert!(matches!(
+        db.create_tree("\0system"),
+        Err(holt::Error::InvalidTreeName { .. })
+    ));
     let lazy = db.open_or_create_tree("lazy").unwrap();
     lazy.put(b"k", b"v").unwrap();
     assert_eq!(
@@ -137,6 +141,51 @@ fn db_atomic_commits_and_aborts_across_trees() {
         })
         .unwrap());
     assert!(lock.get(b"should-not-appear").unwrap().is_none());
+}
+
+#[test]
+fn db_atomic_commits_disjoint_trees_from_concurrent_threads() {
+    let db = std::sync::Arc::new(DB::open(TreeConfig::memory()).unwrap());
+    db.create_tree("left").unwrap();
+    db.create_tree("right").unwrap();
+
+    let left_db = std::sync::Arc::clone(&db);
+    let left = std::thread::spawn(move || {
+        for i in 0..256u32 {
+            let key = i.to_le_bytes();
+            left_db
+                .atomic(|batch| {
+                    batch.put("left", &key, b"l");
+                })
+                .unwrap();
+        }
+    });
+
+    let right_db = std::sync::Arc::clone(&db);
+    let right = std::thread::spawn(move || {
+        for i in 0..256u32 {
+            let key = i.to_le_bytes();
+            right_db
+                .atomic(|batch| {
+                    batch.put("right", &key, b"r");
+                })
+                .unwrap();
+        }
+    });
+
+    left.join().unwrap();
+    right.join().unwrap();
+
+    let left = db.open_tree("left").unwrap();
+    let right = db.open_tree("right").unwrap();
+    assert_eq!(
+        left.get(&255u32.to_le_bytes()).unwrap().as_deref(),
+        Some(&b"l"[..])
+    );
+    assert_eq!(
+        right.get(&255u32.to_le_bytes()).unwrap().as_deref(),
+        Some(&b"r"[..])
+    );
 }
 
 #[test]
@@ -200,6 +249,7 @@ fn db_drop_tree_hides_catalog_entry_and_fences_old_handle() {
     let db = DB::open(TreeConfig::memory()).unwrap();
     let objects = db.create_tree("objects").unwrap();
     objects.put(b"bucket/a", b"etag").unwrap();
+    let mut range_before_drop = objects.range().into_iter();
 
     db.drop_tree("objects").unwrap();
 
@@ -216,6 +266,30 @@ fn db_drop_tree_hides_catalog_entry_and_fences_old_handle() {
     ));
     assert!(matches!(
         objects.put(b"bucket/b", b"etag-b"),
+        Err(holt::Error::TreeDropped)
+    ));
+    assert!(matches!(
+        objects.get(b"bucket/a"),
+        Err(holt::Error::TreeDropped)
+    ));
+    assert!(matches!(
+        objects.get_record(b"bucket/a"),
+        Err(holt::Error::TreeDropped)
+    ));
+    assert!(matches!(
+        objects.get_version(b"bucket/a"),
+        Err(holt::Error::TreeDropped)
+    ));
+    assert!(matches!(
+        range_before_drop.next(),
+        Some(Err(holt::Error::TreeDropped))
+    ));
+    assert!(matches!(
+        objects.range_keys().into_iter().next(),
+        Some(Err(holt::Error::TreeDropped))
+    ));
+    assert!(matches!(
+        objects.scan_keys(b"bucket/").visit(1, |_| Ok(())),
         Err(holt::Error::TreeDropped)
     ));
     assert!(matches!(

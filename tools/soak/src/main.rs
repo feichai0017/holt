@@ -8,14 +8,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use holt::{CheckpointConfig, KeyRangeEntryRef, Tree, TreeConfig};
+use holt::{CheckpointConfig, KeyRangeEntryRef, Tree, TreeConfig, DB};
 
 type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T> = std::result::Result<T, DynError>;
 
+const DB_SOAK_TREES: [&str; 4] = ["objects", "inodes", "locks", "sessions"];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
     Normal,
+    DbNormal,
     Crash,
     Child,
 }
@@ -59,6 +62,7 @@ impl Config {
                 "--mode" => {
                     cfg.mode = match take(&mut args, "--mode")?.as_str() {
                         "normal" => Mode::Normal,
+                        "db" | "db-normal" => Mode::DbNormal,
                         "crash" => Mode::Crash,
                         "child" | "crash-child" => Mode::Child,
                         other => return Err(format!("unknown --mode `{other}`").into()),
@@ -114,6 +118,7 @@ fn run() -> Result<()> {
     let cfg = Config::parse()?;
     match cfg.mode {
         Mode::Normal => run_normal(&cfg),
+        Mode::DbNormal => run_db_normal(&cfg),
         Mode::Crash => run_crash_parent(&cfg),
         Mode::Child => run_crash_child(&cfg),
     }
@@ -172,6 +177,86 @@ fn run_normal(cfg: &Config) -> Result<()> {
     let reopened = open_tree(cfg)?;
     verify_oracle(&reopened, &oracle)?;
     print_stats("normal-post-reopen", &reopened, total_ops)?;
+    Ok(())
+}
+
+fn run_db_normal(cfg: &Config) -> Result<()> {
+    prepare_dir(cfg)?;
+    let db = Arc::new(open_db(cfg)?);
+    for name in DB_SOAK_TREES {
+        db.open_or_create_tree(name)?;
+    }
+
+    let oracle = Arc::new(
+        DB_SOAK_TREES
+            .iter()
+            .map(|_| (0..cfg.keys).map(|_| AtomicU64::new(0)).collect::<Vec<_>>())
+            .collect::<Vec<_>>(),
+    );
+    let deadline = Instant::now() + cfg.duration;
+    let ops_per_thread = cfg.ops.div_ceil(cfg.threads);
+    let mut handles = Vec::with_capacity(cfg.threads);
+
+    for tid in 0..cfg.threads {
+        let db = Arc::clone(&db);
+        let oracle = Arc::clone(&oracle);
+        let cfg = cfg.clone_for_thread();
+        handles.push(thread::spawn(move || -> Result<u64> {
+            let mut rng = Rng::new(cfg.seed ^ ((tid as u64) << 32) ^ 0xDBDB_0000_500A_0001);
+            let mut done = 0u64;
+            while done < ops_per_thread as u64 && Instant::now() < deadline {
+                let tree_slot = (rng.next_u64() as usize) % DB_SOAK_TREES.len();
+                let idx = partitioned_index(&mut rng, cfg.keys, cfg.threads, tid);
+                let roll = rng.next_u64() % 100;
+                if roll < 45 {
+                    let rev = make_revision(tid, done);
+                    let key = key(idx);
+                    let value = value(idx, rev);
+                    db.atomic(|batch| batch.put(DB_SOAK_TREES[tree_slot], &key, &value))?;
+                    oracle[tree_slot][idx].store(rev, Ordering::Release);
+                } else if roll < 65 {
+                    verify_db_one(&db, &oracle, tree_slot, idx)?;
+                } else if roll < 75 {
+                    let key = key(idx);
+                    db.atomic(|batch| batch.delete(DB_SOAK_TREES[tree_slot], &key))?;
+                    oracle[tree_slot][idx].store(0, Ordering::Release);
+                } else if roll < 88 {
+                    scan_db_small_prefix(&db, tree_slot, idx)?;
+                } else if roll < 96 {
+                    let other =
+                        (tree_slot + 1 + (rng.next_u64() as usize % (DB_SOAK_TREES.len() - 1)))
+                            % DB_SOAK_TREES.len();
+                    let rev = make_revision(tid, done);
+                    let other_rev = rev ^ 0x5A5A_0000_0000_0000;
+                    let key = key(idx);
+                    let primary_value = value(idx, rev);
+                    let other_value = value(idx, other_rev);
+                    db.atomic(|batch| {
+                        batch.put(DB_SOAK_TREES[tree_slot], &key, &primary_value);
+                        batch.put(DB_SOAK_TREES[other], &key, &other_value);
+                    })?;
+                    oracle[tree_slot][idx].store(rev, Ordering::Release);
+                    oracle[other][idx].store(other_rev, Ordering::Release);
+                } else {
+                    view_db_prefix(&db, tree_slot, idx)?;
+                }
+                done += 1;
+            }
+            Ok(done)
+        }));
+    }
+
+    let mut total_ops = 0u64;
+    for handle in handles {
+        total_ops += handle.join().map_err(|_| "db worker thread panicked")??;
+    }
+    db.checkpoint()?;
+    print_db_stats("db-normal-pre-reopen", &db, total_ops);
+    drop(db);
+
+    let reopened = open_db(cfg)?;
+    verify_db_oracle(&reopened, &oracle)?;
+    print_db_stats("db-normal-post-reopen", &reopened, total_ops);
     Ok(())
 }
 
@@ -247,6 +332,14 @@ fn open_tree(cfg: &Config) -> holt::Result<Tree> {
     Tree::open(tree_cfg)
 }
 
+fn open_db(cfg: &Config) -> holt::Result<DB> {
+    let mut tree_cfg = TreeConfig::new(&cfg.dir);
+    tree_cfg.buffer_pool_size = cfg.buffer_pool;
+    tree_cfg.wal_sync = cfg.wal_sync;
+    tree_cfg.checkpoint = CheckpointConfig::default();
+    DB::open(tree_cfg)
+}
+
 fn prepare_dir(cfg: &Config) -> Result<()> {
     if cfg.reset && cfg.dir.exists() {
         let name = cfg
@@ -287,6 +380,37 @@ fn verify_oracle(tree: &Tree, oracle: &[AtomicU64]) -> Result<()> {
     Ok(())
 }
 
+fn verify_db_one(db: &DB, oracle: &[Vec<AtomicU64>], tree_slot: usize, idx: usize) -> Result<()> {
+    let expected = oracle[tree_slot][idx].load(Ordering::Acquire);
+    let tree = db.open_tree(DB_SOAK_TREES[tree_slot])?;
+    let got = tree.get(&key(idx))?;
+    if expected == 0 {
+        if got.is_some() {
+            return Err(format!(
+                "tree `{}` key {idx} exists but oracle says deleted",
+                DB_SOAK_TREES[tree_slot]
+            )
+            .into());
+        }
+    } else if got.as_deref() != Some(value(idx, expected).as_slice()) {
+        return Err(format!(
+            "tree `{}` key {idx} value mismatch",
+            DB_SOAK_TREES[tree_slot]
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn verify_db_oracle(db: &DB, oracle: &[Vec<AtomicU64>]) -> Result<()> {
+    for (tree_slot, tree_oracle) in oracle.iter().enumerate() {
+        for idx in 0..tree_oracle.len() {
+            verify_db_one(db, oracle, tree_slot, idx)?;
+        }
+    }
+    Ok(())
+}
+
 fn verify_ack_entries(tree: &Tree, expected: &[(Vec<u8>, u64)]) -> Result<()> {
     for (key, rev) in expected {
         let got = tree.get(key)?;
@@ -316,6 +440,36 @@ fn scan_small_prefix(tree: &Tree, idx: usize) -> Result<()> {
             Ok(())
         })?;
     std::hint::black_box(seen);
+    Ok(())
+}
+
+fn scan_db_small_prefix(db: &DB, tree_slot: usize, idx: usize) -> Result<()> {
+    let tree = db.open_tree(DB_SOAK_TREES[tree_slot])?;
+    scan_small_prefix(&tree, idx)
+}
+
+fn view_db_prefix(db: &DB, tree_slot: usize, idx: usize) -> Result<()> {
+    let prefix = format!("bucket-{:03}/", idx % 256);
+    let scopes = [(DB_SOAK_TREES[tree_slot], prefix.as_bytes())];
+    db.view(&scopes, |view| {
+        let Some(tree) = view.tree(DB_SOAK_TREES[tree_slot]) else {
+            return Err(holt::Error::Internal("missing DB soak view tree"));
+        };
+        let mut seen = 0usize;
+        tree.scan_keys(prefix.as_bytes())?
+            .delimiter(b'/')
+            .visit(16, |entry| {
+                match entry {
+                    KeyRangeEntryRef::Key { .. } | KeyRangeEntryRef::CommonPrefix(_) => {
+                        seen += 1;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })?;
+        std::hint::black_box(seen);
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -363,6 +517,30 @@ fn print_stats(label: &str, tree: &Tree, progress: u64) -> Result<()> {
         s.open.wal_replay_micros,
     );
     Ok(())
+}
+
+fn print_db_stats(label: &str, db: &DB, progress: u64) {
+    let s = db.stats();
+    let journal_debt = s.journal.map_or(0, |j| j.checkpoint_debt);
+    let pending_work = s.journal.map_or(0, |j| j.pending_work);
+    let ck_failed = s.checkpointer.map_or(0, |c| c.rounds_failed);
+    println!(
+        "{{\"event\":\"stats\",\"label\":\"{label}\",\"progress\":{progress},\
+         \"open_trees\":{},\"dirty\":{},\"pending_delete\":{},\"bm_hits\":{},\
+         \"bm_misses\":{},\"walker_ops\":{},\"max_blob_hops\":{},\
+         \"wal_pending_work\":{pending_work},\"wal_checkpoint_debt\":{journal_debt},\
+         \"checkpoint_failed\":{ck_failed},\"replay_records\":{},\
+         \"replay_micros\":{}}}",
+        s.open_tree_count,
+        s.bm_dirty_count,
+        s.bm_pending_delete_count,
+        s.bm_cache_hits,
+        s.bm_cache_misses,
+        s.bm_walker_ops,
+        s.bm_max_blob_hops,
+        s.open.wal_replay_records,
+        s.open.wal_replay_micros,
+    );
 }
 
 fn partitioned_index(rng: &mut Rng, keys: usize, threads: usize, tid: usize) -> usize {
@@ -435,6 +613,7 @@ fn print_help() {
         "holt-soak\n\n\
          Modes:\n\
            --mode normal    multi-thread read/write/list/reopen validation\n\
+           --mode db-normal multi-tree DB atomic/view/reopen validation\n\
            --mode crash     parent process repeatedly SIGKILLs child writers\n\
            --mode child     internal crash-test child mode\n\n\
          Common options:\n\

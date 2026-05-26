@@ -332,7 +332,10 @@ fn expected_key_entries(
 
     for key in model.keys().filter(|key| key.starts_with(&prefix)) {
         if let Some(delimiter) = delimiter {
-            if let Some(pos) = key[prefix.len()..].iter().position(|byte| *byte == delimiter) {
+            if let Some(pos) = key[prefix.len()..]
+                .iter()
+                .position(|byte| *byte == delimiter)
+            {
                 let common = key[..prefix.len() + pos + 1].to_vec();
                 if emitted_prefixes.insert(common.clone()) {
                     expected.push(ExpectedKeyEntry::CommonPrefix(common));

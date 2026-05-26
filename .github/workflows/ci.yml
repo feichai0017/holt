@@ -117,6 +117,19 @@ jobs:
             --buffer-pool 16 \
             --wal-sync false
 
+      - name: holt-soak DB normal smoke
+        run: |
+          cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+            --mode db-normal \
+            --dir target/holt-soak-db-ci \
+            --reset \
+            --duration-secs 2 \
+            --keys 1000 \
+            --ops 4000 \
+            --threads 2 \
+            --buffer-pool 16 \
+            --wal-sync false
+
   # --------------------------------------------------------------
   # Fuzz smoke — short libFuzzer run over the storage-engine model
   # target. This is not a replacement for long fuzz campaigns; it is
@@ -141,6 +154,9 @@ jobs:
 
       - name: cargo fuzz run atomic_model
         run: cargo +nightly fuzz run atomic_model -- -runs=512
+
+      - name: cargo fuzz run db_model
+        run: cargo +nightly fuzz run db_model -- -runs=256
 
   # --------------------------------------------------------------
   # Coverage — source-based LLVM coverage over lib + integration

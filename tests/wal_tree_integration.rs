@@ -139,6 +139,18 @@ fn db_drop_tree_survives_checkpoint_and_reopen() {
         ));
         let recreated = db.create_tree("objects").unwrap();
         assert!(recreated.get(b"bucket/a.jpg").unwrap().is_none());
+        recreated.put(b"bucket/b.jpg", b"etag-b").unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    {
+        let db = DB::open(durable_cfg(dir.path())).unwrap();
+        let objects = db.open_tree("objects").unwrap();
+        assert!(objects.get(b"bucket/a.jpg").unwrap().is_none());
+        assert_eq!(
+            objects.get(b"bucket/b.jpg").unwrap().as_deref(),
+            Some(&b"etag-b"[..])
+        );
     }
 }
 

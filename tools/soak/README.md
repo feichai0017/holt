@@ -8,6 +8,9 @@ the parent workspace.
 
 - `normal`: multi-threaded point read/write/delete, key-only prefix
   scan, atomic batch, checkpoint, reopen, and oracle verification.
+- `db-normal`: multi-threaded named-tree DB run with cross-tree atomic
+  batches, per-tree point reads, key-only scans, DB views, checkpoint,
+  reopen, and oracle verification.
 - `crash`: parent process repeatedly starts a child writer, kills it
   with `SIGKILL`, reopens the tree, and verifies every operation the
   child acknowledged in `soak-ack.log`.
@@ -19,6 +22,21 @@ the parent workspace.
 cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
   --mode normal \
   --dir target/holt-soak \
+  --reset \
+  --duration-secs 60 \
+  --keys 100000 \
+  --ops 1000000 \
+  --threads 4 \
+  --buffer-pool 64 \
+  --wal-sync false
+```
+
+## DB Smoke
+
+```sh
+cargo run --manifest-path tools/soak/Cargo.toml --locked -- \
+  --mode db-normal \
+  --dir target/holt-soak-db \
   --reset \
   --duration-secs 60 \
   --keys 100000 \
@@ -54,10 +72,11 @@ normal/crash campaigns belong in nightly or release-gate runs.
 
 ## Validation Tiers
 
-- PR CI: build the harness and run a short `normal` smoke so API or
-  stats drift is caught quickly.
-- Nightly: run `normal`, `crash`, checkpoint failpoints, WAL integration,
-  and a longer fuzz campaign from `.github/workflows/nightly.yml`.
+- PR CI: build the harness and run short `normal` and `db-normal`
+  smokes so API or stats drift is caught quickly.
+- Nightly: run `normal`, `db-normal`, `crash`, checkpoint failpoints,
+  WAL integration, and a longer fuzz campaign from
+  `.github/workflows/nightly.yml`.
 - Release gate: run `normal` for several hours on the target platform,
   then run `crash` with `wal_sync=true`; keep the JSON output so replay
   time, cache misses, WAL debt, and checkpoint debt can be compared

@@ -24,3 +24,9 @@ name = "atomic_model"
 path = "fuzz_targets/atomic_model.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "db_model"
+path = "fuzz_targets/db_model.rs"
+test = false
+doc = false

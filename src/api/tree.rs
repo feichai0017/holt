@@ -53,6 +53,7 @@ pub(crate) struct TreeRuntime {
     endpoint_locks: Arc<EndpointLocks>,
     route_cache: Arc<engine::RouteCache>,
     prefix_list_cache: Arc<engine::PrefixListCache>,
+    mutation_gate: Arc<Gate>,
     dropped: Arc<AtomicBool>,
 }
 
@@ -62,6 +63,7 @@ impl TreeRuntime {
             endpoint_locks: Arc::new(EndpointLocks::new()),
             route_cache: Arc::new(engine::RouteCache::new()),
             prefix_list_cache: Arc::new(engine::PrefixListCache::new()),
+            mutation_gate: Arc::new(Gate::new()),
             dropped: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -200,6 +202,7 @@ pub struct Tree {
     /// Conservatively invalidated by `next_seq`, so every write
     /// makes old entries miss.
     prefix_list_cache: Arc<engine::PrefixListCache>,
+    mutation_gate: Arc<Gate>,
     /// Shared liveness flag for DB-managed named trees. `DB::drop_tree`
     /// flips it so existing handles can no longer publish writes.
     dropped: Arc<AtomicBool>,
@@ -461,10 +464,15 @@ impl Tree {
             commit_gate,
             journal,
             prefix_list_cache: runtime.prefix_list_cache,
+            mutation_gate: runtime.mutation_gate,
             dropped: runtime.dropped,
             checkpointer,
             open_stats,
         })
+    }
+
+    pub(crate) fn mutation_gate(&self) -> Arc<Gate> {
+        Arc::clone(&self.mutation_gate)
     }
 
     fn ensure_live(&self) -> Result<()> {
@@ -483,6 +491,7 @@ impl Tree {
     /// cached blobs optimistically and restarts from the root when
     /// a concurrent writer invalidates its snapshot.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.ensure_live()?;
         self.lookup_record_unlocked(key)
             .map(|record| record.map(|record| record.value))
     }
@@ -493,6 +502,7 @@ impl Tree {
     /// This is the preferred read before a compare-and-set update:
     /// it avoids the two-lookup `get()` + `get_version()` pattern.
     pub fn get_record(&self, key: &[u8]) -> Result<Option<Record>> {
+        self.ensure_live()?;
         self.lookup_record_unlocked(key)
     }
 
@@ -504,6 +514,7 @@ impl Tree {
     /// It is not an MVCC timestamp and cannot be used to read old
     /// values.
     pub fn get_version(&self, key: &[u8]) -> Result<Option<RecordVersion>> {
+        self.ensure_live()?;
         let search = engine::SearchKey::user(key);
         engine::lookup_multi_with(
             &self.store,
@@ -592,6 +603,7 @@ impl Tree {
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_live()?;
+            let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
@@ -696,6 +708,7 @@ impl Tree {
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_live()?;
+            let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
@@ -776,6 +789,7 @@ impl Tree {
         let journal_ack = {
             let _mutation = self.maintenance_gate.enter_shared();
             self.ensure_live()?;
+            let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoints = self.endpoint_locks.lock_pair(src, dst);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
@@ -928,8 +942,9 @@ impl Tree {
     }
 
     pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
-        let _maintenance = self.maintenance_gate.enter_exclusive();
+        let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
+        let _tree_mutation = self.mutation_gate.enter_exclusive();
         let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + mutating_index` and replay can derive it without
@@ -1400,6 +1415,8 @@ impl Tree {
             self.root_guid,
             Arc::clone(&self.maintenance_gate),
         )
+        .with_mutation_gate(Arc::clone(&self.mutation_gate))
+        .with_liveness(Arc::clone(&self.dropped))
     }
 
     /// Shorthand for `tree.range().prefix(p)` — the
@@ -1456,8 +1473,9 @@ impl Tree {
     }
 
     fn capture_view(&self, prefix: &[u8]) -> Result<View> {
-        let _maintenance = self.maintenance_gate.enter_exclusive();
+        let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
+        let _tree_mutation = self.mutation_gate.enter_exclusive();
         self.capture_view_unlocked(prefix)
     }
 
@@ -1485,6 +1503,7 @@ impl Tree {
     pub fn is_prefix_empty(&self, prefix: &[u8]) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
+        let _tree_mutation = self.mutation_gate.enter_shared();
         self.projected_prefix_empty(&std::collections::HashMap::new(), prefix)
     }
 
@@ -2143,6 +2162,7 @@ impl Tree {
 
     fn seed_maintenance_candidates(&self) -> Result<()> {
         let _maintenance = self.maintenance_gate.enter_shared();
+        let _tree_mutation = self.mutation_gate.enter_shared();
         let guids = engine::collect_blob_guids(&self.store, self.root_guid)?;
         for guid in guids {
             let pin = self.store.pin(guid)?;
@@ -2163,6 +2183,7 @@ impl Tree {
         use crate::store::STRUCTURAL_SEQ;
 
         let _maintenance = self.maintenance_gate.enter_shared();
+        let _tree_mutation = self.mutation_gate.enter_exclusive();
         if !self.store.has_blob(guid)? {
             return Ok(false);
         }
@@ -2204,6 +2225,7 @@ impl Tree {
         use crate::store::STRUCTURAL_SEQ;
 
         let _maintenance = self.maintenance_gate.enter_exclusive();
+        let _tree_mutation = self.mutation_gate.enter_exclusive();
         if !self.store.has_blob(guid)? {
             return Ok(());
         }
