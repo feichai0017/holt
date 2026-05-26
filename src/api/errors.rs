@@ -99,6 +99,8 @@ pub enum Error {
         /// Static reason.
         reason: &'static str,
     },
+    /// A named DB tree handle was used after `DB::drop_tree`.
+    TreeDropped,
     /// A scoped [`crate::View`] read tried to access a key or range
     /// prefix outside the subtree captured when the view was opened.
     OutsideViewScope {
@@ -196,6 +198,7 @@ impl std::fmt::Display for Error {
             Self::TreeNotFound { name } => write!(f, "DB tree not found: {name}"),
             Self::TreeExists { name } => write!(f, "DB tree already exists: {name}"),
             Self::InvalidTreeName { reason } => write!(f, "invalid DB tree name: {reason}"),
+            Self::TreeDropped => write!(f, "DB tree has been dropped"),
             Self::OutsideViewScope {
                 requested_len,
                 scope_len,
@@ -307,6 +310,7 @@ mod tests {
                 Error::InvalidTreeName { reason: "empty" }.to_string(),
                 "invalid DB tree name: empty",
             ),
+            (Error::TreeDropped.to_string(), "DB tree has been dropped"),
         ];
 
         for (actual, expected) in cases {
@@ -335,5 +339,6 @@ mod tests {
         assert!(Error::InvalidTreeName { reason: "empty" }
             .source()
             .is_none());
+        assert!(Error::TreeDropped.source().is_none());
     }
 }

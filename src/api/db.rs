@@ -18,10 +18,11 @@ use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats};
 use super::tree::{ensure_root_blob, replay_wal, Tree, TreeRuntime};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
-use crate::engine::KeyRangeEntry;
+use crate::engine::RangeEntry;
 use crate::journal::codec::BatchEncoder;
 use crate::journal::group_commit::Journal;
 use crate::layout::BlobGuid;
+use crate::store::blob_store::BlobStore;
 use crate::store::BufferManager;
 
 const DB_ROOT_TAG: u8 = 0xDB;
@@ -29,12 +30,26 @@ const DB_CATALOG_TREE_ID: u64 = 0x686f_6c74_6462_0001;
 const DB_TREE_HASH_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const DB_TREE_HASH_PRIME: u64 = 0x0000_0100_0000_01b3;
 const CATALOG_VALUE_MAGIC: &[u8; 8] = b"holtdb01";
-const CATALOG_VALUE_LEN: usize = 16;
+const CATALOG_STATE_LIVE: u8 = 1;
+const CATALOG_STATE_DROPPING: u8 = 2;
+const CATALOG_VALUE_LEN: usize = 17;
 
 #[derive(Clone)]
 struct OpenTree {
     root_guid: BlobGuid,
     runtime: TreeRuntime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CatalogState {
+    Live,
+    Dropping,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CatalogEntry {
+    tree_id: u64,
+    state: CatalogState,
 }
 
 /// A storage instance containing multiple named [`Tree`] roots.
@@ -102,7 +117,7 @@ impl DB {
         )
         .map(Arc::new);
 
-        Ok(Self {
+        let db = Self {
             cfg,
             store: bm,
             maintenance_gate,
@@ -112,7 +127,9 @@ impl DB {
             checkpointer,
             open_stats,
             trees: Arc::new(Mutex::new(HashMap::new())),
-        })
+        };
+        db.stage_dropped_trees()?;
+        Ok(db)
     }
 
     /// Create a named tree inside this DB.
@@ -123,7 +140,7 @@ impl DB {
     pub fn create_tree(&self, name: &str) -> Result<Tree> {
         let name_bytes = validate_tree_name(name)?;
         let tree_id = tree_id_for_name(name_bytes);
-        if self.catalog_lookup(name_bytes)?.is_some() {
+        if self.catalog_entry(name_bytes)?.is_some() || self.open_runtime_is_dropped(tree_id) {
             return Err(Error::TreeExists {
                 name: name.to_owned(),
             });
@@ -134,7 +151,7 @@ impl DB {
             tree_name: None,
             op: BatchOp::PutIfAbsent {
                 key: name_bytes.to_vec(),
-                value: encode_catalog_value(tree_id).to_vec(),
+                value: encode_catalog_value(tree_id, CatalogState::Live).to_vec(),
             },
         }])?;
         if !committed {
@@ -153,7 +170,7 @@ impl DB {
     pub fn open_tree(&self, name: &str) -> Result<Tree> {
         let name_bytes = validate_tree_name(name)?;
         let tree_id = self
-            .catalog_lookup(name_bytes)?
+            .catalog_lookup_live(name_bytes)?
             .ok_or_else(|| Error::TreeNotFound {
                 name: name.to_owned(),
             })?;
@@ -176,19 +193,46 @@ impl DB {
 
     /// Return every named tree recorded in the durable catalog.
     pub fn list_trees(&self) -> Result<Vec<String>> {
-        let catalog = self.catalog_tree()?;
         let mut names = Vec::new();
-        for entry in catalog.range_keys() {
-            match entry? {
-                KeyRangeEntry::Key { key, .. } => {
-                    let name = String::from_utf8(key)
-                        .map_err(|_| Error::node_corrupt("db catalog key"))?;
-                    names.push(name);
-                }
-                KeyRangeEntry::CommonPrefix(_) => {}
+        for (key, entry) in self.catalog_entries()? {
+            if entry.state == CatalogState::Live {
+                let name =
+                    String::from_utf8(key).map_err(|_| Error::node_corrupt("db catalog key"))?;
+                names.push(name);
             }
         }
         Ok(names)
+    }
+
+    /// Drop a named tree from the catalog and stage its blobs for
+    /// checkpoint-time deletion.
+    ///
+    /// The catalog tombstone is hidden from [`Self::list_trees`] and
+    /// from [`Self::open_tree`]. Existing handles are fenced before
+    /// this call returns, and a later [`Self::checkpoint`] completes
+    /// the physical cleanup.
+    pub fn drop_tree(&self, name: &str) -> Result<()> {
+        let name_bytes = validate_tree_name(name)?;
+        let _maintenance = self.maintenance_gate.enter_exclusive();
+        let entry = match self.catalog_entry(name_bytes)? {
+            Some(entry) if entry.state == CatalogState::Live => entry,
+            Some(_) | None => {
+                return Err(Error::TreeNotFound {
+                    name: name.to_owned(),
+                });
+            }
+        };
+        let guids = self.collect_tree_guids(entry.tree_id)?;
+        let seq = self.apply_system_batch_unlocked(
+            DB_CATALOG_TREE_ID,
+            vec![BatchOp::Put {
+                key: name_bytes.to_vec(),
+                value: encode_catalog_value(entry.tree_id, CatalogState::Dropping).to_vec(),
+            }],
+        )?;
+        self.mark_runtime_dropped(entry.tree_id);
+        self.stage_tree_delete_guids(&guids, seq);
+        Ok(())
     }
 
     /// Apply mutations across named trees under one WAL record.
@@ -228,7 +272,7 @@ impl DB {
             for (name, prefix) in scopes {
                 let name_bytes = validate_tree_name(name)?;
                 let tree_id =
-                    self.catalog_lookup(name_bytes)?
+                    self.catalog_lookup_live(name_bytes)?
                         .ok_or_else(|| Error::TreeNotFound {
                             name: (*name).to_owned(),
                         })?;
@@ -247,12 +291,22 @@ impl DB {
     /// deletes, and truncates the shared WAL when it is safe. It is
     /// not tied to any one named tree.
     pub fn checkpoint(&self) -> Result<()> {
+        self.stage_dropped_trees()?;
         Tree::checkpoint_shared_parts(
             &self.store,
             self.journal.as_ref(),
             &self.maintenance_gate,
             &self.commit_gate,
-        )
+        )?;
+        if self.store.pending_delete_count() == 0 && self.finalize_dropped_trees()? {
+            Tree::checkpoint_shared_parts(
+                &self.store,
+                self.journal.as_ref(),
+                &self.maintenance_gate,
+                &self.commit_gate,
+            )?;
+        }
+        Ok(())
     }
 
     /// Run one online maintenance pass for the catalog and every
@@ -334,7 +388,13 @@ impl DB {
         self.tree_from_state(DB_CATALOG_TREE_ID, open)
     }
 
-    fn catalog_lookup(&self, name: &[u8]) -> Result<Option<u64>> {
+    fn catalog_lookup_live(&self, name: &[u8]) -> Result<Option<u64>> {
+        Ok(self
+            .catalog_entry(name)?
+            .and_then(|entry| (entry.state == CatalogState::Live).then_some(entry.tree_id)))
+    }
+
+    fn catalog_entry(&self, name: &[u8]) -> Result<Option<CatalogEntry>> {
         let catalog = self.catalog_tree()?;
         catalog
             .get(name)?
@@ -342,10 +402,90 @@ impl DB {
             .transpose()
     }
 
+    fn catalog_entries(&self) -> Result<Vec<(Vec<u8>, CatalogEntry)>> {
+        let catalog = self.catalog_tree()?;
+        let mut entries = Vec::new();
+        for item in catalog.range() {
+            if let RangeEntry::Key { key, value, .. } = item? {
+                let entry = decode_catalog_value(&key, &value)?;
+                entries.push((key, entry));
+            }
+        }
+        Ok(entries)
+    }
+
+    fn stage_dropped_trees(&self) -> Result<()> {
+        for (_, entry) in self.catalog_entries()? {
+            if entry.state == CatalogState::Dropping {
+                let _maintenance = self.maintenance_gate.enter_exclusive();
+                self.mark_runtime_dropped(entry.tree_id);
+                let guids = self.collect_tree_guids(entry.tree_id)?;
+                self.stage_tree_delete_guids(&guids, self.next_seq.load(Ordering::Acquire));
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize_dropped_trees(&self) -> Result<bool> {
+        let mut ops = Vec::new();
+        let mut finalized_tree_ids = Vec::new();
+        for (name, entry) in self.catalog_entries()? {
+            if entry.state == CatalogState::Dropping
+                && !self
+                    .store
+                    .store_has_blob(root_guid_for_tree_id(entry.tree_id))?
+            {
+                ops.push(BatchOp::Delete { key: name });
+                finalized_tree_ids.push(entry.tree_id);
+            }
+        }
+        if ops.is_empty() {
+            return Ok(false);
+        }
+        let _maintenance = self.maintenance_gate.enter_exclusive();
+        self.apply_system_batch_unlocked(DB_CATALOG_TREE_ID, ops)?;
+        let mut trees = self.trees.lock().unwrap();
+        for tree_id in finalized_tree_ids {
+            trees.remove(&tree_id);
+        }
+        Ok(true)
+    }
+
+    fn collect_tree_guids(&self, tree_id: u64) -> Result<Vec<BlobGuid>> {
+        let root_guid = root_guid_for_tree_id(tree_id);
+        if !self.store.has_blob(root_guid)? {
+            return Ok(Vec::new());
+        }
+        crate::engine::collect_blob_guids(&self.store, root_guid)
+    }
+
+    fn stage_tree_delete_guids(&self, guids: &[BlobGuid], seq: u64) {
+        for guid in guids {
+            self.store.mark_for_delete(*guid, seq);
+        }
+    }
+
+    fn mark_runtime_dropped(&self, tree_id: u64) {
+        if let Some(open) = self.trees.lock().unwrap().get(&tree_id) {
+            open.runtime.mark_dropped();
+        }
+    }
+
+    fn open_runtime_is_dropped(&self, tree_id: u64) -> bool {
+        self.trees
+            .lock()
+            .unwrap()
+            .get(&tree_id)
+            .is_some_and(|open| open.runtime.is_dropped())
+    }
+
     fn open_tree_state(&self, tree_id: u64) -> Result<OpenTree> {
         let mut trees = self.trees.lock().unwrap();
         if let Some(open) = trees.get(&tree_id) {
-            return Ok(open.clone());
+            if !open.runtime.is_dropped() {
+                return Ok(open.clone());
+            }
+            return Err(Error::TreeDropped);
         }
         let root_guid = root_guid_for_tree_id(tree_id);
         ensure_root_blob(&self.store, root_guid)?;
@@ -407,7 +547,7 @@ impl DB {
             if name.is_empty() {
                 return Err(Error::InvalidTreeName { reason: "empty" });
             }
-            match self.catalog_lookup(name)? {
+            match self.catalog_lookup_live(name)? {
                 Some(id) if id == item.tree_id => {}
                 Some(_) => return Err(Error::node_corrupt("db catalog tree id mismatch")),
                 None => {
@@ -497,6 +637,40 @@ impl DB {
             }
         }
         Ok(())
+    }
+
+    fn apply_system_batch_unlocked(&self, tree_id: u64, ops: Vec<BatchOp>) -> Result<u64> {
+        let open = {
+            let mut trees = self.trees.lock().unwrap();
+            if let Some(open) = trees.get(&tree_id) {
+                open.clone()
+            } else {
+                let root_guid = root_guid_for_tree_id(tree_id);
+                ensure_root_blob(&self.store, root_guid)?;
+                let open = OpenTree {
+                    root_guid,
+                    runtime: TreeRuntime::new(),
+                };
+                trees.insert(tree_id, open.clone());
+                open
+            }
+        };
+        let groups = vec![DBBatchGroup {
+            tree_id,
+            tree: self.tree_from_state(tree_id, open)?,
+            ops,
+        }];
+        let count = count_wal_ops(&groups);
+        let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
+        if !Self::preflight_batch_groups(&groups, base_seq)? {
+            return Err(Error::Internal("system DB batch preflight failed"));
+        }
+        if let Some(journal) = &self.journal {
+            self.apply_batch_groups_with_journal(&groups, base_seq, journal)?;
+        } else {
+            self.apply_batch_groups_in_memory(&groups, base_seq)?;
+        }
+        Ok(base_seq)
     }
 }
 
@@ -716,24 +890,33 @@ fn validate_tree_name(name: &str) -> Result<&[u8]> {
     Ok(name.as_bytes())
 }
 
-fn encode_catalog_value(tree_id: u64) -> [u8; CATALOG_VALUE_LEN] {
+fn encode_catalog_value(tree_id: u64, state: CatalogState) -> [u8; CATALOG_VALUE_LEN] {
     let mut out = [0u8; CATALOG_VALUE_LEN];
     out[..CATALOG_VALUE_MAGIC.len()].copy_from_slice(CATALOG_VALUE_MAGIC);
-    out[CATALOG_VALUE_MAGIC.len()..].copy_from_slice(&tree_id.to_le_bytes());
+    out[CATALOG_VALUE_MAGIC.len()] = match state {
+        CatalogState::Live => CATALOG_STATE_LIVE,
+        CatalogState::Dropping => CATALOG_STATE_DROPPING,
+    };
+    out[CATALOG_VALUE_MAGIC.len() + 1..].copy_from_slice(&tree_id.to_le_bytes());
     out
 }
 
-fn decode_catalog_value(name: &[u8], value: &[u8]) -> Result<u64> {
+fn decode_catalog_value(name: &[u8], value: &[u8]) -> Result<CatalogEntry> {
     if value.len() != CATALOG_VALUE_LEN
         || &value[..CATALOG_VALUE_MAGIC.len()] != CATALOG_VALUE_MAGIC
     {
         return Err(Error::node_corrupt("db catalog value"));
     }
+    let state = match value[CATALOG_VALUE_MAGIC.len()] {
+        CATALOG_STATE_LIVE => CatalogState::Live,
+        CATALOG_STATE_DROPPING => CatalogState::Dropping,
+        _ => return Err(Error::node_corrupt("db catalog state")),
+    };
     let mut raw = [0u8; 8];
-    raw.copy_from_slice(&value[CATALOG_VALUE_MAGIC.len()..]);
+    raw.copy_from_slice(&value[CATALOG_VALUE_MAGIC.len() + 1..]);
     let tree_id = u64::from_le_bytes(raw);
     if tree_id == 0 || tree_id == DB_CATALOG_TREE_ID || tree_id != tree_id_for_name(name) {
         return Err(Error::node_corrupt("db catalog tree id"));
     }
-    Ok(tree_id)
+    Ok(CatalogEntry { tree_id, state })
 }

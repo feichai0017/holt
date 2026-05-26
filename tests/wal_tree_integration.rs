@@ -118,6 +118,31 @@ fn db_checkpoint_flushes_replayed_multi_tree_without_tree_handles() {
 }
 
 #[test]
+fn db_drop_tree_survives_checkpoint_and_reopen() {
+    let dir = tempdir().unwrap();
+    {
+        let db = DB::open(durable_cfg(dir.path())).unwrap();
+        let objects = db.create_tree("objects").unwrap();
+        objects.put(b"bucket/a.jpg", b"etag-a").unwrap();
+        db.checkpoint().unwrap();
+
+        db.drop_tree("objects").unwrap();
+        db.checkpoint().unwrap();
+    }
+
+    {
+        let db = DB::open(durable_cfg(dir.path())).unwrap();
+        assert!(db.list_trees().unwrap().is_empty());
+        assert!(matches!(
+            db.open_tree("objects"),
+            Err(holt::Error::TreeNotFound { .. })
+        ));
+        let recreated = db.create_tree("objects").unwrap();
+        assert!(recreated.get(b"bucket/a.jpg").unwrap().is_none());
+    }
+}
+
+#[test]
 fn view_snapshots_uncheckpointed_persistent_bytes() {
     let dir = tempdir().unwrap();
     let tree = Tree::open(durable_cfg(dir.path())).unwrap();

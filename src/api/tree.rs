@@ -12,7 +12,7 @@
 //!
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::config::{Storage, TreeConfig};
@@ -53,6 +53,7 @@ pub(crate) struct TreeRuntime {
     endpoint_locks: Arc<EndpointLocks>,
     route_cache: Arc<engine::RouteCache>,
     prefix_list_cache: Arc<engine::PrefixListCache>,
+    dropped: Arc<AtomicBool>,
 }
 
 impl TreeRuntime {
@@ -61,7 +62,16 @@ impl TreeRuntime {
             endpoint_locks: Arc::new(EndpointLocks::new()),
             route_cache: Arc::new(engine::RouteCache::new()),
             prefix_list_cache: Arc::new(engine::PrefixListCache::new()),
+            dropped: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn mark_dropped(&self) {
+        self.dropped.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn is_dropped(&self) -> bool {
+        self.dropped.load(Ordering::Acquire)
     }
 }
 
@@ -190,6 +200,9 @@ pub struct Tree {
     /// Conservatively invalidated by `next_seq`, so every write
     /// makes old entries miss.
     prefix_list_cache: Arc<engine::PrefixListCache>,
+    /// Shared liveness flag for DB-managed named trees. `DB::drop_tree`
+    /// flips it so existing handles can no longer publish writes.
+    dropped: Arc<AtomicBool>,
     /// Background checkpointer handle. `Some` iff
     /// `cfg.checkpoint.enabled`. Shared via `Arc` so the thread
     /// shuts down on the **last** `Tree` clone's drop, not the
@@ -448,9 +461,18 @@ impl Tree {
             commit_gate,
             journal,
             prefix_list_cache: runtime.prefix_list_cache,
+            dropped: runtime.dropped,
             checkpointer,
             open_stats,
         })
+    }
+
+    fn ensure_live(&self) -> Result<()> {
+        if self.dropped.load(Ordering::Acquire) {
+            Err(Error::TreeDropped)
+        } else {
+            Ok(())
+        }
     }
 
     /// Look up `key`. Returns the value bytes, or `None` if no leaf
@@ -569,6 +591,7 @@ impl Tree {
 
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
+            self.ensure_live()?;
             let _endpoint = self.endpoint_locks.lock_key(key);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
@@ -672,6 +695,7 @@ impl Tree {
 
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
+            self.ensure_live()?;
             let _endpoint = self.endpoint_locks.lock_key(key);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
@@ -751,6 +775,7 @@ impl Tree {
 
         let journal_ack = {
             let _mutation = self.maintenance_gate.enter_shared();
+            self.ensure_live()?;
             let _endpoints = self.endpoint_locks.lock_pair(src, dst);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
 
@@ -904,6 +929,7 @@ impl Tree {
 
     pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_exclusive();
+        self.ensure_live()?;
         let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
         // Reserve a contiguous seq range so each inner op's seq is
         // `base + mutating_index` and replay can derive it without
@@ -1431,6 +1457,7 @@ impl Tree {
 
     fn capture_view(&self, prefix: &[u8]) -> Result<View> {
         let _maintenance = self.maintenance_gate.enter_exclusive();
+        self.ensure_live()?;
         self.capture_view_unlocked(prefix)
     }
 
@@ -1457,6 +1484,7 @@ impl Tree {
     /// the emptiness check must be atomic with subsequent writes.
     pub fn is_prefix_empty(&self, prefix: &[u8]) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_shared();
+        self.ensure_live()?;
         self.projected_prefix_empty(&std::collections::HashMap::new(), prefix)
     }
 
@@ -2089,6 +2117,7 @@ impl Tree {
     /// settled if you want to force a tree all the way down after a
     /// heavy churn phase.
     pub fn compact(&self) -> Result<()> {
+        self.ensure_live()?;
         if self.store.compaction_candidate_count() == 0 && self.store.merge_candidate_count() == 0 {
             self.seed_maintenance_candidates()?;
         }

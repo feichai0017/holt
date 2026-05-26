@@ -195,6 +195,43 @@ fn db_stats_reports_shared_resources() {
     assert!(stats.journal.is_none());
 }
 
+#[test]
+fn db_drop_tree_hides_catalog_entry_and_fences_old_handle() {
+    let db = DB::open(TreeConfig::memory()).unwrap();
+    let objects = db.create_tree("objects").unwrap();
+    objects.put(b"bucket/a", b"etag").unwrap();
+
+    db.drop_tree("objects").unwrap();
+
+    assert!(db.list_trees().unwrap().is_empty());
+    assert!(matches!(
+        db.open_tree("objects"),
+        Err(holt::Error::TreeNotFound { .. })
+    ));
+    assert!(matches!(
+        db.atomic(|batch| {
+            batch.put("objects", b"bucket/b", b"etag-b");
+        }),
+        Err(holt::Error::TreeNotFound { .. })
+    ));
+    assert!(matches!(
+        objects.put(b"bucket/b", b"etag-b"),
+        Err(holt::Error::TreeDropped)
+    ));
+    assert!(matches!(
+        db.drop_tree("objects"),
+        Err(holt::Error::TreeNotFound { .. })
+    ));
+    assert!(matches!(
+        db.create_tree("objects"),
+        Err(holt::Error::TreeExists { .. })
+    ));
+
+    db.checkpoint().unwrap();
+    let recreated = db.create_tree("objects").unwrap();
+    assert!(recreated.get(b"bucket/a").unwrap().is_none());
+}
+
 // ----------------------------------------------------------------
 // Put / Get
 // ----------------------------------------------------------------
