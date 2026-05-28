@@ -9,6 +9,7 @@
 use crate::api::errors::{Error, Result};
 use crate::layout::{Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix};
 use crate::store::BlobFrameRef;
+use std::mem::size_of;
 
 use super::cast;
 
@@ -106,4 +107,14 @@ pub(super) fn read_node256(frame: BlobFrameRef<'_>, slot: u16) -> Result<Node256
         .body_of_slot(slot)
         .ok_or(Error::node_corrupt("read_node256: body"))?;
     Ok(*cast::<Node256>(body))
+}
+
+pub(super) fn read_node256_child(frame: BlobFrameRef<'_>, slot: u16, byte: u8) -> Result<u32> {
+    let body = frame
+        .body_of_slot(slot)
+        .ok_or(Error::node_corrupt("read_node256_child: body"))?;
+    if body.len() != size_of::<Node256>() {
+        return Err(Error::node_corrupt("read_node256_child: non-Node256 slot"));
+    }
+    Ok(cast::<Node256>(body).children[byte as usize])
 }

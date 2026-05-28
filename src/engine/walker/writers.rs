@@ -13,7 +13,9 @@ use crate::layout::{
 };
 use crate::store::BlobFrame;
 
-use super::readers::{read_node16, read_node256, read_node4, read_node48, read_prefix};
+use super::readers::{
+    read_node16, read_node256, read_node256_child, read_node4, read_node48, read_prefix,
+};
 use super::SearchKey;
 
 pub(super) fn write_struct_to_slot<T>(frame: &mut BlobFrame<'_>, slot: u16, v: &T) -> Result<()> {
@@ -160,8 +162,7 @@ pub(super) fn inner_find_child(
             }
         }
         NodeType::Node256 => {
-            let n = read_node256(frame.as_ref(), slot)?;
-            let s = n.children[byte as usize];
+            let s = read_node256_child(frame.as_ref(), slot, byte)?;
             if s == 0 {
                 Ok(None)
             } else {
