@@ -9,6 +9,17 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-06-02
+
+### Fixed
+
+- Fixed a DB checkpoint race where a concurrent pending delete could
+  remove an in-flight cache image after the checkpoint worker had
+  claimed it, causing `write_through_batch: flushing entry lost cache
+  image` and blocking crash-safe checkpoint completion.
+- Kept pending-delete cleanup from reclaiming cache and route-resident
+  state until the delete has been applied to the inner blob store.
+
 ## [0.4.1] — 2026-05-27
 
 ### Added
