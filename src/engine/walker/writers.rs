@@ -9,10 +9,12 @@ use std::mem::{offset_of, size_of};
 use crate::api::errors::{Error, Result};
 use crate::engine::simd;
 use crate::layout::{
-    leaf_extent_size, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, PREFIX_MAX_INLINE,
+    leaf_extent_size, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix,
+    PREFIX_MAX_INLINE,
 };
 use crate::store::BlobFrame;
 
+use super::cast;
 use super::readers::{
     read_node16, read_node256, read_node256_child, read_node4, read_node48, read_prefix,
 };
@@ -32,6 +34,24 @@ pub(super) fn write_struct_to_slot<T>(frame: &mut BlobFrame<'_>, slot: u16, v: &
         body.copy_from_slice(bytes);
     }
     Ok(())
+}
+
+/// Repoint an existing `BlobNode`'s child GUID. Used by copy-on-write
+/// forking to redirect a parent frame's crossing at `slot` from the
+/// shared child frame to its freshly-installed private fork. The
+/// parent frame must be exclusively latched by the caller.
+pub(super) fn repoint_blob_node(
+    frame: &mut BlobFrame<'_>,
+    slot: u16,
+    new_child: BlobGuid,
+) -> Result<()> {
+    let mut bn = *cast::<BlobNode>(
+        frame
+            .body_of_slot(slot)
+            .ok_or(Error::node_corrupt("repoint_blob_node: body"))?,
+    );
+    bn.child_blob_guid = new_child;
+    write_struct_to_slot(frame, slot, &bn)
 }
 
 pub(super) fn write_leaf(

@@ -275,6 +275,35 @@ pub struct BufferManager {
 impl BufferManager {
     // ---------- copy-on-write snapshots ----------
 
+    /// The copy-on-write fork barrier: the highest epoch any live
+    /// snapshot holds. A frame with `created_epoch <= fork_barrier`
+    /// may be referenced by a snapshot and must be forked before an
+    /// in-place overwrite. `0` means no live snapshot — the walker's
+    /// hot path compares against it and never forks.
+    #[must_use]
+    pub(crate) fn fork_barrier(&self) -> u64 {
+        self.fork_barrier.load(Ordering::Acquire)
+    }
+
+    /// Fork a frame for copy-on-write: copy `src_bytes` to a fresh GUID
+    /// `new_guid`, repatch the self-GUID, install it, and pin it. The
+    /// install stamps the current epoch — strictly greater than any
+    /// live fork barrier once a snapshot exists — so the fork is
+    /// private to the live tree and is never itself re-forked for the
+    /// snapshot that triggered it.
+    pub(crate) fn fork_frame(
+        &self,
+        src_bytes: &[u8],
+        new_guid: BlobGuid,
+        seq: u64,
+    ) -> Result<Arc<CachedBlob>> {
+        let mut buf = self.alloc_blob_buf_zeroed();
+        buf.as_mut_slice().copy_from_slice(src_bytes);
+        crate::layout::set_frame_blob_guid(buf.as_mut_slice(), new_guid);
+        self.install_new_blob(new_guid, buf, seq);
+        self.pin(new_guid)
+    }
+
     /// Copy `src`'s current frame image to a fresh GUID `new_guid`,
     /// install it, and pin it — the frozen root of a new CoW snapshot.
     ///
@@ -290,14 +319,8 @@ impl BufferManager {
         src: &CachedBlob,
         seq: u64,
     ) -> Result<Arc<CachedBlob>> {
-        let mut buf = self.alloc_blob_buf_zeroed();
-        {
-            let guard = src.read();
-            buf.as_mut_slice().copy_from_slice(guard.as_slice());
-        }
-        crate::layout::set_frame_blob_guid(buf.as_mut_slice(), new_guid);
-        self.install_new_blob(new_guid, buf, seq);
-        self.pin(new_guid)
+        let guard = src.read();
+        self.fork_frame(guard.as_slice(), new_guid, seq)
     }
 
     /// Register a live snapshot rooted at `root_guid`. Bumps the global

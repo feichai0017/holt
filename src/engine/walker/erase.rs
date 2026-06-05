@@ -6,6 +6,7 @@ use crate::layout::{BlobNode, NodeType, BLOB_MAX_INLINE};
 use std::sync::Arc;
 
 use super::cast;
+use super::cow::{child_is_snapshot_shared, fork_child_if_shared};
 use super::lookup::lookup_at;
 use super::readers::{
     ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48, read_prefix,
@@ -106,41 +107,48 @@ pub fn erase_multi_conditional(
         };
         match root_lookup {
             (root_guid, LookupResult::Crossing(crossing)) => {
-                if let Some(cache) = route_cache {
-                    cache.learn(
-                        key,
-                        root_guid,
-                        0,
-                        root_version,
-                        crossing.child_guid,
-                        crossing.child_depth,
-                    );
-                    bm.mark_route_resident(crossing.child_guid);
-                }
                 let child_pin = bm.pin(crossing.child_guid)?;
-                child_pin.prefetch_header();
-                let child_guard = child_pin.write();
-                drop(root_read);
+                // Copy-on-write: a shared root child must be forked by
+                // repointing the root's BlobNode, which needs the root's
+                // exclusive latch — bail to the root-local path below.
+                let child_shared = child_is_snapshot_shared(bm, child_pin.as_ref());
+                if !child_shared {
+                    if let Some(cache) = route_cache {
+                        cache.learn(
+                            key,
+                            root_guid,
+                            0,
+                            root_version,
+                            crossing.child_guid,
+                            crossing.child_depth,
+                        );
+                        bm.mark_route_resident(crossing.child_guid);
+                    }
+                    child_pin.prefetch_header();
+                    let child_guard = child_pin.write();
+                    drop(root_read);
 
-                blob_hops = 1;
-                let outcome = lock_coupled_erase_in_blob(
-                    bm,
-                    child_guard,
-                    child_pin.as_ref(),
-                    crossing.child_guid,
-                    false,
-                    key,
-                    seq,
-                    condition,
-                    crossing.child_depth,
-                    &mut blob_hops,
-                    &mut max_cross_blob_depth,
-                );
-                drop(child_pin);
-                if outcome.is_ok() {
-                    bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+                    blob_hops = 1;
+                    let outcome = lock_coupled_erase_in_blob(
+                        bm,
+                        child_guard,
+                        child_pin.as_ref(),
+                        crossing.child_guid,
+                        false,
+                        key,
+                        seq,
+                        condition,
+                        crossing.child_depth,
+                        &mut blob_hops,
+                        &mut max_cross_blob_depth,
+                    );
+                    drop(child_pin);
+                    if outcome.is_ok() {
+                        bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+                    }
+                    return outcome;
                 }
-                return outcome;
+                drop(child_pin);
             }
             (_, LookupResult::NotFound) => {
                 bm.note_walker_blob_hops(1, 0);
@@ -191,6 +199,12 @@ fn try_erase_from_route(
     let Some(cache) = route_cache else {
         return Ok(None);
     };
+    // Copy-on-write: the route-cache shortcut mutates a deep child in
+    // place; under a live snapshot that child may be shared, so fall
+    // back to the full root descent, which forks at each crossing.
+    if bm.fork_barrier() != 0 {
+        return Ok(None);
+    }
     let Some(route) = cache.lookup(key) else {
         return Ok(None);
     };
@@ -252,6 +266,10 @@ fn try_erase_from_route(
 struct EraseBlobCrossing {
     child_guid: crate::layout::BlobGuid,
     child_depth: usize,
+    /// Slot of the `BlobNode` in the parent frame that points at this
+    /// child — the edge a copy-on-write fork repoints at the child's
+    /// private fork.
+    parent_slot: u16,
 }
 
 enum EraseStep {
@@ -288,8 +306,42 @@ fn lock_coupled_erase_in_blob(
             let child_pin = bm.pin(crossing.child_guid)?;
             child_pin.prefetch_header();
             let child_guard = child_pin.write();
-            drop(guard);
 
+            if let Some((fork_guid, fork_pin)) = fork_child_if_shared(
+                bm,
+                &mut guard,
+                child_guard.as_slice(),
+                crossing.parent_slot,
+                seq,
+            )? {
+                drop(child_guard);
+                drop(child_pin);
+                let fork_guard = fork_pin.write();
+                drop(guard);
+                let mut outcome = lock_coupled_erase_in_blob(
+                    bm,
+                    fork_guard,
+                    fork_pin.as_ref(),
+                    fork_guid,
+                    false,
+                    key,
+                    seq,
+                    condition,
+                    crossing.child_depth,
+                    blob_hops,
+                    max_cross_blob_depth,
+                )?;
+                drop(fork_pin);
+                // Repointing this frame's BlobNode at the fork changed it.
+                if is_top_blob {
+                    outcome.root_dirty = true;
+                } else {
+                    bm.mark_dirty_cached(current_guid, seq, current_entry);
+                }
+                return Ok(outcome);
+            }
+
+            drop(guard);
             let outcome = lock_coupled_erase_in_blob(
                 bm,
                 child_guard,
@@ -437,6 +489,7 @@ fn blob_node_erase_step(
     Ok(EraseStep::Crossing(EraseBlobCrossing {
         child_guid: bn.child_blob_guid,
         child_depth: depth + plen,
+        parent_slot: slot,
     }))
 }
 

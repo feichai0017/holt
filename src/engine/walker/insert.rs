@@ -6,6 +6,7 @@ use crate::layout::{leaf_extent_size, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE}
 use std::sync::Arc;
 
 use super::cast;
+use super::cow::{child_is_snapshot_shared, fork_child_if_shared};
 use super::lookup::lookup_at;
 use super::migrate::blob_needs_compaction;
 use super::readers::{ntype_of, read_leaf_key_ref, read_prefix};
@@ -142,42 +143,51 @@ pub fn insert_multi_conditional(
             }
         };
         if let Some((root_guid, crossing)) = root_crossing {
-            if let Some(cache) = route_cache {
-                cache.learn(
-                    key,
-                    root_guid,
-                    0,
-                    root_version,
-                    crossing.child_guid,
-                    crossing.child_depth,
-                );
-                bm.mark_route_resident(crossing.child_guid);
-            }
             let child_pin = bm.pin(crossing.child_guid)?;
-            child_pin.prefetch_header();
-            let child_guard = child_pin.write();
-            drop(root_read);
+            // Copy-on-write: if the root's child may be shared with a
+            // live snapshot, forking it requires repointing the root's
+            // own BlobNode, which needs the root's exclusive latch. Bail
+            // to the root-local exclusive path below, whose crossing arm
+            // performs the fork. No snapshot ⇒ barrier 0 ⇒ no probe.
+            let child_shared = child_is_snapshot_shared(bm, child_pin.as_ref());
+            if !child_shared {
+                if let Some(cache) = route_cache {
+                    cache.learn(
+                        key,
+                        root_guid,
+                        0,
+                        root_version,
+                        crossing.child_guid,
+                        crossing.child_depth,
+                    );
+                    bm.mark_route_resident(crossing.child_guid);
+                }
+                child_pin.prefetch_header();
+                let child_guard = child_pin.write();
+                drop(root_read);
 
-            blob_hops = 1;
-            let outcome = lock_coupled_insert_in_blob(
-                bm,
-                child_guard,
-                child_pin.as_ref(),
-                crossing.child_guid,
-                false,
-                key,
-                value,
-                seq,
-                condition,
-                crossing.child_depth,
-                &mut blob_hops,
-                &mut max_cross_blob_depth,
-            );
-            drop(child_pin);
-            if outcome.is_ok() {
-                bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+                blob_hops = 1;
+                let outcome = lock_coupled_insert_in_blob(
+                    bm,
+                    child_guard,
+                    child_pin.as_ref(),
+                    crossing.child_guid,
+                    false,
+                    key,
+                    value,
+                    seq,
+                    condition,
+                    crossing.child_depth,
+                    &mut blob_hops,
+                    &mut max_cross_blob_depth,
+                );
+                drop(child_pin);
+                if outcome.is_ok() {
+                    bm.note_walker_blob_hops(blob_hops, max_cross_blob_depth);
+                }
+                return outcome;
             }
-            return outcome;
+            drop(child_pin);
         }
         drop(root_read);
     }
@@ -227,6 +237,13 @@ fn try_insert_from_optimistic_route(
     let Some(cache) = route_cache else {
         return Ok(None);
     };
+    // Copy-on-write: the route-cache shortcut jumps straight to a deep
+    // child and mutates it in place. Under a live snapshot that child
+    // may be shared, so fall back to the full root descent, which forks
+    // shared frames at each crossing.
+    if bm.fork_barrier() != 0 {
+        return Ok(None);
+    }
     let Some(route) = cache.lookup(key) else {
         return Ok(None);
     };
@@ -579,6 +596,10 @@ fn insert_batch_in_pinned_blob(
 struct InsertBlobCrossing {
     child_guid: crate::layout::BlobGuid,
     child_depth: usize,
+    /// Slot of the `BlobNode` in the parent frame that points at this
+    /// child — the edge a copy-on-write fork repoints at the child's
+    /// private fork.
+    parent_slot: u16,
 }
 
 enum InsertStep {
@@ -638,34 +659,21 @@ fn lock_coupled_insert_in_blob(
                 });
             }
             Ok(InsertStep::Crossing(crossing)) => {
-                let child_pin = bm.pin(crossing.child_guid)?;
-                child_pin.prefetch_header();
-                let child_guard = child_pin.write();
-                drop(guard);
-
-                let mut outcome = lock_coupled_insert_in_blob(
+                return cross_and_insert(
                     bm,
-                    child_guard,
-                    child_pin.as_ref(),
-                    crossing.child_guid,
-                    false,
+                    guard,
+                    crossing,
+                    is_top_blob,
+                    current_guid,
+                    current_entry,
+                    current_dirty,
                     key,
                     value,
                     seq,
                     condition,
-                    crossing.child_depth,
                     blob_hops,
                     max_cross_blob_depth,
                 );
-                drop(child_pin);
-
-                if outcome.is_ok() && current_dirty && !is_top_blob {
-                    bm.mark_dirty_cached(current_guid, seq, current_entry);
-                }
-                if let Ok(outcome) = &mut outcome {
-                    outcome.root_dirty |= is_top_blob && current_dirty;
-                }
-                return outcome;
             }
             Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
                 {
@@ -685,6 +693,91 @@ fn lock_coupled_insert_in_blob(
     Err(Error::NotYetImplemented(
         "lock_coupled_insert_in_blob: spillover retry loop exhausted",
     ))
+}
+
+/// Handle an insert that crosses a `BlobNode` into a child frame.
+///
+/// If a live snapshot may reference the child, fork it first (repointing
+/// this frame's edge at the fork — see [`fork_child_if_shared`]), then
+/// lock-couple the insert into the child (or its fork) and propagate
+/// this frame's dirtiness upward. `parent_dirty` carries any dirtiness
+/// this frame already accrued (e.g. from a spillover in the caller's
+/// retry loop).
+#[allow(clippy::too_many_arguments)]
+fn cross_and_insert(
+    bm: &BufferManager,
+    mut parent_guard: BlobWriteGuard<'_>,
+    crossing: InsertBlobCrossing,
+    is_top_blob: bool,
+    current_guid: crate::layout::BlobGuid,
+    current_entry: &CachedBlob,
+    mut parent_dirty: bool,
+    key: SearchKey<'_>,
+    value: &[u8],
+    seq: u64,
+    condition: InsertCondition,
+    blob_hops: &mut u64,
+    max_cross_blob_depth: &mut usize,
+) -> Result<InsertOutcome> {
+    let child_pin = bm.pin(crossing.child_guid)?;
+    child_pin.prefetch_header();
+    let child_guard = child_pin.write();
+
+    let mut outcome = if let Some((fork_guid, fork_pin)) = fork_child_if_shared(
+        bm,
+        &mut parent_guard,
+        child_guard.as_slice(),
+        crossing.parent_slot,
+        seq,
+    )? {
+        parent_dirty = true;
+        drop(child_guard);
+        drop(child_pin);
+        let fork_guard = fork_pin.write();
+        drop(parent_guard);
+        let out = lock_coupled_insert_in_blob(
+            bm,
+            fork_guard,
+            fork_pin.as_ref(),
+            fork_guid,
+            false,
+            key,
+            value,
+            seq,
+            condition,
+            crossing.child_depth,
+            blob_hops,
+            max_cross_blob_depth,
+        );
+        drop(fork_pin);
+        out
+    } else {
+        drop(parent_guard);
+        let out = lock_coupled_insert_in_blob(
+            bm,
+            child_guard,
+            child_pin.as_ref(),
+            crossing.child_guid,
+            false,
+            key,
+            value,
+            seq,
+            condition,
+            crossing.child_depth,
+            blob_hops,
+            max_cross_blob_depth,
+        );
+        drop(child_pin);
+        out
+    };
+
+    if outcome.is_ok() && parent_dirty && !is_top_blob {
+        bm.mark_dirty_cached(current_guid, seq, current_entry);
+    }
+    if let Ok(outcome) = &mut outcome {
+        outcome.root_dirty |= is_top_blob && parent_dirty;
+    }
+    outcome
 }
 
 // ---------- recursive dispatch ----------
@@ -807,6 +900,7 @@ fn blob_node_insert_step(
         return Ok(InsertStep::Crossing(InsertBlobCrossing {
             child_guid: bn.child_blob_guid,
             child_depth: depth + plen,
+            parent_slot: slot,
         }));
     }
 

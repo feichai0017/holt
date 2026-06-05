@@ -119,6 +119,22 @@ pub fn set_frame_created_epoch(buf: &mut [u8], epoch: u64) {
         .copy_from_slice(&epoch.to_ne_bytes());
 }
 
+/// Read the per-frame creation epoch from a formatted frame buffer.
+///
+/// Inverse of [`set_frame_created_epoch`]; called on the mutation hot
+/// path to decide whether a frame must be forked before an in-place
+/// overwrite. The caller guarantees `buf` is at least [`HEADER_SIZE`]
+/// bytes.
+#[inline]
+#[must_use]
+pub fn frame_created_epoch(buf: &[u8]) -> u64 {
+    u64::from_ne_bytes(
+        buf[CREATED_EPOCH_OFFSET..CREATED_EPOCH_OFFSET + size_of::<u64>()]
+            .try_into()
+            .expect("frame buffer is at least HEADER_SIZE bytes"),
+    )
+}
+
 /// Byte offset of [`BlobHeader::blob_guid`] within a frame buffer.
 pub const BLOB_GUID_OFFSET: usize = offset_of!(BlobHeader, blob_guid);
 
