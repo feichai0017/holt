@@ -86,7 +86,12 @@ pub struct BlobHeader {
     /// existed, which forces a copy-on-write on first mutation under
     /// any live snapshot (safe, just not maximally lazy).
     pub created_epoch: u64,
-    _pad_88: [u8; 0x18],
+    /// Root-frame-only epoch high-water mark. Persisted so a reopened
+    /// tree restores `current_epoch` above every frame's `created_epoch`,
+    /// keeping snapshots taken after reopen correct. Stamped on the live
+    /// root at each snapshot; ignored on non-root frames.
+    pub epoch_high_water: u64,
+    _pad_90: [u8; 0x10],
     /// 128-bit blob identifier.
     pub blob_guid: BlobGuid,
     _pad_b0: [u8; (HEADER_SIZE as usize) - 0xb0],
@@ -104,6 +109,7 @@ const _: () = assert!(offset_of!(BlobHeader, gap_space) == 0x68);
 const _: () = assert!(offset_of!(BlobHeader, tombstone_leaf_cnt) == 0x6c);
 const _: () = assert!(offset_of!(BlobHeader, free_list_head) == 0x70);
 const _: () = assert!(offset_of!(BlobHeader, created_epoch) == 0x80);
+const _: () = assert!(offset_of!(BlobHeader, epoch_high_water) == 0x88);
 const _: () = assert!(offset_of!(BlobHeader, blob_guid) == 0xa0);
 
 /// Byte offset of [`BlobHeader::created_epoch`] within a frame buffer.
@@ -130,6 +136,28 @@ pub fn set_frame_created_epoch(buf: &mut [u8], epoch: u64) {
 pub fn frame_created_epoch(buf: &[u8]) -> u64 {
     u64::from_ne_bytes(
         buf[CREATED_EPOCH_OFFSET..CREATED_EPOCH_OFFSET + size_of::<u64>()]
+            .try_into()
+            .expect("frame buffer is at least HEADER_SIZE bytes"),
+    )
+}
+
+/// Byte offset of [`BlobHeader::epoch_high_water`] within a frame buffer.
+pub const EPOCH_HIGH_WATER_OFFSET: usize = offset_of!(BlobHeader, epoch_high_water);
+
+/// Stamp the root-frame epoch high-water mark (see the field docs). The
+/// caller guarantees `buf` is at least [`HEADER_SIZE`] bytes.
+#[inline]
+pub fn set_frame_epoch_high_water(buf: &mut [u8], epoch: u64) {
+    buf[EPOCH_HIGH_WATER_OFFSET..EPOCH_HIGH_WATER_OFFSET + size_of::<u64>()]
+        .copy_from_slice(&epoch.to_ne_bytes());
+}
+
+/// Read the root-frame epoch high-water mark.
+#[inline]
+#[must_use]
+pub fn frame_epoch_high_water(buf: &[u8]) -> u64 {
+    u64::from_ne_bytes(
+        buf[EPOCH_HIGH_WATER_OFFSET..EPOCH_HIGH_WATER_OFFSET + size_of::<u64>()]
             .try_into()
             .expect("frame buffer is at least HEADER_SIZE bytes"),
     )
@@ -166,6 +194,7 @@ mod tests {
         assert_eq!(offset_of!(BlobHeader, tombstone_leaf_cnt), 0x6c);
         assert_eq!(offset_of!(BlobHeader, free_list_head), 0x70);
         assert_eq!(offset_of!(BlobHeader, created_epoch), 0x80);
+        assert_eq!(offset_of!(BlobHeader, epoch_high_water), 0x88);
         assert_eq!(offset_of!(BlobHeader, blob_guid), 0xa0);
     }
 

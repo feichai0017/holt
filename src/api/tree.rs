@@ -364,6 +364,15 @@ impl Tree {
         let root_guid = ROOT_BLOB_GUID;
         ensure_root_blob(&bm, root_guid)?;
 
+        // Restore the CoW epoch above every persisted frame's
+        // `created_epoch` (the high-water is stamped on the live root at
+        // each snapshot) so snapshots taken after this reopen are correct.
+        {
+            let root = bm.pin(root_guid)?;
+            let high_water = crate::layout::frame_epoch_high_water(root.read().as_slice());
+            bm.set_current_epoch(high_water);
+        }
+
         // File-backed trees keep a WAL alongside the data file.
         // Replay every durable record onto the BM-cached blob
         // image before exposing the tree to callers: the on-disk
@@ -1522,6 +1531,18 @@ impl Tree {
             self.store
                 .install_snapshot_root(snap_root, &self.root_pin, STRUCTURAL_SEQ)?;
         let epoch = self.store.register_snapshot(snap_root);
+
+        // Persist the bumped epoch on the live root so a reopened tree
+        // restores `current_epoch` above every frame's `created_epoch`.
+        {
+            let mut root = self.root_pin.write();
+            crate::layout::set_frame_epoch_high_water(
+                root.as_mut_slice(),
+                self.store.current_epoch(),
+            );
+        }
+        self.store
+            .mark_dirty_cached(self.root_guid, STRUCTURAL_SEQ, self.root_pin.as_ref());
 
         let view = View::new(prefix.to_vec(), Arc::clone(&self.store), snap_root, root_pin);
         Ok(Snapshot::new(view, Arc::clone(&self.store), epoch))

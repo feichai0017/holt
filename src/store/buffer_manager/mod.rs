@@ -287,6 +287,20 @@ pub struct BufferManager {
 impl BufferManager {
     // ---------- copy-on-write snapshots ----------
 
+    /// Current global CoW epoch — the value stamped into every frame
+    /// installed via [`Self::install_new_blob`] (forks included).
+    #[must_use]
+    pub(crate) fn current_epoch(&self) -> u64 {
+        self.current_epoch.load(Ordering::Acquire)
+    }
+
+    /// Restore the global CoW epoch on reopen, above every persisted
+    /// frame's `created_epoch`, so snapshots taken after a reopen
+    /// correctly fork pre-existing frames. Clamped to the floor of 1.
+    pub(crate) fn set_current_epoch(&self, epoch: u64) {
+        self.current_epoch.store(epoch.max(1), Ordering::Release);
+    }
+
     /// The copy-on-write fork barrier: the highest epoch any live
     /// snapshot holds. A frame with `created_epoch <= fork_barrier`
     /// may be referenced by a snapshot and must be forked before an

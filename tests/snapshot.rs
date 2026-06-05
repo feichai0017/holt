@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use holt::{BlobStore, Error, MemoryBlobStore, Tree, TreeBuilder, TreeConfig};
+use tempfile::tempdir;
 
 #[test]
 fn snapshot_isolates_root_local_writes() {
@@ -418,6 +419,74 @@ fn overlapping_snapshots_reclaim_after_last_retires() {
                 .as_deref(),
             Some(&b"b"[..]),
             "live key {i}",
+        );
+    }
+}
+
+#[test]
+fn snapshot_correct_after_reopen() {
+    let dir = tempdir().unwrap();
+    let cfg = || {
+        let mut c = TreeConfig::new(dir.path());
+        c.checkpoint.enabled = false;
+        c.wal_sync = true;
+        c
+    };
+
+    const N: u32 = 2000;
+    let v1 = vec![0x01_u8; 200];
+    let v2 = vec![0x02_u8; 200];
+    let v3 = vec![0x03_u8; 200];
+
+    // Session 1: write, then snapshot + fork + retire so the live child
+    // frames end up with a created_epoch above 1, and checkpoint so they
+    // persist into blobs.dat (not just the WAL — replay would re-stamp
+    // them at epoch 1 and hide the bug).
+    {
+        let tree = Tree::open(cfg()).unwrap();
+        for i in 0..N {
+            tree.put(format!("k{i:06}").as_bytes(), &v1).unwrap();
+        }
+        {
+            let snap = tree.snapshot(b"").unwrap();
+            for i in 0..N {
+                tree.put(format!("k{i:06}").as_bytes(), &v2).unwrap();
+            }
+            assert_eq!(snap.get(b"k000000").unwrap().as_deref(), Some(&v1[..]));
+        } // retire
+        tree.checkpoint().unwrap();
+    }
+
+    // Reopen.
+    let tree = Tree::open(cfg()).unwrap();
+
+    // Live data survives the reopen (forks included).
+    for i in 0..N {
+        assert_eq!(
+            tree.get(format!("k{i:06}").as_bytes()).unwrap().as_deref(),
+            Some(&v2[..]),
+            "reopened live key {i}",
+        );
+    }
+
+    // A NEW snapshot after reopen must isolate. If current_epoch reset to
+    // 1 while the loaded frames carry created_epoch > 1, the walker would
+    // wrongly treat them as private and overwrite them in place, leaking
+    // v3 into the snapshot.
+    let snap = tree.snapshot(b"").unwrap();
+    for i in 0..N {
+        tree.put(format!("k{i:06}").as_bytes(), &v3).unwrap();
+    }
+    for i in 0..N {
+        assert_eq!(
+            snap.get(format!("k{i:06}").as_bytes()).unwrap().as_deref(),
+            Some(&v2[..]),
+            "post-reopen snapshot key {i} was corrupted by a live write",
+        );
+        assert_eq!(
+            tree.get(format!("k{i:06}").as_bytes()).unwrap().as_deref(),
+            Some(&v3[..]),
+            "post-reopen live key {i}",
         );
     }
 }
