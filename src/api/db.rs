@@ -15,6 +15,7 @@ use super::atomic::{BatchOp, RecordVersion};
 use super::config::TreeConfig;
 use super::errors::{Error, Result};
 use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats};
+use super::snapshot::Snapshot;
 use super::tree::{ensure_root_blob, replay_wal, Tree, TreeRuntime};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
@@ -329,7 +330,7 @@ impl DB {
                 .collect::<Vec<_>>();
             let mut trees = HashMap::with_capacity(scoped.len());
             for (_, name, prefix, tree) in scoped {
-                trees.insert(name, tree.capture_view_unlocked(prefix)?);
+                trees.insert(name, tree.snapshot_unlocked(prefix)?);
             }
             DBView { trees }
         };
@@ -738,9 +739,8 @@ impl DB {
 /// Created by [`DB::view`]. Each captured tree is exposed as a
 /// normal [`View`], so point lookup and range/list APIs stay the
 /// same as single-tree snapshots.
-#[derive(Clone)]
 pub struct DBView {
-    trees: HashMap<String, View>,
+    trees: HashMap<String, Snapshot>,
 }
 
 impl DBView {
@@ -748,7 +748,7 @@ impl DBView {
     /// in [`DB::view`]'s scope array.
     #[must_use]
     pub fn tree(&self, name: &str) -> Option<&View> {
-        self.trees.get(name)
+        self.trees.get(name).map(Snapshot::view)
     }
 
     /// Number of captured named tree views.

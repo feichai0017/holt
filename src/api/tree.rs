@@ -1463,13 +1463,11 @@ impl Tree {
 
     /// Run a read-only transaction over a prefix snapshot.
     ///
-    /// The tree captures the current blob graph while holding this
-    /// tree's exclusive mutation gate, releases the live tree, then
-    /// invokes `read` with an immutable [`View`]. Writes committed
-    /// after the capture are invisible to all reads made through
-    /// that view. The implementation copies blob frames, not decoded
-    /// entries, so point lookup and range/list operations keep using
-    /// the ART walker.
+    /// Internally a [`Self::snapshot`] held for the duration of `read`: a
+    /// copy-on-write capture (O(1) — only the root frame is copied; later
+    /// live writes fork the frames this view references). Writes committed
+    /// after the capture are invisible to all reads made through the view,
+    /// and point lookup / range / list keep using the ART walker.
     ///
     /// A view is scoped: reads outside `prefix` return
     /// [`Error::OutsideViewScope`]. Use `prefix = b""` only when a
@@ -1478,53 +1476,39 @@ impl Tree {
     where
         F: FnOnce(&View) -> Result<R>,
     {
-        let view = self.capture_view(prefix)?;
-        read(&view)
-    }
-
-    fn capture_view(&self, prefix: &[u8]) -> Result<View> {
-        let _maintenance = self.maintenance_gate.enter_shared();
-        self.ensure_live()?;
-        let _tree_mutation = self.mutation_gate.enter_exclusive();
-        self.capture_view_unlocked(prefix)
-    }
-
-    pub(crate) fn capture_view_unlocked(&self, prefix: &[u8]) -> Result<View> {
-        let scope = prefix.to_vec();
-        let topology = engine::collect_blob_topology_silent(&self.store, self.root_guid)?;
-        let snapshot_store = Arc::new(MemoryBlobStore::new());
-        for entry in &topology {
-            let bytes = self.store.snapshot_blob_image(entry.guid)?;
-            snapshot_store.write_blob(entry.guid, &bytes)?;
-        }
-
-        let snapshot_bm = Arc::new(BufferManager::new(snapshot_store, topology.len().max(1)));
-        let root_pin = snapshot_bm.pin(self.root_guid)?;
-        Ok(View::new(scope, snapshot_bm, self.root_guid, root_pin))
+        let snap = self.snapshot(prefix)?;
+        read(snap.view())
     }
 
     /// Capture a stable copy-on-write [`Snapshot`] of the subtree under
     /// `prefix`.
     ///
-    /// Unlike [`Self::view`], which eagerly copies every reachable frame,
-    /// a snapshot copies only the root frame up front and shares the rest
+    /// A snapshot copies only the root frame up front and shares the rest
     /// with the live tree; subsequent writes fork (copy-on-write) only
     /// the frames the snapshot still references. Creation is O(one frame
     /// copy), reads have 1× amplification, and the per-write overhead is
-    /// zero whenever no snapshot is live.
+    /// zero whenever no snapshot is live. [`Self::view`] is the same
+    /// mechanism exposed as a scoped closure; this returns an owned handle.
     ///
     /// Reads outside `prefix` return [`Error::OutsideViewScope`]; use
     /// `prefix = b""` for a whole-tree snapshot. The snapshot stays valid
     /// until its handle is dropped (or [`Snapshot::retire`] is called).
     pub fn snapshot(&self, prefix: &[u8]) -> Result<Snapshot> {
-        use crate::store::STRUCTURAL_SEQ;
-
         let _maintenance = self.maintenance_gate.enter_shared();
         self.ensure_live()?;
         // Freeze live writers so the root frame is byte-stable for the
         // copy, and so no writer is mid-overwriting a soon-to-be-shared
         // frame at the instant the fork barrier rises.
         let _freeze = self.mutation_gate.enter_exclusive();
+        self.snapshot_unlocked(prefix)
+    }
+
+    /// [`Self::snapshot`] without taking this tree's maintenance/mutation
+    /// gates — the caller must already hold the mutation gate exclusively.
+    /// Used by [`crate::DB::view`] to capture several trees atomically
+    /// under a single coordinated freeze.
+    pub(crate) fn snapshot_unlocked(&self, prefix: &[u8]) -> Result<Snapshot> {
+        use crate::store::STRUCTURAL_SEQ;
 
         let snap_root = engine::fresh_blob_guid();
         let root_pin =
