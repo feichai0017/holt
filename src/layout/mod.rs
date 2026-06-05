@@ -16,8 +16,8 @@ mod slot;
 pub use blob_node::{BlobNode, BLOB_MAX_INLINE};
 pub(crate) use header::ROOT_BLOB_GUID;
 pub use header::{
-    set_frame_created_epoch, BlobGuid, BlobHeader, DATA_AREA_START, HEADER_SIZE, MAX_SLOTS,
-    PAGE_SIZE,
+    set_frame_blob_guid, set_frame_created_epoch, BlobGuid, BlobHeader, DATA_AREA_START,
+    HEADER_SIZE, MAX_SLOTS, PAGE_SIZE,
 };
 pub use leaf::{leaf_extent_size, Leaf};
 pub use node::{size_of_node, NodeType, SIZE_BY_TYPE};

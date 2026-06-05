@@ -130,7 +130,7 @@ mod mutation;
 mod residency;
 mod telemetry;
 
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -261,6 +261,69 @@ pub struct BufferManager {
     /// snapshot knows whether it must fork the frame instead of
     /// overwriting it in place.
     current_epoch: AtomicU64,
+    /// Highest epoch held by any LIVE snapshot — the copy-on-write
+    /// fork barrier. A frame whose `created_epoch <= fork_barrier`
+    /// may be visible to a snapshot and so must be forked before an
+    /// in-place overwrite; `0` (no live snapshot) disables forking.
+    fork_barrier: AtomicU64,
+    /// Live CoW snapshots, keyed by epoch → snapshot root GUID. Drives
+    /// fork-barrier recomputation on retire and (later) orphan reclaim.
+    /// One entry per outstanding snapshot, so it stays tiny.
+    snapshots: Mutex<BTreeMap<u64, BlobGuid>>,
+}
+
+impl BufferManager {
+    // ---------- copy-on-write snapshots ----------
+
+    /// Copy `src`'s current frame image to a fresh GUID `new_guid`,
+    /// install it, and pin it — the frozen root of a new CoW snapshot.
+    ///
+    /// The caller must hold the owning tree's mutation gate exclusively
+    /// so the source frame is byte-stable for the copy. The copy keeps
+    /// `src`'s entire structure (children are referenced by GUID, so
+    /// they stay shared rather than deep-copied); only the self-GUID is
+    /// repatched. The copy's `created_epoch` is irrelevant because a
+    /// snapshot root is read-only and never forked.
+    pub(crate) fn install_snapshot_root(
+        &self,
+        new_guid: BlobGuid,
+        src: &CachedBlob,
+        seq: u64,
+    ) -> Result<Arc<CachedBlob>> {
+        let mut buf = self.alloc_blob_buf_zeroed();
+        {
+            let guard = src.read();
+            buf.as_mut_slice().copy_from_slice(guard.as_slice());
+        }
+        crate::layout::set_frame_blob_guid(buf.as_mut_slice(), new_guid);
+        self.install_new_blob(new_guid, buf, seq);
+        self.pin(new_guid)
+    }
+
+    /// Register a live snapshot rooted at `root_guid`. Bumps the global
+    /// epoch (so frames created afterwards are private to the live
+    /// tree), raises the fork barrier to the snapshot's epoch, and
+    /// returns that epoch.
+    pub(crate) fn register_snapshot(&self, root_guid: BlobGuid) -> u64 {
+        let mut live = self.snapshots.lock().expect("snapshot registry poisoned");
+        // `fetch_add` returns the pre-bump value: that is this snapshot's
+        // epoch and, because `current_epoch` only ever increases, the
+        // largest key in the registry — hence the new barrier.
+        let epoch = self.current_epoch.fetch_add(1, Ordering::AcqRel);
+        live.insert(epoch, root_guid);
+        self.fork_barrier.store(epoch, Ordering::Release);
+        epoch
+    }
+
+    /// Retire the snapshot at `epoch`, lowering the fork barrier to the
+    /// highest remaining live snapshot epoch (or `0` when none remain).
+    /// Idempotent: retiring an unknown epoch only recomputes the barrier.
+    pub(crate) fn retire_snapshot(&self, epoch: u64) {
+        let mut live = self.snapshots.lock().expect("snapshot registry poisoned");
+        live.remove(&epoch);
+        let barrier = live.keys().next_back().copied().unwrap_or(0);
+        self.fork_barrier.store(barrier, Ordering::Release);
+    }
 }
 
 impl BufferManager {
@@ -307,6 +370,8 @@ impl BufferManager {
             clock: AtomicU64::new(1),
             telemetry: Telemetry::default(),
             current_epoch: AtomicU64::new(1),
+            fork_barrier: AtomicU64::new(0),
+            snapshots: Mutex::new(BTreeMap::new()),
         }
     }
 

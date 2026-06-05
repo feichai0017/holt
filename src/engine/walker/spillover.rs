@@ -563,7 +563,7 @@ pub(super) fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
 /// Time-based prefix doesn't compromise privacy here: the GUID
 /// lives inside an internal `manifest.bin` and never escapes the
 /// process.
-pub(super) fn fresh_blob_guid() -> BlobGuid {
+pub(crate) fn fresh_blob_guid() -> BlobGuid {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(1);

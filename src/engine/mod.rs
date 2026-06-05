@@ -36,6 +36,6 @@ pub use walker::{
     RangeEntry, RangeIter,
 };
 pub(crate) use walker::{
-    collect_blob_children_from_frame, insert_multi_batch_conditional, InsertBatchItem,
-    PrefixListCache, SearchKey,
+    collect_blob_children_from_frame, fresh_blob_guid, insert_multi_batch_conditional,
+    InsertBatchItem, PrefixListCache, SearchKey,
 };

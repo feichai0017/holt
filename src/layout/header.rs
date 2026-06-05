@@ -119,6 +119,22 @@ pub fn set_frame_created_epoch(buf: &mut [u8], epoch: u64) {
         .copy_from_slice(&epoch.to_ne_bytes());
 }
 
+/// Byte offset of [`BlobHeader::blob_guid`] within a frame buffer.
+pub const BLOB_GUID_OFFSET: usize = offset_of!(BlobHeader, blob_guid);
+
+/// Overwrite the self-GUID in an already-formatted frame buffer.
+///
+/// Used when forking a frame to a fresh identity for copy-on-write
+/// snapshots: the rest of the frame is position-independent (slots
+/// address one another by intra-frame index, and `BlobNode`s address
+/// *children* by GUID), so a raw byte copy plus this single patch
+/// yields a valid frame under the new GUID. The caller guarantees
+/// `buf` is at least [`HEADER_SIZE`] bytes.
+#[inline]
+pub fn set_frame_blob_guid(buf: &mut [u8], guid: BlobGuid) {
+    buf[BLOB_GUID_OFFSET..BLOB_GUID_OFFSET + size_of::<BlobGuid>()].copy_from_slice(guid.as_slice());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

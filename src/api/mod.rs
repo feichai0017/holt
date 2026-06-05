@@ -11,6 +11,7 @@ pub mod config;
 pub mod db;
 pub mod errors;
 pub mod key;
+pub mod snapshot;
 pub mod stats;
 pub mod tree;
 pub mod view;

@@ -73,6 +73,7 @@ pub use range::{
     RangeIter,
 };
 pub(crate) use scan::collect_blob_children_from_frame;
+pub(crate) use spillover::fresh_blob_guid;
 pub use scan::{collect_blob_guids, collect_blob_topology_silent};
 pub use types::{EraseCondition, EraseOutcome, InsertCondition, InsertOutcome};
 
