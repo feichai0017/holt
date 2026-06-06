@@ -16,6 +16,83 @@ fn sm_file_db(dir: &Path) -> DB {
     DB::open(cfg).expect("open state-machine file DB")
 }
 
+/// A metadata-store-shaped fixture: many named families opened up front,
+/// commands applied as multi-family `DB::atomic` conditional batches
+/// (`put_if_absent` to a "current" family + a "dedupe" family, like a
+/// replicated metadata service), each pinned with `commit_durable`.
+#[test]
+fn durable_recovers_metadata_store_shaped_workload() {
+    // 14 families, opened at startup like a real metadata store.
+    const FAMILIES: &[&str] = &[
+        "system_current",
+        "mount_current",
+        "inode_current",
+        "dentry_current",
+        "parent_current",
+        "xattr_current",
+        "chunk_current",
+        "session_current",
+        "path_index_current",
+        "watch_current",
+        "snapshot_current",
+        "gc_current",
+        "command_dedupe_current",
+        "history",
+    ];
+    let dir = tempdir().unwrap();
+    {
+        // memory_flush_on_write=false: frames stay dirty until checkpoint,
+        // so commit_durable's flush is the only thing persisting them.
+        let mut cfg = TreeConfig::new(dir.path());
+        cfg.durability = Durability::StateMachine;
+        cfg.memory_flush_on_write = false;
+        let db = DB::open(cfg).unwrap();
+        for f in FAMILIES {
+            db.create_tree(f).unwrap();
+        }
+        for n in 1..=40u64 {
+            db.atomic(|b| {
+                let key = format!("dir/{n:05}");
+                // current record (NotExists predicate -> put_if_absent)
+                b.put_if_absent("dentry_current", key.as_bytes(), &n.to_le_bytes());
+                // dedupe record (put_if_absent by request id)
+                b.put_if_absent(
+                    "command_dedupe_current",
+                    format!("req-{n}").as_bytes(),
+                    b"ok",
+                );
+                // a history record for the prior version
+                if n > 1 {
+                    b.put(
+                        "history",
+                        format!("h/dentry/dir/{:05}/{}", n - 1, n - 1).as_bytes(),
+                        &n.to_le_bytes(),
+                    );
+                }
+            })
+            .unwrap();
+            db.commit_durable(n).unwrap();
+        }
+    }
+    // Reopen with no WAL — recovery is the durable manifest alone.
+    let db = sm_file_db(dir.path());
+    assert_eq!(db.durable_applied_index().unwrap(), 40);
+    assert_eq!(db.list_trees().unwrap().len(), FAMILIES.len());
+    let dentry = db.open_tree("dentry_current").unwrap();
+    let dedupe = db.open_tree("command_dedupe_current").unwrap();
+    for n in 1..=40u64 {
+        assert_eq!(
+            dentry.get(format!("dir/{n:05}").as_bytes()).unwrap(),
+            Some(n.to_le_bytes().to_vec()),
+            "dentry dir/{n:05}",
+        );
+        assert!(
+            dedupe.get(format!("req-{n}").as_bytes()).unwrap().is_some(),
+            "dedupe req-{n}",
+        );
+    }
+}
+
 fn sm_file_tree(dir: &Path) -> Tree {
     let mut cfg = TreeConfig::new(dir);
     cfg.durability = Durability::StateMachine;
