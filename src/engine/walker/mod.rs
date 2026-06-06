@@ -71,7 +71,7 @@ pub use migrate::{blob_needs_compaction, compact_blob};
 pub(crate) use range::PrefixListCache;
 pub use range::{
     KeyRangeBuilder, KeyRangeEntry, KeyRangeEntryRef, KeyRangeIter, RangeBuilder, RangeEntry,
-    RangeIter,
+    RangeIter, ScanStats,
 };
 pub(crate) use scan::collect_blob_children_from_frame;
 pub(crate) use spillover::fresh_blob_guid;

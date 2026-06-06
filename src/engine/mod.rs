@@ -33,7 +33,7 @@ pub use walker::{
     erase_multi, erase_multi_conditional, insert_multi, insert_multi_conditional,
     lookup_multi_with, try_merge_children, EraseCondition, EraseOutcome, InsertCondition,
     InsertOutcome, KeyRangeBuilder, KeyRangeEntry, KeyRangeEntryRef, KeyRangeIter, RangeBuilder,
-    RangeEntry, RangeIter,
+    RangeEntry, RangeIter, ScanStats,
 };
 pub(crate) use walker::{
     collect_blob_children_from_frame, fresh_blob_guid, insert_multi_batch_conditional,

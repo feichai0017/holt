@@ -110,6 +110,36 @@ pub enum KeyRangeEntryRef<'a> {
     CommonPrefix(&'a [u8]),
 }
 
+/// Per-scan work accounting for a single range cursor.
+///
+/// A scan can step over far more of the tree than it returns —
+/// tombstoned leaves linger until compaction, delimiter rollups collapse
+/// whole subtrees into one emission, and a concurrent writer can force
+/// the cursor to restart. `ScanStats` exposes that gap so callers can
+/// spot pathological listings (a `readdir` that walks 10k tombstones to
+/// return 10 live names) and decide when to compact.
+///
+/// Read it from a [`RangeIter`] / [`KeyRangeIter`] after draining, or as
+/// the return of [`KeyRangeBuilder::visit`]. Counters accumulate over the
+/// scan's lifetime: `visited` measures work, the rest measure outcomes.
+/// A cache-served prefix list reports `visited == 0` — it never walked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    /// Stored entries the cursor examined: every leaf it read (including
+    /// tombstoned or out-of-range ones skipped without emission) plus
+    /// every delimiter fold. Always `>= returned + rollup`; the surplus
+    /// is wasted work (a `readdir` that examined 10k tombstones to return
+    /// 10 names reports `visited = 10_010`, `returned = 10`).
+    pub visited: u64,
+    /// Live leaves emitted (`Key` entries).
+    pub returned: u64,
+    /// Delimiter rollups emitted (`CommonPrefix` entries).
+    pub rollup: u64,
+    /// Cursor restarts forced by a concurrent writer rewriting a blob on
+    /// the descent path — a read/write contention signal.
+    pub restarts: u64,
+}
+
 const PREFIX_LIST_CACHE_SLOTS: usize = 256;
 const PREFIX_LIST_CACHE_MAX_LIMIT: usize = 256;
 
@@ -403,6 +433,7 @@ impl RangeBuilder {
             projection,
             initialized: false,
             terminated: false,
+            stats: ScanStats::default(),
         }
     }
 }
@@ -468,12 +499,12 @@ impl KeyRangeBuilder {
     /// but avoids allocating one `Vec<u8>` per emitted entry. The
     /// slices passed to `visitor` are valid only for the duration
     /// of that callback.
-    pub fn visit<F>(self, limit: usize, mut visitor: F) -> Result<usize>
+    pub fn visit<F>(self, limit: usize, mut visitor: F) -> Result<ScanStats>
     where
         F: FnMut(KeyRangeEntryRef<'_>) -> Result<()>,
     {
         if limit == 0 {
-            return Ok(0);
+            return Ok(ScanStats::default());
         }
 
         let mut builder = self;
@@ -484,15 +515,29 @@ impl KeyRangeBuilder {
 
         if let (Some(cache), Some(epoch)) = (&builder.prefix_list_cache, &builder.epoch) {
             let current_epoch = epoch.load(Ordering::Acquire);
-            if let Some(emitted) = cache.visit(
-                current_epoch,
-                prefix,
-                start_after,
-                delimiter,
-                limit,
-                &mut visitor,
-            )? {
-                return Ok(emitted);
+            // Count the served entries by kind in a wrapper so the cache
+            // stays unaware of stats. On a hit `visited`/`restarts` stay
+            // zero — nothing was walked.
+            let mut stats = ScanStats::default();
+            let hit = {
+                let mut counting = |entry: KeyRangeEntryRef<'_>| {
+                    match entry {
+                        KeyRangeEntryRef::Key { .. } => stats.returned += 1,
+                        KeyRangeEntryRef::CommonPrefix(_) => stats.rollup += 1,
+                    }
+                    visitor(entry)
+                };
+                cache.visit(
+                    current_epoch,
+                    prefix,
+                    start_after,
+                    delimiter,
+                    limit,
+                    &mut counting,
+                )?
+            };
+            if hit.is_some() {
+                return Ok(stats);
             }
         }
 
@@ -516,7 +561,7 @@ impl KeyRangeBuilder {
                 .inner
                 .into_iter_with_projection(RangeProjection::KeyRefs),
         };
-        let emitted = iter.visit_key_entries_unlocked(limit, |entry| {
+        iter.visit_key_entries_unlocked(limit, |entry| {
             if let Some(cached) = cached.as_mut() {
                 cached.push(CachedKeyRangeEntry::from_ref(entry));
             }
@@ -542,7 +587,7 @@ impl KeyRangeBuilder {
                 );
             }
         }
-        Ok(emitted)
+        Ok(iter.stats())
     }
 }
 
@@ -576,6 +621,11 @@ impl Iterator for KeyRangeIter {
 }
 
 impl KeyRangeIter {
+    /// Per-scan work accounting — see [`ScanStats`].
+    pub fn stats(&self) -> ScanStats {
+        self.inner.stats()
+    }
+
     /// Advance without entering `maintenance_gate`.
     /// Caller must already hold the tree's maintenance guard.
     pub(crate) fn next_unlocked(&mut self) -> Option<Result<KeyRangeEntry>> {
@@ -629,6 +679,7 @@ pub struct RangeIter {
     projection: RangeProjection,
     initialized: bool,
     terminated: bool,
+    stats: ScanStats,
 }
 
 struct Frame {
@@ -904,6 +955,13 @@ impl Iterator for RangeIter {
 }
 
 impl RangeIter {
+    /// Work accounting accumulated by this cursor so far. Read it after
+    /// draining — or partway through — to see how much of the tree the
+    /// scan stepped over versus what it returned. See [`ScanStats`].
+    pub fn stats(&self) -> ScanStats {
+        self.stats
+    }
+
     fn next_projected_maybe_guarded(
         &mut self,
         enter_gate: bool,
@@ -1117,7 +1175,13 @@ impl RangeIter {
         }
     }
 
-    fn common_prefix_advance_from_emit(&self) -> RangeAdvance {
+    fn common_prefix_advance_from_emit(&mut self) -> RangeAdvance {
+        // A segment rollup folds a whole subtree at an inner node without
+        // descending to its leaves — count it as one examined unit so the
+        // `visited >= returned + rollup` invariant holds across both the
+        // leaf-time and descent-time rollup paths.
+        self.stats.visited += 1;
+        self.stats.rollup += 1;
         match self.projection {
             RangeProjection::Records => RangeAdvance::Entry(ProjectedRangeEntry::Record(
                 RangeEntry::CommonPrefix(self.emit_buf.clone()),
@@ -1404,6 +1468,7 @@ impl RangeIter {
                                 &mut self.emit_buf,
                             )?
                         };
+                        self.stats.visited += 1;
                         match kv {
                             LeafAction::Skip => {}
                             LeafAction::Done => return Ok(RangeAdvance::Done),
@@ -1416,6 +1481,7 @@ impl RangeIter {
                                     return Ok(RangeAdvance::Restart);
                                 }
                                 self.set_lower_bound_exclusive(&key);
+                                self.stats.returned += 1;
                                 let entry = match self.projection {
                                     RangeProjection::Records => {
                                         ProjectedRangeEntry::Record(RangeEntry::Key {
@@ -1464,6 +1530,7 @@ impl RangeIter {
                                 if !self.set_lower_bound_successor(&common) {
                                     self.terminated = true;
                                 }
+                                self.stats.rollup += 1;
                                 let entry = match self.projection {
                                     RangeProjection::Records => ProjectedRangeEntry::Record(
                                         RangeEntry::CommonPrefix(common),
@@ -1482,6 +1549,7 @@ impl RangeIter {
                                     return Ok(RangeAdvance::Restart);
                                 }
                                 self.set_lower_bound_to_emit_exclusive();
+                                self.stats.returned += 1;
                                 return Ok(RangeAdvance::KeyRef(KeyRefKind::Key { version }));
                             }
                             LeafAction::KeyRefCommonPrefix => {
@@ -1497,6 +1565,7 @@ impl RangeIter {
                                 if !self.set_lower_bound_to_emit_successor() {
                                     self.terminated = true;
                                 }
+                                self.stats.rollup += 1;
                                 return Ok(RangeAdvance::KeyRef(KeyRefKind::CommonPrefix));
                             }
                         }
@@ -1713,6 +1782,7 @@ impl RangeIter {
 
     fn restart_cursor(&mut self) {
         self.bm.note_range_restart();
+        self.stats.restarts += 1;
         self.stack.clear();
         self.curr_key.clear();
         self.cursor_floor = 0;

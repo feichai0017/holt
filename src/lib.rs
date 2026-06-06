@@ -163,7 +163,7 @@ pub use api::view::{View, ViewKeyRangeBuilder, ViewRangeBuilder};
 // Range-scan iterator surface.
 pub use engine::{
     KeyRangeBuilder, KeyRangeEntry, KeyRangeEntryRef, KeyRangeIter, RangeBuilder, RangeEntry,
-    RangeIter,
+    RangeIter, ScanStats,
 };
 
 // Stats snapshots returned by `Tree::stats` and `DB::stats`.

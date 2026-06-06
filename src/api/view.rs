@@ -103,12 +103,8 @@ impl View {
 
     /// Return `true` if no captured key starts with `prefix`.
     pub fn is_prefix_empty(&self, prefix: &[u8]) -> Result<bool> {
-        let mut found = false;
-        self.scan_keys(prefix)?.visit(1, |_| {
-            found = true;
-            Ok(())
-        })?;
-        Ok(!found)
+        let stats = self.scan_keys(prefix)?.visit(1, |_| Ok(()))?;
+        Ok(stats.returned + stats.rollup == 0)
     }
 
     fn lookup_record(&self, key: &[u8]) -> Result<Option<Record>> {
@@ -188,8 +184,9 @@ impl ViewKeyRangeBuilder {
         self
     }
 
-    /// Visit key-only entries with borrowed key bytes.
-    pub fn visit<F>(self, limit: usize, visitor: F) -> Result<usize>
+    /// Visit key-only entries with borrowed key bytes, returning the
+    /// scan's [`crate::ScanStats`].
+    pub fn visit<F>(self, limit: usize, visitor: F) -> Result<crate::ScanStats>
     where
         F: FnMut(crate::KeyRangeEntryRef<'_>) -> Result<()>,
     {
