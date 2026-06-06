@@ -7,6 +7,24 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.5.1] — 2026-06-06
+
+### Fixed
+
+- Added durable recovery coverage for NoKV-style metadata stores using many
+  named families and multi-family `DB::atomic` batches under
+  `Durability::StateMachine`.
+- Verified that `DB::commit_durable(applied_index)` can reopen a
+  metadata-service-shaped checkpoint without a Holt WAL and retain the durable
+  applied index needed for external-log replay.
+
+### Validation
+
+- `cargo test --test sm_durable durable_recovers_metadata_store_shaped_workload -- --exact --nocapture`
+- `cargo test --release --test sm_durable durable_recovers_metadata_store_shaped_workload -- --exact`
+- NoKV sibling validation with a local Holt patch:
+  `cargo test --config 'patch.crates-io.holt.path="../holt"' -p nokv-meta -p nokv-cluster -p nokv-server`
+
 ## [0.5.0] — 2026-06-06
 
 This release adds a two-axis durability model (who owns durability ×
