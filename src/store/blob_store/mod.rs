@@ -37,27 +37,6 @@ pub use memory::MemoryBlobStore;
 use crate::api::errors::Result;
 use crate::layout::BlobGuid;
 
-/// Durable state-machine metadata committed atomically alongside the
-/// blob-store manifest.
-///
-/// In `Durability::StateMachine` mode there is no WAL; the durable
-/// on-disk recovery point is a copy-on-write snapshot whose roots —
-/// plus the external log index it reflects and the version counter to
-/// resume at — are recorded here and committed with the manifest's
-/// atomic tmp+rename. `roots` maps each tree's id to the GUID of its
-/// durable snapshot root (`tree_id == 0` is a standalone `Tree`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DurableManifest {
-    /// External log index this durable image reflects (Raft `applied_index`).
-    pub applied_index: u64,
-    /// Version counter to resume at on reopen (above every durable frame's seq).
-    pub next_seq: u64,
-    /// CoW epoch the durable roots were captured at.
-    pub durable_epoch: u64,
-    /// Per-tree durable snapshot root: `(tree_id, durable_root_guid)`.
-    pub roots: Vec<(u64, BlobGuid)>,
-}
-
 /// A blob-granular storage interface.
 ///
 /// All implementations are `Send + Sync` so the buffer manager can
@@ -138,24 +117,5 @@ pub trait BlobStore: Send + Sync {
     /// `true` iff `guid` exists. Default impl scans `list_blobs`.
     fn has_blob(&self, guid: BlobGuid) -> Result<bool> {
         self.list_blobs().map(|v| v.contains(&guid))
-    }
-
-    /// Atomically commit `meta` as the store's durable state-machine
-    /// recovery point (see [`DurableManifest`]).
-    ///
-    /// The caller has already flushed and synced every frame in the
-    /// durable closure; this records the roots + log index + seq and
-    /// makes them durable with the manifest's own atomic rename. The
-    /// default errors — only file-backed stores support durable
-    /// recovery; an in-memory store is volatile by construction.
-    fn commit_durable_manifest(&self, _meta: &DurableManifest) -> Result<()> {
-        Err(crate::api::errors::Error::DurableManifestUnsupported)
-    }
-
-    /// The durable recovery point recorded by the last
-    /// [`Self::commit_durable_manifest`], or `None` if none was ever
-    /// committed (or the store is volatile).
-    fn load_durable_manifest(&self) -> Result<Option<DurableManifest>> {
-        Ok(None)
     }
 }

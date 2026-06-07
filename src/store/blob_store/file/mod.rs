@@ -78,7 +78,7 @@ use crate::layout::{BlobGuid, PAGE_SIZE};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use super::BlobBufPool;
-use super::{AlignedBlobBuf, BlobStore, DurableManifest};
+use super::{AlignedBlobBuf, BlobStore};
 
 #[cfg(all(target_os = "linux", feature = "io-uring"))]
 use self::uring::UringContext;
@@ -116,12 +116,9 @@ const REGISTERED_BUFFER_MAX_SLOTS: usize = 32;
 const MANIFEST_MAGIC: [u8; 8] = *b"ARTSNMNF";
 /// Manifest format version. Bumped on any breaking change.
 ///
-/// v2 appends a durable state-machine trailer after the slot table
-/// (see [`DURABLE_TRAILER_MAGIC`]). A v1 file is refused on load — the
-/// on-disk format is pre-1.0 and not migrated.
+/// A v1 file is refused on load — the on-disk format is pre-1.0 and
+/// not migrated.
 const MANIFEST_VERSION: u16 = 2;
-/// Magic prefixing the v2 durable state-machine trailer.
-const DURABLE_TRAILER_MAGIC: [u8; 4] = *b"DMT2";
 /// Per-record magic for `manifest.log`.
 const MANIFEST_LOG_MAGIC: [u8; 4] = *b"MLG1";
 const MANIFEST_LOG_TY_SET: u8 = 1;
@@ -206,10 +203,6 @@ struct Manifest {
     /// `manifest.log`. The in-memory `slots` map already reflects
     /// them; this queue is the recovery contract.
     pending_log: Vec<ManifestDelta>,
-    /// Durable state-machine recovery point, written into the v2
-    /// snapshot trailer and preserved across normal log compactions.
-    /// Default (empty `roots`) means no durable checkpoint exists yet.
-    durable: DurableManifest,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -827,46 +820,13 @@ impl BlobStore for FileBlobStore {
     fn needs_flush(&self) -> bool {
         self.data_needs_sync().is_some() || self.manifest_dirty.load(Ordering::Acquire)
     }
-
-    fn commit_durable_manifest(&self, meta: &DurableManifest) -> Result<()> {
-        let _io = self.data_io_lock.lock().unwrap();
-        // Data must be durable before the manifest names its slots — the
-        // same ordering `flush` relies on. The caller already wrote every
-        // durable-closure frame; here we make sure it reached the medium.
-        if let Some(epoch) = self.data_needs_sync() {
-            self.sync_data_file()?;
-            self.mark_data_synced(epoch);
-        }
-        let mut m = self.manifest.write().unwrap();
-        m.durable = meta.clone();
-        // A full atomic snapshot (tmp+rename) is the commit point; it
-        // supersedes the incremental log, so truncate it. The freed-slot
-        // queue becomes durably gone once the snapshot omits those slots.
-        m.persist_snapshot(&self.data_dir)?;
-        m.truncate_log()?;
-        m.pending_log.clear();
-        m.publish_pending_free_slots();
-        self.manifest_dirty.store(false, Ordering::Release);
-        Ok(())
-    }
-
-    fn load_durable_manifest(&self) -> Result<Option<DurableManifest>> {
-        let m = self.manifest.read().unwrap();
-        if m.durable.roots.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(m.durable.clone()))
-        }
-    }
 }
 
 impl Manifest {
     fn load_or_create(path: &Path, log_path: &Path) -> Result<Self> {
-        let (mut slots, mut next_slot, durable) = match File::open(path) {
+        let (mut slots, mut next_slot) = match File::open(path) {
             Ok(mut f) => Self::parse_snapshot(&mut f)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                (HashMap::new(), 0, DurableManifest::default())
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0),
             Err(e) => return Err(Error::BlobStoreIo(e)),
         };
 
@@ -886,11 +846,10 @@ impl Manifest {
             log_path: log_path.to_path_buf(),
             log_bytes: replay.valid_bytes,
             pending_log: Vec::new(),
-            durable,
         })
     }
 
-    fn parse_snapshot(f: &mut File) -> Result<(HashMap<BlobGuid, u64>, u64, DurableManifest)> {
+    fn parse_snapshot(f: &mut File) -> Result<(HashMap<BlobGuid, u64>, u64)> {
         // Header: magic 8 + version 2 + count 4 + reserved 2 + next_slot 8 = 24 B.
         let mut hdr = [0u8; 24];
         f.read_exact(&mut hdr)?;
@@ -923,48 +882,7 @@ impl Manifest {
             used_slots.push(s);
         }
         ReusableSlots::reconstruct(next_slot, &used_slots)?;
-        let durable = Self::parse_durable_trailer(f)?;
-        Ok((slots, next_slot, durable))
-    }
-
-    /// Read + verify the v2 durable state-machine trailer that follows
-    /// the slot table. The CRC covers `DMT2 .. last root entry`.
-    fn parse_durable_trailer(f: &mut File) -> Result<DurableManifest> {
-        let mut fixed = [0u8; 4 + 8 + 8 + 8 + 4];
-        f.read_exact(&mut fixed)?;
-        if fixed[..4] != DURABLE_TRAILER_MAGIC {
-            return Err(Error::node_corrupt(
-                "FileBlobStore::Manifest::trailer magic",
-            ));
-        }
-        let applied_index = u64::from_le_bytes(fixed[4..12].try_into().unwrap());
-        let next_seq = u64::from_le_bytes(fixed[12..20].try_into().unwrap());
-        let durable_epoch = u64::from_le_bytes(fixed[20..28].try_into().unwrap());
-        let root_count = u32::from_le_bytes(fixed[28..32].try_into().unwrap()) as usize;
-
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&fixed);
-        let mut roots = Vec::with_capacity(root_count);
-        let mut root_buf = [0u8; 8 + 16];
-        for _ in 0..root_count {
-            f.read_exact(&mut root_buf)?;
-            hasher.update(&root_buf);
-            let tree_id = u64::from_le_bytes(root_buf[..8].try_into().unwrap());
-            let mut guid: BlobGuid = [0u8; 16];
-            guid.copy_from_slice(&root_buf[8..24]);
-            roots.push((tree_id, guid));
-        }
-        let mut crc_buf = [0u8; 4];
-        f.read_exact(&mut crc_buf)?;
-        if u32::from_le_bytes(crc_buf) != hasher.finalize() {
-            return Err(Error::node_corrupt("FileBlobStore::Manifest::trailer crc"));
-        }
-        Ok(DurableManifest {
-            applied_index,
-            next_seq,
-            durable_epoch,
-            roots,
-        })
+        Ok((slots, next_slot))
     }
 
     fn allocate_slot(&mut self) -> u64 {
@@ -1043,24 +961,6 @@ impl Manifest {
             f.write_all(g)?;
             f.write_all(&s.to_le_bytes())?;
         }
-
-        // v2 durable state-machine trailer (preserved across compactions).
-        let mut trailer = Vec::with_capacity(32 + self.durable.roots.len() * 24 + 4);
-        trailer.extend_from_slice(&DURABLE_TRAILER_MAGIC);
-        trailer.extend_from_slice(&self.durable.applied_index.to_le_bytes());
-        trailer.extend_from_slice(&self.durable.next_seq.to_le_bytes());
-        trailer.extend_from_slice(&self.durable.durable_epoch.to_le_bytes());
-        let root_count = u32::try_from(self.durable.roots.len()).map_err(|_| {
-            Error::BlobStoreIo(io::Error::other("durable root count exceeds u32::MAX"))
-        })?;
-        trailer.extend_from_slice(&root_count.to_le_bytes());
-        for (tree_id, guid) in &self.durable.roots {
-            trailer.extend_from_slice(&tree_id.to_le_bytes());
-            trailer.extend_from_slice(guid);
-        }
-        let crc = crc32fast::hash(&trailer);
-        trailer.extend_from_slice(&crc.to_le_bytes());
-        f.write_all(&trailer)?;
 
         f.sync_all()?;
         drop(f);
@@ -1617,69 +1517,6 @@ mod tests {
         assert_eq!(dst.as_slice()[100], 10);
         b.read_blob(g2, &mut dst).unwrap();
         assert_eq!(dst.as_slice()[100], 11);
-    }
-
-    #[test]
-    fn durable_manifest_round_trips_through_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let root: BlobGuid = [0xD1; 16];
-        let meta = DurableManifest {
-            applied_index: 42,
-            next_seq: 1000,
-            durable_epoch: 7,
-            roots: vec![(0, root), (0x686f_6c74_6462_0001, [0xD2; 16])],
-        };
-        {
-            let Some(b) = try_open(dir.path()) else {
-                return;
-            };
-            b.write_blob(root, &buf_with(9)).unwrap();
-            b.flush().unwrap();
-            assert_eq!(b.load_durable_manifest().unwrap(), None); // none yet
-            b.commit_durable_manifest(&meta).unwrap();
-            assert_eq!(b.load_durable_manifest().unwrap(), Some(meta.clone()));
-        }
-        // The durable trailer survives reopen via manifest.bin.
-        let Some(b) = try_open(dir.path()) else {
-            return;
-        };
-        assert_eq!(b.load_durable_manifest().unwrap(), Some(meta));
-        let mut dst = AlignedBlobBuf::zeroed();
-        b.read_blob(root, &mut dst).unwrap();
-        assert_eq!(dst.as_slice()[100], 9);
-    }
-
-    #[test]
-    fn durable_trailer_preserved_across_snapshot_compaction() {
-        let dir = tempfile::tempdir().unwrap();
-        let root: BlobGuid = [0xD3; 16];
-        let meta = DurableManifest {
-            applied_index: 5,
-            next_seq: 50,
-            durable_epoch: 2,
-            roots: vec![(0, root)],
-        };
-        {
-            let Some(b) = try_open(dir.path()) else {
-                return;
-            };
-            b.write_blob(root, &buf_with(1)).unwrap();
-            b.flush().unwrap();
-            b.commit_durable_manifest(&meta).unwrap();
-            // A later blob + a full snapshot rewrite (the compaction path)
-            // must carry the durable trailer forward unchanged.
-            b.write_blob([0xD4; 16], &buf_with(2)).unwrap();
-            b.flush().unwrap();
-            {
-                let m = b.manifest.read().unwrap();
-                m.persist_snapshot(&b.data_dir).unwrap();
-            }
-            assert_eq!(b.load_durable_manifest().unwrap(), Some(meta.clone()));
-        }
-        let Some(b) = try_open(dir.path()) else {
-            return;
-        };
-        assert_eq!(b.load_durable_manifest().unwrap(), Some(meta));
     }
 
     #[test]

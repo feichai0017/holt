@@ -62,12 +62,6 @@ impl Snapshot {
         self.view.as_ref().expect("snapshot retired")
     }
 
-    /// GUID of this snapshot's copy-on-write root frame — recorded in the
-    /// durable manifest as a state-machine recovery root.
-    pub(crate) fn root_guid(&self) -> crate::layout::BlobGuid {
-        self.view().root_guid()
-    }
-
     /// Retire the snapshot now, releasing its hold on the fork barrier.
     /// Equivalent to dropping the handle, but explicit. Idempotent.
     pub fn retire(mut self) {

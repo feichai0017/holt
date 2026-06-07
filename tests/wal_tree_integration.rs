@@ -39,25 +39,6 @@ fn durable_cfg(dir: &std::path::Path) -> TreeConfig {
 }
 
 #[test]
-fn state_machine_mode_attaches_no_wal() {
-    // In state-machine mode the owner's log (e.g. Raft) is the source of
-    // truth: Holt attaches no WAL, so writes are served from memory and
-    // recovery is checkpoint + caller replay (not WAL replay).
-    let dir = tempdir().unwrap();
-    let mut cfg = TreeConfig::new(dir.path());
-    cfg.durability = Durability::StateMachine;
-    cfg.checkpoint.enabled = false;
-
-    let tree = Tree::open(cfg).unwrap();
-    tree.put(b"a", b"1").unwrap();
-    assert_eq!(tree.get(b"a").unwrap().as_deref(), Some(&b"1"[..]));
-    assert!(
-        !wal_path(dir.path()).exists(),
-        "state-machine mode must not write a WAL",
-    );
-}
-
-#[test]
 fn db_named_trees_replay_from_one_wal() {
     let dir = tempdir().unwrap();
     {

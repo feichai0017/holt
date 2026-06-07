@@ -24,7 +24,7 @@ use crate::engine::RangeEntry;
 use crate::journal::codec::BatchEncoder;
 use crate::journal::group_commit::Journal;
 use crate::layout::BlobGuid;
-use crate::store::blob_store::{BlobStore, DurableManifest};
+use crate::store::blob_store::BlobStore;
 use crate::store::BufferManager;
 
 const DB_ROOT_TAG: u8 = 0xDB;
@@ -56,10 +56,6 @@ struct CatalogEntry {
     state: CatalogState,
 }
 
-/// A captured durable snapshot set: `(tree_id, snapshot)` per family,
-/// plus the CoW epoch and `next_seq` observed under the capture freeze.
-type DurableCapture = (Vec<(u64, Snapshot)>, u64, u64);
-
 /// A storage instance containing multiple named [`Tree`] roots.
 ///
 /// Use `Tree` directly when one ART namespace is enough. Use `DB`
@@ -78,11 +74,6 @@ pub struct DB {
     open_stats: OpenStats,
     trees: Arc<Mutex<HashMap<u64, OpenTree>>>,
     catalog_cache: Arc<Mutex<HashMap<String, CatalogEntry>>>,
-    /// StateMachine durable recovery point held live: one CoW snapshot
-    /// per family (+ catalog) so writes fork past the on-disk durable
-    /// image instead of overwriting it. Swapped on each `commit_durable`,
-    /// established at reopen. `None` outside StateMachine durability.
-    durable_snapshot: Arc<Mutex<Option<Vec<Snapshot>>>>,
 }
 
 impl std::fmt::Debug for DB {
@@ -99,47 +90,26 @@ impl DB {
         let bm = Tree::open_buffer_manager(&cfg)?;
         let mut open_stats = OpenStats::default();
 
-        // StateMachine + file storage: recover from the durable manifest,
-        // not a WAL. Rehydrate each tree's fixed root from its durable
-        // snapshot root, then resume the epoch + seq above the durable
-        // point. An external log replays everything past `applied_index`.
-        let durable = if cfg.durability.is_state_machine() {
-            bm.load_durable_manifest()?
-        } else {
-            None
-        };
-
-        let (journal, next_seq) = if let Some(meta) = &durable {
-            for &(tree_id, durable_root) in &meta.roots {
-                bm.reopen_install_root(root_guid_for_tree_id(tree_id), durable_root)?;
+        let (journal, next_seq) = match cfg.wal_path() {
+            Some(path) => {
+                let next_seq = if path.exists() {
+                    let start = std::time::Instant::now();
+                    let (next_seq, replay_stats) =
+                        replay_wal(&path, &bm, |tree_id| Ok(root_guid_for_tree_id(tree_id)))?;
+                    open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
+                    open_stats.wal_replay_records = replay_stats.records_seen;
+                    open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        open_stats.wal_replay_bytes = meta.len();
+                    }
+                    next_seq
+                } else {
+                    1
+                };
+                let journal = Journal::open_or_create(&path, 0)?;
+                (Some(Arc::new(journal)), next_seq)
             }
-            bm.flush_inner()?;
-            bm.set_current_epoch(meta.durable_epoch);
-            (None, meta.next_seq.max(1))
-        } else {
-            // WAL durability attaches a journal and replays it; StateMachine
-            // with no durable manifest yet (or memory storage) starts empty.
-            match cfg.wal_path() {
-                Some(path) if cfg.durability.attach_wal() => {
-                    let next_seq = if path.exists() {
-                        let start = std::time::Instant::now();
-                        let (next_seq, replay_stats) =
-                            replay_wal(&path, &bm, |tree_id| Ok(root_guid_for_tree_id(tree_id)))?;
-                        open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
-                        open_stats.wal_replay_records = replay_stats.records_seen;
-                        open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
-                        if let Ok(meta) = std::fs::metadata(&path) {
-                            open_stats.wal_replay_bytes = meta.len();
-                        }
-                        next_seq
-                    } else {
-                        1
-                    };
-                    let journal = Journal::open_or_create(&path, 0)?;
-                    (Some(Arc::new(journal)), next_seq)
-                }
-                _ => (None, 1),
-            }
+            _ => (None, 1),
         };
 
         let maintenance_gate = Arc::new(Gate::new());
@@ -164,14 +134,7 @@ impl DB {
             open_stats,
             trees: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(Mutex::new(HashMap::new())),
-            durable_snapshot: Arc::new(Mutex::new(None)),
         };
-        // Hold a live snapshot at the durable image so the first post-reopen
-        // writes fork past it rather than overwriting durable frames in
-        // place (which a crash before the next commit_durable would not heal).
-        if durable.is_some() {
-            db.hold_durable_snapshot()?;
-        }
         db.stage_dropped_trees()?;
         Ok(db)
     }
@@ -330,119 +293,6 @@ impl DB {
         self.apply_atomic(batch.pending)
     }
 
-    /// Apply independent single-key conditional writes across families
-    /// **without** a cross-family atomic barrier, returning one `applied`
-    /// flag per buffered op (in buffer order).
-    ///
-    /// Each op runs on its own tree's per-key concurrent path — the same
-    /// `mutation_gate`-shared + endpoint-lock discipline as
-    /// [`Tree::put_if_absent`] / [`Tree::compare_and_put`] — so unrelated
-    /// keys never serialize against each other or against the coarse
-    /// [`Self::atomic`] gate. This is the create-heavy metadata path: a
-    /// logical op spanning several families (e.g. a dentry plus its
-    /// inode) decomposes into independent CAS that fan out concurrently.
-    ///
-    /// # Durability contract
-    ///
-    /// Only valid when durability is [`crate::Durability::StateMachine`];
-    /// otherwise returns [`Error::ScatterRequiresStateMachine`]. The fan-out
-    /// is non-atomic, so an external log must own the atomic + replay unit:
-    /// a crash mid-`scatter` is healed by replaying the owning log entry,
-    /// which re-runs the whole call. Each op is individually idempotent on
-    /// replay — `put_if_absent` of a present key, `compare_and_put` of a
-    /// superseded version, or `delete` of an absent key all report
-    /// `applied = false` rather than erroring, so the caller treats a
-    /// `false` on replay as "already applied". Under a local WAL, use
-    /// [`Self::atomic`] for multi-family writes.
-    pub fn scatter<F>(&self, build: F) -> Result<Vec<bool>>
-    where
-        F: FnOnce(&mut Scatter),
-    {
-        if !self.cfg.durability.is_state_machine() {
-            return Err(Error::ScatterRequiresStateMachine);
-        }
-        let mut scatter = Scatter::default();
-        build(&mut scatter);
-
-        let mut applied = Vec::with_capacity(scatter.ops.len());
-        let mut handles: HashMap<String, Tree> = HashMap::new();
-        for (name, op) in &scatter.ops {
-            if !handles.contains_key(name) {
-                let name_bytes = validate_tree_name(name)?;
-                let tree_id = self
-                    .catalog_lookup_live(name_bytes)?
-                    .ok_or_else(|| Error::TreeNotFound { name: name.clone() })?;
-                let open = self.open_tree_state(tree_id)?;
-                handles.insert(name.clone(), self.tree_from_state(tree_id, open)?);
-            }
-            let tree = &handles[name];
-            applied.push(apply_scatter_op(tree, op)?);
-        }
-        Ok(applied)
-    }
-
-    /// Apply independent single-key writes across families concurrently.
-    ///
-    /// This has the same StateMachine-only durability contract as
-    /// [`Self::scatter`], but it additionally rejects duplicate `(tree, key)`
-    /// pairs up front and then lets unrelated keys run through their own
-    /// per-key Holt write paths in parallel. Use this only when no buffered
-    /// op depends on the effect of an earlier op in the same scatter batch.
-    pub fn scatter_independent<F>(&self, build: F) -> Result<Vec<bool>>
-    where
-        F: FnOnce(&mut Scatter),
-    {
-        if !self.cfg.durability.is_state_machine() {
-            return Err(Error::ScatterRequiresStateMachine);
-        }
-        let mut scatter = Scatter::default();
-        build(&mut scatter);
-        if scatter.ops.is_empty() {
-            return Ok(Vec::new());
-        }
-        validate_scatter_independent(&scatter)?;
-
-        let mut handles: HashMap<String, Tree> = HashMap::new();
-        for (name, _) in &scatter.ops {
-            if !handles.contains_key(name) {
-                let name_bytes = validate_tree_name(name)?;
-                let tree_id = self
-                    .catalog_lookup_live(name_bytes)?
-                    .ok_or_else(|| Error::TreeNotFound { name: name.clone() })?;
-                let open = self.open_tree_state(tree_id)?;
-                handles.insert(name.clone(), self.tree_from_state(tree_id, open)?);
-            }
-        }
-
-        let mut results = (0..scatter.ops.len())
-            .map(|_| None)
-            .collect::<Vec<Option<Result<bool>>>>();
-        std::thread::scope(|scope| {
-            let mut joins = Vec::with_capacity(scatter.ops.len());
-            for (idx, (name, op)) in scatter.ops.into_iter().enumerate() {
-                let tree = handles
-                    .get(&name)
-                    .expect("scatter tree handles are resolved before workers")
-                    .clone();
-                joins.push(scope.spawn(move || (idx, apply_scatter_op(&tree, &op))));
-            }
-            for join in joins {
-                match join.join() {
-                    Ok((idx, result)) => results[idx] = Some(result),
-                    Err(_) => {
-                        return Err(Error::Internal("scatter_independent worker panicked"));
-                    }
-                }
-            }
-            Ok(())
-        })?;
-
-        results
-            .into_iter()
-            .map(|result| result.expect("scatter worker populated every result"))
-            .collect()
-    }
-
     /// Run a read-only transaction over explicit tree/prefix scopes.
     ///
     /// Holt captures every listed scope while holding each touched
@@ -534,20 +384,13 @@ impl DB {
         self.store.gc_sweep_unreachable(&reachable)
     }
 
-    /// Export a consistent point-in-time image of every live family for
-    /// the state-machine durability model: the owner (e.g. Raft) ships it
-    /// as a snapshot and installs it on a fresh node, then replays its log
-    /// from `applied_index`.
+    /// Export a consistent point-in-time image of every live family.
     ///
     /// Each family is captured with a copy-on-write snapshot taken under a
     /// brief all-families freeze, so the image is a single consistent
     /// instant; serialization then runs *outside* the freeze while live
     /// applies continue (forking the frames the snapshots reference).
-    ///
-    /// `applied_index` is recorded verbatim — the caller must hold its
-    /// apply loop quiescent so the captured state matches that index, and
-    /// must not create or drop trees concurrently.
-    pub fn export_checkpoint(&self, applied_index: u64) -> Result<CheckpointImage> {
+    pub fn export_checkpoint(&self) -> Result<CheckpointImage> {
         // Enumerate live families gate-free (the catalog range scan manages
         // its own maintenance gate; holding one here would deadlock it).
         let mut families: Vec<(Vec<u8>, u64, Tree)> = Vec::new();
@@ -584,7 +427,7 @@ impl DB {
         };
 
         // Serialize after releasing the freeze — applies resume here.
-        let mut buf = checkpoint::begin(applied_index, snaps.len() as u32);
+        let mut buf = checkpoint::begin(snaps.len() as u32);
         for (name, snap) in &snaps {
             let mut block = Vec::new();
             for entry in snap.range() {
@@ -598,15 +441,13 @@ impl DB {
     }
 
     /// Install a checkpoint produced by [`Self::export_checkpoint`] into
-    /// this (fresh) DB and return the image's `applied_index`. The owner
-    /// then replays its log from that index.
+    /// this fresh DB.
     ///
-    /// Intended for a fresh / wiped DB (node bootstrap or Raft
-    /// `InstallSnapshot`): every family is recreated and repopulated. On
-    /// error the partially-installed DB must be discarded and the install
-    /// retried — do not serve from a half-installed DB. Holt does not yet
-    /// provide online replacement of a live DB image.
-    pub fn install_checkpoint(&self, image: &CheckpointImage) -> Result<u64> {
+    /// Intended for a fresh / wiped DB: every family is recreated and
+    /// repopulated. On error the partially-installed DB must be discarded
+    /// and the install retried — do not serve from a half-installed DB.
+    /// Holt does not yet provide online replacement of a live DB image.
+    pub fn install_checkpoint(&self, image: &CheckpointImage) -> Result<()> {
         let decoded = checkpoint::decode(image.as_bytes())?;
         for (name, kv) in &decoded.families {
             let name = std::str::from_utf8(name)
@@ -616,122 +457,6 @@ impl DB {
                 tree.put(key, value)?;
             }
         }
-        Ok(decoded.applied_index)
-    }
-
-    /// Commit a crash-consistent durable checkpoint reflecting external
-    /// log index `applied_index` (StateMachine durability only).
-    ///
-    /// Captures a copy-on-write snapshot of every family under a brief
-    /// all-families freeze, persists the snapshot closure to disk, then
-    /// atomically commits a manifest naming those roots plus
-    /// `applied_index` and the resume `next_seq`. The manifest rename is
-    /// the commit point: a crash before it reopens at the previous
-    /// `applied_index`, a crash after it at this one — never a torn state.
-    /// On reopen the caller replays its external log past `applied_index`.
-    ///
-    /// The caller must hold its apply loop quiescent so the captured state
-    /// matches `applied_index`, and must not create/drop trees
-    /// concurrently. Returns [`Error::CommitDurableRequiresStateMachine`]
-    /// under [`crate::Durability::Wal`] (the WAL is the durable point
-    /// there) and [`Error::DurableManifestUnsupported`] on memory storage.
-    pub fn commit_durable(&self, applied_index: u64) -> Result<()> {
-        if !self.cfg.durability.is_state_machine() {
-            return Err(Error::CommitDurableRequiresStateMachine);
-        }
-        let families = self.durable_families()?;
-        let (snaps, durable_epoch, next_seq) = self.freeze_and_snapshot(&families)?;
-
-        // Persist every frame in the durable closure (snapshot roots + the
-        // children they reference) to the data file and fsync it.
-        Tree::checkpoint_shared_parts(
-            &self.store,
-            self.journal.as_ref(),
-            &self.maintenance_gate,
-            &self.commit_gate,
-        )?;
-
-        // Atomic manifest commit — the tmp+rename is the durable point.
-        let roots: Vec<(u64, BlobGuid)> =
-            snaps.iter().map(|(id, s)| (*id, s.root_guid())).collect();
-        self.store.commit_durable_manifest(&DurableManifest {
-            applied_index,
-            next_seq,
-            durable_epoch,
-            roots,
-        })?;
-
-        // Swap the held snapshot; retire the previous one only AFTER the
-        // rename, so its frames stay live until the new manifest is durable.
-        let prev = self
-            .durable_snapshot
-            .lock()
-            .unwrap()
-            .replace(snaps.into_iter().map(|(_, s)| s).collect());
-        if let Some(prev) = prev {
-            for snap in prev {
-                snap.retire();
-            }
-        }
-        Ok(())
-    }
-
-    /// The external log index the last committed durable checkpoint
-    /// reflects, or `0` if none was ever committed. After reopen this is
-    /// the index an external log replays past.
-    pub fn durable_applied_index(&self) -> Result<u64> {
-        Ok(self
-            .store
-            .load_durable_manifest()?
-            .map_or(0, |m| m.applied_index))
-    }
-
-    /// Live families (+ the catalog) as `(tree_id, Tree)` for a durable
-    /// snapshot. Gate-free — the catalog range scan manages its own gate.
-    fn durable_families(&self) -> Result<Vec<(u64, Tree)>> {
-        let mut families = Vec::new();
-        for (_, entry) in self.catalog_entries()? {
-            if entry.state == CatalogState::Live {
-                let open = self.open_tree_state(entry.tree_id)?;
-                families.push((entry.tree_id, self.tree_from_state(entry.tree_id, open)?));
-            }
-        }
-        families.push((DB_CATALOG_TREE_ID, self.catalog_tree()?));
-        Ok(families)
-    }
-
-    /// Freeze every family's writers (tree-id order, matching
-    /// `apply_atomic`/`export_checkpoint`) and snapshot each — one
-    /// consistent multi-tree instant. Returns the snapshots plus the CoW
-    /// epoch and `next_seq` captured under the freeze.
-    fn freeze_and_snapshot(&self, families: &[(u64, Tree)]) -> Result<DurableCapture> {
-        let mut gates: Vec<(u64, Arc<Gate>)> = families
-            .iter()
-            .map(|(id, t)| (*id, t.mutation_gate()))
-            .collect();
-        gates.sort_by_key(|(id, _)| *id);
-        gates.dedup_by_key(|(id, _)| *id);
-        let _guards: Vec<_> = gates
-            .iter()
-            .map(|(_, gate)| gate.enter_exclusive())
-            .collect();
-
-        let mut snaps = Vec::with_capacity(families.len());
-        for (tree_id, tree) in families {
-            snaps.push((*tree_id, tree.snapshot_unlocked(b"")?));
-        }
-        let epoch = self.store.current_epoch();
-        let next_seq = self.next_seq.load(Ordering::Acquire);
-        Ok((snaps, epoch, next_seq))
-    }
-
-    /// Establish the held durable snapshot at reopen so the first
-    /// post-reopen writes fork past the durable image (see the
-    /// `durable_snapshot` field).
-    fn hold_durable_snapshot(&self) -> Result<()> {
-        let families = self.durable_families()?;
-        let (snaps, _, _) = self.freeze_and_snapshot(&families)?;
-        *self.durable_snapshot.lock().unwrap() = Some(snaps.into_iter().map(|(_, s)| s).collect());
         Ok(())
     }
 
@@ -993,14 +718,9 @@ impl DB {
             .collect::<Vec<_>>();
         gates.sort_by_key(|(tree_id, _)| *tree_id);
         gates.dedup_by_key(|(tree_id, _)| *tree_id);
-        // StateMachine durability: an external log serializes writes, so
-        // the batch is the only writer and takes each family's gate shared
-        // (like a single-key write) rather than fencing out concurrent
-        // scans. Snapshot/view capture still fences via the exclusive gate.
-        let relaxed = self.cfg.durability.is_state_machine();
         let _tree_guards = gates
             .iter()
-            .map(|(_, gate)| gate.enter_batch(relaxed))
+            .map(|(_, gate)| gate.enter_batch())
             .collect::<Vec<_>>();
         let count = count_wal_ops(&groups);
         let base_seq = self.next_seq.fetch_add(count, Ordering::Relaxed);
@@ -1290,162 +1010,6 @@ impl DBAtomicBatch {
             tree_name: tree.to_owned(),
             op,
         });
-    }
-}
-
-/// One buffered op in a [`Scatter`]. Only the genuinely-independent
-/// single-key conditional writes are representable — rename and the
-/// `assert_*` guards need real atomicity and live on [`DBAtomicBatch`].
-#[derive(Debug, Clone)]
-enum ScatterOp {
-    Put {
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    PutIfAbsent {
-        key: Vec<u8>,
-        value: Vec<u8>,
-    },
-    CompareAndPut {
-        key: Vec<u8>,
-        expected: RecordVersion,
-        value: Vec<u8>,
-    },
-    Delete {
-        key: Vec<u8>,
-    },
-    DeleteIfVersion {
-        key: Vec<u8>,
-        expected: RecordVersion,
-    },
-}
-
-impl ScatterOp {
-    fn key(&self) -> &[u8] {
-        match self {
-            Self::Put { key, .. }
-            | Self::PutIfAbsent { key, .. }
-            | Self::CompareAndPut { key, .. }
-            | Self::Delete { key }
-            | Self::DeleteIfVersion { key, .. } => key,
-        }
-    }
-}
-
-/// Builder for [`DB::scatter`] — buffers independent single-key
-/// conditional writes that fan out across families with no atomic
-/// barrier. The `(tree, op)` order is preserved; `DB::scatter` returns
-/// one `applied` flag per buffered op in this order.
-#[derive(Debug, Default)]
-pub struct Scatter {
-    ops: Vec<(String, ScatterOp)>,
-}
-
-impl Scatter {
-    /// Buffer an unconditional put in `tree` (always `applied`).
-    pub fn put(&mut self, tree: &str, key: &[u8], value: &[u8]) {
-        self.ops.push((
-            tree.to_owned(),
-            ScatterOp::Put {
-                key: key.to_vec(),
-                value: value.to_vec(),
-            },
-        ));
-    }
-
-    /// Buffer a create-only put in `tree` (`applied = false` if a live
-    /// record already exists).
-    pub fn put_if_absent(&mut self, tree: &str, key: &[u8], value: &[u8]) {
-        self.ops.push((
-            tree.to_owned(),
-            ScatterOp::PutIfAbsent {
-                key: key.to_vec(),
-                value: value.to_vec(),
-            },
-        ));
-    }
-
-    /// Buffer a version-guarded update in `tree` (`applied = false` if the
-    /// live version no longer matches `expected`).
-    pub fn compare_and_put(
-        &mut self,
-        tree: &str,
-        key: &[u8],
-        expected: RecordVersion,
-        value: &[u8],
-    ) {
-        self.ops.push((
-            tree.to_owned(),
-            ScatterOp::CompareAndPut {
-                key: key.to_vec(),
-                expected,
-                value: value.to_vec(),
-            },
-        ));
-    }
-
-    /// Buffer a delete in `tree` (`applied = false` if the key was
-    /// already absent).
-    pub fn delete(&mut self, tree: &str, key: &[u8]) {
-        self.ops
-            .push((tree.to_owned(), ScatterOp::Delete { key: key.to_vec() }));
-    }
-
-    /// Buffer a version-guarded delete in `tree` (`applied = false` if the
-    /// live version no longer matches `expected`).
-    pub fn delete_if_version(&mut self, tree: &str, key: &[u8], expected: RecordVersion) {
-        self.ops.push((
-            tree.to_owned(),
-            ScatterOp::DeleteIfVersion {
-                key: key.to_vec(),
-                expected,
-            },
-        ));
-    }
-
-    /// Number of buffered operations.
-    pub fn len(&self) -> usize {
-        self.ops.len()
-    }
-
-    /// `true` when no operations have been buffered.
-    pub fn is_empty(&self) -> bool {
-        self.ops.is_empty()
-    }
-}
-
-fn validate_scatter_independent(scatter: &Scatter) -> Result<()> {
-    let mut seen = HashSet::with_capacity(scatter.ops.len());
-    for (tree, op) in &scatter.ops {
-        let key = op.key();
-        let mut identity = Vec::with_capacity(tree.len() + 1 + key.len());
-        identity.extend_from_slice(tree.as_bytes());
-        identity.push(0);
-        identity.extend_from_slice(key);
-        if !seen.insert(identity) {
-            return Err(Error::ScatterDuplicateKey {
-                tree: tree.clone(),
-                key_len: key.len(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn apply_scatter_op(tree: &Tree, op: &ScatterOp) -> Result<bool> {
-    match op {
-        ScatterOp::Put { key, value } => {
-            tree.put(key, value)?;
-            Ok(true)
-        }
-        ScatterOp::PutIfAbsent { key, value } => tree.put_if_absent(key, value),
-        ScatterOp::CompareAndPut {
-            key,
-            expected,
-            value,
-        } => tree.compare_and_put(key, *expected, value),
-        ScatterOp::Delete { key } => tree.delete(key),
-        ScatterOp::DeleteIfVersion { key, expected } => tree.delete_if_version(key, *expected),
     }
 }
 

@@ -17,13 +17,9 @@
 //! snapshots — are in place and covered by integration + property
 //! tests.
 //!
-//! Durability is a policy orthogonal to storage ([`Durability`]):
-//! [`Durability::Wal`] makes holt's own WAL the durable record
-//! (single node), while [`Durability::StateMachine`] cedes
-//! durability to an external log (e.g. Raft) and attaches no WAL —
-//! [`DB::commit_durable`] then pins a crash-consistent on-disk
-//! checkpoint and reopen replays only the log tail past
-//! [`DB::durable_applied_index`]. See `ROADMAP.md` for direction.
+//! [`Durability::Wal`] controls how Holt acknowledges its local
+//! write-ahead log. File-backed trees replay that WAL on open; manual
+//! and background checkpoints make older log records redundant.
 //!
 //! ## Quick taste
 //!
@@ -161,7 +157,7 @@ pub mod metrics;
 pub use api::builder::TreeBuilder;
 pub use api::checkpoint::CheckpointImage;
 pub use api::config::{Durability, Storage, TreeConfig};
-pub use api::db::{DBAtomicBatch, DBView, Scatter, DB};
+pub use api::db::{DBAtomicBatch, DBView, DB};
 pub use api::errors::{Error, Result};
 pub use api::key::{KeyPathBuf, KeyPathError, KeyPrefixBuf};
 pub use api::snapshot::Snapshot;
@@ -190,6 +186,4 @@ pub use checkpoint::CheckpointConfig;
 // Users implementing a custom `BlobStore` need `BlobGuid` to name
 // the blob they're storing.
 pub use layout::BlobGuid;
-pub use store::blob_store::{
-    AlignedBlobBuf, BlobStore, DurableManifest, FileBlobStore, MemoryBlobStore,
-};
+pub use store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};

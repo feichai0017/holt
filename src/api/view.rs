@@ -49,11 +49,6 @@ impl View {
         &self.scope
     }
 
-    /// GUID of the (copy-on-write) root frame this view reads from.
-    pub(crate) fn root_guid(&self) -> BlobGuid {
-        self.root_guid
-    }
-
     /// Look up `key` in the view snapshot.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         self.ensure_in_scope(key)?;

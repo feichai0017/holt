@@ -52,30 +52,16 @@ impl Gate {
 
     /// Acquire the gate for an atomic batch.
     ///
-    /// With `relaxed = false` the batch is **exclusive**: it fences out
-    /// concurrent readers (range scans, view capture) so they observe the
-    /// batch all-or-none. With `relaxed = true` an external log already
-    /// serializes writes (StateMachine durability), so the batch is the
-    /// only writer and need only coexist with readers — it enters
-    /// **shared**, like a single-key write, and no longer blocks scans
-    /// during apply. Snapshot/view capture still takes the exclusive
-    /// gate, so consistent point-in-time captures are unaffected.
-    pub(crate) fn enter_batch(&self, relaxed: bool) -> GateBatchGuard<'_> {
+    /// Atomic batches are **exclusive**: they fence out concurrent
+    /// readers (range scans, view capture) so readers observe the batch
+    /// all-or-none.
+    pub(crate) fn enter_batch(&self) -> GateBatchGuard<'_> {
         // Acquire via the typed guard, then `forget` it so its release
         // Drop is skipped — the returned `GateBatchGuard` takes over the
         // single matching release. (Forgetting a lock guard is safe: it
         // only suppresses the decrement, which we re-issue on drop.)
-        let exclusive = if relaxed {
-            std::mem::forget(self.enter_shared());
-            false
-        } else {
-            std::mem::forget(self.enter_exclusive());
-            true
-        };
-        GateBatchGuard {
-            gate: self,
-            exclusive,
-        }
+        std::mem::forget(self.enter_exclusive());
+        GateBatchGuard { gate: self }
     }
 
     pub(crate) fn enter_exclusive(&self) -> GateWriteGuard<'_> {
@@ -146,21 +132,15 @@ impl Drop for GateWriteGuard<'_> {
     }
 }
 
-/// Guard returned by [`Gate::enter_batch`] — releases the shared or
-/// exclusive hold the batch took, depending on `exclusive`.
+/// Guard returned by [`Gate::enter_batch`].
 #[derive(Debug)]
 pub(crate) struct GateBatchGuard<'a> {
     gate: &'a Gate,
-    exclusive: bool,
 }
 
 impl Drop for GateBatchGuard<'_> {
     fn drop(&mut self) {
-        if self.exclusive {
-            self.gate.leave_exclusive();
-        } else {
-            self.gate.leave_shared();
-        }
+        self.gate.leave_exclusive();
     }
 }
 
@@ -193,27 +173,9 @@ mod tests {
     }
 
     #[test]
-    fn relaxed_batch_does_not_block_shared_readers() {
-        let gate = Arc::new(Gate::new());
-        let batch = gate.enter_batch(true); // StateMachine: shared hold
-
-        let reader_gate = Arc::clone(&gate);
-        let (done_tx, done_rx) = sync_channel(0);
-        let reader = thread::spawn(move || {
-            let _shared = reader_gate.enter_shared();
-            done_tx.send(()).unwrap();
-        });
-        // A concurrent reader proceeds immediately — the relaxed batch
-        // does not fence shared entrants.
-        done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        drop(batch);
-        reader.join().unwrap();
-    }
-
-    #[test]
     fn exclusive_batch_blocks_shared_readers() {
         let gate = Arc::new(Gate::new());
-        let batch = gate.enter_batch(false); // Wal: exclusive hold
+        let batch = gate.enter_batch();
 
         let reader_gate = Arc::clone(&gate);
         let (started_tx, started_rx) = sync_channel(0);

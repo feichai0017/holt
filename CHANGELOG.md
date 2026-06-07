@@ -7,6 +7,21 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.5.4] — 2026-06-07
+
+### Removed
+
+- Removed the external-log state-machine surface from holt core:
+  `Durability::StateMachine`, `DB::commit_durable`,
+  `Tree::commit_durable`, `durable_applied_index`, `DB::scatter`,
+  `DB::scatter_independent`, and the file-store `DurableManifest`
+  trailer.
+- Checkpoint images are now pure DB archive/transfer images. They
+  contain family key/value data and no longer carry an external
+  `applied_index`.
+- Atomic DB/Tree batches always use the exclusive mutation gate again;
+  holt no longer has a StateMachine-only relaxed batch mode.
+
 ## [0.5.3] — 2026-06-07
 
 ### Fixed

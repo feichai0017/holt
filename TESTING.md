@@ -30,7 +30,6 @@ Run on every push and pull request:
 | `soak-db-normal` | Multi-thread named-tree DB lifecycle soak with cross-tree atomic batches, DB views, checkpoint, and reopen |
 | `soak-crash` | Repeated `SIGKILL` with sync WAL (`Durability::Wal { sync: true }`); every acknowledged write must survive reopen |
 | `soak-db-crash` | Repeated `SIGKILL` with sync WAL; every acknowledged cross-tree DB atomic transaction must survive replay as a whole |
-| `soak-sm-crash` | Repeated `SIGKILL` under `Durability::StateMachine` (**no WAL**); the recovered `durable_applied_index` must be internally consistent, never regress across crashes, and never fall below an acked `commit_durable` checkpoint |
 | `fuzz-long` | Time-bounded libFuzzer campaigns over the single-tree and multi-tree DB models |
 | `verified-model` | Manual Verus run for ART shape specs when a Verus binary is available |
 

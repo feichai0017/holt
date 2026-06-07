@@ -1,26 +1,22 @@
 //! Checkpoint image — a serialized, point-in-time image of a whole
-//! [`crate::DB`]: every live family's key/values plus the applied log
-//! index the image reflects.
+//! [`crate::DB`]: every live family's key/values.
 //!
 //! Produced by [`crate::DB::export_checkpoint`] and consumed by
-//! [`crate::DB::install_checkpoint`]. The owner (e.g. a Raft state
-//! machine) ships this to durable storage as its snapshot and installs
-//! it on a fresh node; recovery is then "install this image, replay the
-//! owner's log from `applied_index`". The byte layout is Holt's own and
-//! opaque to the caller — only [`CheckpointImage::applied_index`] is
-//! exposed.
+//! [`crate::DB::install_checkpoint`]. The image is an opaque Holt
+//! encoding for archive, transfer, and fresh-DB bootstrap. It carries
+//! no external log or replication metadata.
 //!
 //! Layout (little-endian):
 //! ```text
-//!   magic[8] "holtckp1" | applied_index:u64 | family_count:u32
+//!   magic[8] "holtdbi1" | family_count:u32
 //!   family*: name_len:u32 name | block_len:u32 block
 //!   block = (key_len:u32 key  val_len:u32 val)*
 //! ```
 
 use crate::api::errors::{Error, Result};
 
-const MAGIC: &[u8; 8] = b"holtckp1";
-const HEADER_LEN: usize = 8 + 8 + 4;
+const MAGIC: &[u8; 8] = b"holtdbi1";
+const HEADER_LEN: usize = 8 + 4;
 
 /// A serialized whole-`DB` checkpoint. See the module docs.
 #[derive(Debug, Clone)]
@@ -47,19 +43,13 @@ impl CheckpointImage {
         self.bytes
     }
 
-    /// The applied log index this checkpoint reflects.
-    pub fn applied_index(&self) -> Result<u64> {
-        Ok(parse_header(&self.bytes)?.0)
-    }
-
-    /// Validate the complete checkpoint image and return its applied index.
+    /// Validate the complete checkpoint image.
     ///
-    /// Unlike [`Self::applied_index`], this walks every encoded family and
-    /// key/value block, catching truncated bodies, trailing bytes, and
-    /// malformed length prefixes before a caller stages the image for
-    /// installation.
-    pub fn validate(&self) -> Result<u64> {
-        Ok(decode(&self.bytes)?.applied_index)
+    /// This walks every encoded family and key/value block, catching
+    /// truncated bodies, trailing bytes, and malformed length prefixes
+    /// before a caller stages the image for installation.
+    pub fn validate(&self) -> Result<()> {
+        decode(&self.bytes).map(|_| ())
     }
 
     pub(crate) fn from_raw(bytes: Vec<u8>) -> Self {
@@ -71,10 +61,9 @@ impl CheckpointImage {
 
 /// Start a checkpoint buffer with the header. Families are appended
 /// with [`put_family`].
-pub(crate) fn begin(applied_index: u64, family_count: u32) -> Vec<u8> {
+pub(crate) fn begin(family_count: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(HEADER_LEN);
     buf.extend_from_slice(MAGIC);
-    buf.extend_from_slice(&applied_index.to_le_bytes());
     buf.extend_from_slice(&family_count.to_le_bytes());
     buf
 }
@@ -101,13 +90,12 @@ fn corrupt(what: &'static str) -> Error {
     Error::node_corrupt(what)
 }
 
-fn parse_header(bytes: &[u8]) -> Result<(u64, u32)> {
+fn parse_header(bytes: &[u8]) -> Result<u32> {
     if bytes.len() < HEADER_LEN || &bytes[0..8] != MAGIC {
         return Err(corrupt("checkpoint image: bad magic or truncated header"));
     }
-    let applied_index = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    let family_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
-    Ok((applied_index, family_count))
+    let family_count = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+    Ok(family_count)
 }
 
 /// Read a `u32` length + that many bytes at `*off`, advancing `*off`.
@@ -131,15 +119,13 @@ pub(crate) type Kv<'a> = (&'a [u8], &'a [u8]);
 /// One decoded family: its name + key/values, borrowed from the image.
 pub(crate) type Family<'a> = (&'a [u8], Vec<Kv<'a>>);
 
-/// Decoded view of a checkpoint: applied index + the families. Borrows
-/// the image bytes.
+/// Decoded view of a checkpoint. Borrows the image bytes.
 pub(crate) struct Decoded<'a> {
-    pub applied_index: u64,
     pub families: Vec<Family<'a>>,
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded<'_>> {
-    let (applied_index, family_count) = parse_header(bytes)?;
+    let family_count = parse_header(bytes)?;
     let mut off = HEADER_LEN;
     let mut families = Vec::with_capacity(family_count as usize);
     for _ in 0..family_count {
@@ -157,8 +143,5 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded<'_>> {
     if off != bytes.len() {
         return Err(corrupt("checkpoint image: trailing bytes"));
     }
-    Ok(Decoded {
-        applied_index,
-        families,
-    })
+    Ok(Decoded { families })
 }

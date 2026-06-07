@@ -120,30 +120,6 @@ pub enum Error {
     /// DB trees share one buffer manager, so reclaiming unreachable
     /// frames safely needs a DB-wide pass rather than a single tree's.
     GcRequiresStandaloneTree,
-    /// [`crate::DB::scatter`] was called under [`crate::Durability::Wal`].
-    /// The non-atomic multi-family fast path is only sound when an
-    /// external log owns durability and replay (`StateMachine`); under a
-    /// local WAL a torn multi-family write has no replay to heal it, so
-    /// use [`crate::DB::atomic`] there.
-    ScatterRequiresStateMachine,
-    /// [`crate::DB::scatter_independent`] received two operations for the
-    /// same `(tree, key)`. Independent scatter requires one op per key so
-    /// parallel execution cannot change ordered scatter semantics.
-    ScatterDuplicateKey {
-        /// Tree containing the duplicate key.
-        tree: String,
-        /// Duplicate key length, reported without dumping user bytes.
-        key_len: usize,
-    },
-    /// [`crate::DB::commit_durable`] was called under
-    /// [`crate::Durability::Wal`]. The durable recovery point is the WAL
-    /// in that mode; `commit_durable` only applies when an external log
-    /// owns durability (`StateMachine`).
-    CommitDurableRequiresStateMachine,
-    /// A durable state-machine checkpoint was requested on a store that
-    /// cannot persist one (an in-memory store). `StateMachine` durable
-    /// recovery requires file-backed storage.
-    DurableManifestUnsupported,
 }
 
 impl Error {
@@ -244,22 +220,6 @@ impl std::fmt::Display for Error {
             Self::GcRequiresStandaloneTree => write!(
                 f,
                 "gc is only supported on standalone trees; trees opened through a DB share a buffer manager"
-            ),
-            Self::ScatterRequiresStateMachine => write!(
-                f,
-                "scatter requires StateMachine durability; use atomic under a local WAL"
-            ),
-            Self::ScatterDuplicateKey { tree, key_len } => write!(
-                f,
-                "scatter_independent duplicate key in tree {tree} ({key_len} bytes)"
-            ),
-            Self::CommitDurableRequiresStateMachine => write!(
-                f,
-                "commit_durable requires StateMachine durability; the WAL is the durable point under a local WAL"
-            ),
-            Self::DurableManifestUnsupported => write!(
-                f,
-                "durable state-machine checkpoint requires file-backed storage"
             ),
         }
     }

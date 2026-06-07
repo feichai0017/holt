@@ -38,25 +38,21 @@ pub enum Storage {
     Memory,
 }
 
-/// Who owns the durable log, and how Holt recovers.
+/// How Holt's local write-ahead log is acknowledged.
 ///
 /// Orthogonal to [`Storage`]: `Storage` is *where* blob frames live;
-/// `Durability` is *who* is the source of truth and how restart works.
+/// `Durability` is how the embedded engine acknowledges its own WAL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
-    /// Holt's write-ahead log is the source of truth (single node).
+    /// Holt's write-ahead log is the source of truth.
+    ///
     /// Recovery replays the WAL. `sync = true` fsyncs each write before
-    /// acking; `false` uses group commit (ack once the journal worker
-    /// queue accepts the record; fsync is batched).
+    /// acking; `false` uses async group commit where fsync is batched by
+    /// the journal worker.
     Wal {
         /// Per-write fsync before ack.
         sync: bool,
     },
-    /// An external log (e.g. Raft) is the source of truth and Holt is a
-    /// materialized state machine. No WAL is kept — recovery loads a
-    /// checkpoint via [`crate::DB::install_checkpoint`] and the owner
-    /// replays its log from there.
-    StateMachine,
 }
 
 impl Durability {
@@ -64,19 +60,6 @@ impl Durability {
     #[must_use]
     pub fn wal_sync(self) -> bool {
         matches!(self, Self::Wal { sync: true })
-    }
-
-    /// Whether the open path attaches and replays a Holt WAL.
-    #[must_use]
-    pub fn attach_wal(self) -> bool {
-        matches!(self, Self::Wal { .. })
-    }
-
-    /// Whether Holt is a materialized state machine — an external log
-    /// owns durability and recovery is checkpoint + caller replay.
-    #[must_use]
-    pub fn is_state_machine(self) -> bool {
-        matches!(self, Self::StateMachine)
     }
 }
 

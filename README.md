@@ -8,10 +8,10 @@
 
 > A carefully crafted **adaptive radix tree** for path-shaped metadata.
 
-> ⚠️ **Pre-1.0 (v0.5.3 released).** The public API is now narrow and
+> ⚠️ **Pre-1.0 (v0.5.4 released).** The public API is now narrow and
 > SemVer-stable inside a minor release, but minor releases may
 > still break source compatibility before 1.0. Pin the exact
-> published version in your `Cargo.toml` (`holt = "=0.5.3"`) until 1.0
+> published version in your `Cargo.toml` (`holt = "=0.5.4"`) until 1.0
 > stabilises the surface.
 
 `holt` is an embedded Rust library for storing **hierarchical
@@ -73,13 +73,11 @@ buffer manager, 3-thread background checkpointer, SIMD CRC32 + node
 scans, copy-on-write snapshots, and stateful `Tree::range` with prefix,
 `start_after`, and S3 delimiter rollup.
 
-**0.5** adds a two-axis durability model (`Durability::Wal` /
-`Durability::StateMachine`, orthogonal to storage) and the pieces a
-*replicated* metadata service needs: crash-consistent on-disk recovery
-with **no WAL** when an external log owns durability
-(`DB::commit_durable` / `durable_applied_index`), whole-DB checkpoint
-export/install, and the metadata-shaped fast paths `DB::scatter`,
-`Tree::put_many_if_absent`, and per-scan `ScanStats`. See the
+**0.5** keeps holt focused as an embedded metadata KV engine: local WAL
+durability with group commit, whole-DB checkpoint export/install,
+copy-on-write snapshots, `Tree::put_many_if_absent`, and per-scan
+`ScanStats`. Replication, external log replay, and shard ownership live
+above holt instead of inside the engine. See the
 [Durability](#durability) section below.
 
 See [`CHANGELOG.md`](CHANGELOG.md) for the release notes and
@@ -101,16 +99,15 @@ holt = "0.5"
 ```
 
 The supported user surface is deliberately small:
-`DB`, `DBAtomicBatch`, `DBView`, `Scatter`, `TreeBuilder`, `Tree`, `TreeConfig`,
+`DB`, `DBAtomicBatch`, `DBView`, `TreeBuilder`, `Tree`, `TreeConfig`,
 `Storage`, `Durability`, `RangeBuilder`, `RangeEntry`, `RangeIter`,
 `KeyRangeBuilder`, `KeyRangeEntry`, `KeyRangeIter`, `ScanStats`, `Snapshot`,
 `View`, `AtomicBatch`, `Record`, `RecordVersion`, `PutOutcome`,
 `KeyPathBuf`, `KeyPrefixBuf`, `KeyPathError`, `CheckpointConfig`,
 `CheckpointImage`, `TreeStats` / `DBStats` / related stats structs,
 `Error` / `Result`, and the custom-store surface (`BlobStore`,
-`MemoryBlobStore`, `FileBlobStore`, `AlignedBlobBuf`, `BlobGuid`,
-`DurableManifest`). Internal layout, WAL, walker, and buffer-manager
-modules are not public API.
+`MemoryBlobStore`, `FileBlobStore`, `AlignedBlobBuf`, `BlobGuid`). Internal
+layout, WAL, walker, and buffer-manager modules are not public API.
 
 ### Open a tree
 
@@ -293,13 +290,13 @@ tree.view(b"img/", |view| {
 
 ### Durability
 
-Durability is a policy orthogonal to storage — pick who owns the durable
-record with `TreeConfig::durability` / `TreeBuilder::durability`:
+Durability controls how holt acknowledges its local write-ahead log:
 
-**`Durability::Wal { sync }` — holt owns durability (single node).** Each write
-updates the BufferManager cache and appends one logical WAL record. `sync: false`
-(the default) returns after the group-commit worker queues the record; `sync: true`
-waits for `sync_data`, and concurrent writers share one fsync. Disk-truth advances at:
+**`Durability::Wal { sync }` — holt owns local durability.** Each write updates
+the BufferManager cache and appends one logical WAL record. `sync: false` (the
+default) returns after the group-commit worker queues the record; `sync: true`
+waits for `sync_data`, and concurrent writers share one fsync. Disk-truth
+advances at:
 
 - **Background checkpoint** — enabled by default for file-backed trees. It flushes
   the WAL, writes dirty blobs through to the store, syncs, applies pending deletes,
@@ -312,35 +309,20 @@ waits for `sync_data`, and concurrent writers share one fsync. Disk-truth advanc
 tree.checkpoint()?;   // flush WAL + write through + truncate
 ```
 
-**`Durability::StateMachine` — an external log owns durability (replicated).**
-For a replicated state machine (e.g. a Raft apply loop): holt attaches **no WAL**
-— the external log is the durable, replicated record. Writes apply to the
-BufferManager; you periodically pin a crash-consistent on-disk checkpoint with
-`commit_durable`, and on restart replay only the log *tail* past the recovered index:
+Whole-DB checkpoint images are ordinary holt archive/transfer artifacts. They
+carry families and key/value bytes, but no external log index or replication
+metadata:
 
 ```rust
-use holt::{Durability, TreeConfig, DB};
+use holt::{TreeConfig, DB};
 
-let mut cfg = TreeConfig::new("/var/lib/meta");
-cfg.durability = Durability::StateMachine;
-let db = DB::open(cfg.clone())?;
+let db = DB::open(TreeConfig::new("/var/lib/meta"))?;
+let image = db.export_checkpoint()?;
+image.validate()?;
 
-// ... apply committed log entries to the state machine, then pin a checkpoint:
-db.commit_durable(applied_index)?;          // atomic, crash-consistent on-disk point
-
-// After a crash, reopen and replay only the tail past the recovered index:
-let db = DB::open(cfg)?;
-let replay_from = db.durable_applied_index()?;   // re-apply entries > replay_from
+let restored = DB::open(TreeConfig::memory())?;
+restored.install_checkpoint(&image)?;
 ```
-
-`commit_durable` takes a copy-on-write snapshot, persists its frame closure, and
-atomically commits a manifest recording the durable roots plus `applied_index`
-and the resume sequence — the manifest rename is the commit point, so a crash
-lands on the previous or the new checkpoint, never a torn state (fault-injection
-and SIGKILL-soak tested). Two StateMachine-only fast paths exploit the external
-log already owning write order: `DB::scatter` (independent cross-family CAS with
-no atomic barrier, each on its own per-key concurrent path) and atomic batches
-that take the mutation gate *shared* instead of fencing concurrent range scans.
 
 ### Validation and observability
 

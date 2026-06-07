@@ -139,7 +139,7 @@ use dashmap::DashMap;
 use crate::api::errors::{Error, Result};
 use crate::layout::BlobGuid;
 
-use super::blob_store::{AlignedBlobBuf, BlobStore, DurableManifest};
+use super::blob_store::{AlignedBlobBuf, BlobStore};
 
 use admission::TinyLFU;
 pub use cached_blob::{BlobWriteGuard, CachedBlob};
@@ -1635,30 +1635,6 @@ impl BufferManager {
     /// phases.
     pub(crate) fn flush_inner(&self) -> Result<()> {
         self.store.flush()
-    }
-
-    /// Atomically commit `meta` as the store's durable state-machine
-    /// recovery point (file stores only; see [`DurableManifest`]).
-    pub(crate) fn commit_durable_manifest(&self, meta: &DurableManifest) -> Result<()> {
-        self.store.commit_durable_manifest(meta)
-    }
-
-    /// The durable recovery point recorded by the store, if any.
-    pub(crate) fn load_durable_manifest(&self) -> Result<Option<DurableManifest>> {
-        self.store.load_durable_manifest()
-    }
-
-    /// Rebuild a tree's fixed root from its durable snapshot root: read
-    /// the durable `source` frame, re-stamp its self-GUID to `fixed`, and
-    /// write it under `fixed`. Called only at reopen — single-threaded,
-    /// so overwriting the (possibly torn) live `fixed` slot is safe; the
-    /// durable image under `source` stays intact for re-recovery until
-    /// the next `commit_durable`.
-    pub(crate) fn reopen_install_root(&self, fixed: BlobGuid, source: BlobGuid) -> Result<()> {
-        let mut buf = self.store.alloc_blob_buf_zeroed();
-        self.store.read_blob(source, &mut buf)?;
-        crate::layout::set_frame_blob_guid(buf.as_mut_slice(), fixed);
-        self.store.write_blob(fixed, &buf)
     }
 
     /// Stage a freshly-created blob in cache and tag it dirty at
