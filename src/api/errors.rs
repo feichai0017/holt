@@ -6,6 +6,13 @@ use crate::store::{AllocError, FreeError};
 /// Result alias used throughout the crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+pub(crate) fn is_blob_store_not_found(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::BlobStoreIo(err) if err.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Top-level error type covering the union of every failure mode.
 ///
 /// Marked `#[non_exhaustive]` — new variants may be added in

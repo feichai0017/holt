@@ -32,7 +32,7 @@ use super::view::View;
 /// The snapshot is retired when the handle is dropped; hold it for as
 /// long as the stable view is needed.
 pub struct Snapshot {
-    view: View,
+    view: Option<View>,
     store: Arc<BufferManager>,
     epoch: u64,
     retired: bool,
@@ -41,7 +41,7 @@ pub struct Snapshot {
 impl Snapshot {
     pub(crate) fn new(view: View, store: Arc<BufferManager>, epoch: u64) -> Self {
         Self {
-            view,
+            view: Some(view),
             store,
             epoch,
             retired: false,
@@ -59,13 +59,13 @@ impl Snapshot {
     /// The underlying scoped read view.
     #[must_use]
     pub fn view(&self) -> &View {
-        &self.view
+        self.view.as_ref().expect("snapshot retired")
     }
 
     /// GUID of this snapshot's copy-on-write root frame — recorded in the
     /// durable manifest as a state-machine recovery root.
     pub(crate) fn root_guid(&self) -> crate::layout::BlobGuid {
-        self.view.root_guid()
+        self.view().root_guid()
     }
 
     /// Retire the snapshot now, releasing its hold on the fork barrier.
@@ -77,6 +77,7 @@ impl Snapshot {
     fn retire_inner(&mut self) {
         if !self.retired {
             self.retired = true;
+            drop(self.view.take());
             self.store.retire_snapshot(self.epoch);
         }
     }
@@ -86,7 +87,7 @@ impl Deref for Snapshot {
     type Target = View;
 
     fn deref(&self) -> &View {
-        &self.view
+        self.view()
     }
 }
 
@@ -100,7 +101,7 @@ impl std::fmt::Debug for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Snapshot")
             .field("epoch", &self.epoch)
-            .field("scope", &self.view.scope())
+            .field("scope", &self.view.as_ref().map(View::scope))
             .finish_non_exhaustive()
     }
 }

@@ -9,7 +9,7 @@
 //! little data, and each queued parent can collapse its direct
 //! children without forcing a whole-tree merge scan.
 
-use crate::api::errors::{Error, Result};
+use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::layout::{BlobNode, NodeType, BLOB_MAX_INLINE};
 use crate::store::{BlobFrame, BufferManager};
 
@@ -191,10 +191,19 @@ fn merge_at_blob_node(
         }
     }
     stats.inspected += 1;
-    if !is_mergeable(bm, frame, bn_slot)? {
+    let mergeable = match is_mergeable(bm, frame, bn_slot) {
+        Ok(mergeable) => mergeable,
+        Err(e) if is_blob_store_not_found(&e) => return Ok(bn_slot),
+        Err(e) => return Err(e),
+    };
+    if !mergeable {
         return Ok(bn_slot);
     }
-    let new_slot = merge_blob(bm, frame, bn_slot, seq)?;
+    let new_slot = match merge_blob(bm, frame, bn_slot, seq) {
+        Ok(new_slot) => new_slot,
+        Err(e) if is_blob_store_not_found(&e) => return Ok(bn_slot),
+        Err(e) => return Err(e),
+    };
     stats.merged += 1;
     Ok(new_slot)
 }

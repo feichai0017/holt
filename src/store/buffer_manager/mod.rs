@@ -412,12 +412,20 @@ impl BufferManager {
     fn reclaim_blob(&self, guid: BlobGuid) {
         {
             let state = self.mutation_shard(guid).lock().unwrap();
-            if state.checkpoint_owned_or_pending(&guid) {
+            if state.is_protected_or_pending(&guid) {
                 return;
             }
         }
-        if let Some((_, entry)) = self.cache.remove(&guid) {
+        if let Some((_, entry)) = self.cache.remove_if(&guid, |_, entry| {
+            if Arc::strong_count(entry) > 1 {
+                return false;
+            }
+            let state = self.mutation_shard(guid).lock().unwrap();
+            !state.is_protected_or_pending(&guid)
+        }) {
             entry.clear_dirty_hint();
+        } else if self.cache.contains_key(&guid) {
+            return;
         }
         self.route_resident.remove(guid);
         let mut state = self.mutation_shard(guid).lock().unwrap();
@@ -2622,6 +2630,31 @@ mod tests {
             .expect("COW reclaim must not drop checkpoint-owned bytes");
         assert_eq!(bytes.as_slice()[123], 0xAA);
         assert!(inner.has_blob(guid).unwrap());
+    }
+
+    #[test]
+    fn cow_reclaim_does_not_drop_pinned_cache_image() {
+        let inner: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
+        let guid = [0x56; 16];
+        inner.write_blob(guid, &make_buf(0)).unwrap();
+        let bm = BufferManager::new(inner.clone(), 1);
+        let pin = bm.pin(guid).unwrap();
+
+        bm.reclaim_blob(guid);
+
+        {
+            let mut guard = pin.write();
+            guard.as_mut_slice()[123] = 0xBB;
+        }
+        bm.mark_dirty_cached(guid, 10, pin.as_ref());
+
+        let snap = bm.snapshot_dirty();
+        let version = bm.snapshot_dirty_versions(&snap).unwrap()[0].content_version;
+        let bytes = bm
+            .snapshot_bytes_if_version(guid, version)
+            .unwrap()
+            .expect("pinned dirty image must stay reachable through cache");
+        assert_eq!(bytes.as_slice()[123], 0xBB);
     }
 
     #[test]

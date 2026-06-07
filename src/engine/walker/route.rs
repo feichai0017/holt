@@ -1,6 +1,6 @@
 //! Shared route-cache validation helpers.
 
-use crate::api::errors::{Error, Result};
+use crate::api::errors::Result;
 use crate::engine::RouteHit;
 use crate::layout::ROOT_BLOB_GUID;
 use crate::store::BlobFrameRef;
@@ -35,11 +35,4 @@ pub(super) fn pin_route_parent(
     } else {
         bm.pin(route.parent_guid)
     }
-}
-
-pub(super) fn route_pin_not_found(error: &Error) -> bool {
-    matches!(
-        error,
-        Error::BlobStoreIo(err) if err.kind() == std::io::ErrorKind::NotFound
-    )
 }

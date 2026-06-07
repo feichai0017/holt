@@ -39,7 +39,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::api::errors::{Error, Result};
+use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::engine;
 use crate::layout::BlobGuid;
 use crate::store::blob_store::{AlignedBlobBuf, BlobStore};
@@ -442,7 +442,11 @@ fn run_merge_pass(shared: &Arc<Shared>) -> Result<u64> {
             .journal
             .as_ref()
             .map(|_| shared.commit_gate.enter_writer());
-        let pin = shared.bm.pin(guid)?;
+        let pin = match shared.bm.pin(guid) {
+            Ok(pin) => pin,
+            Err(e) if is_blob_store_not_found(&e) => continue,
+            Err(e) => return Err(e),
+        };
         let (stats, has_children) = {
             let mut guard = pin.write();
             let mut frame = guard.frame();

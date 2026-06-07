@@ -1,7 +1,7 @@
 //! Insert path — `insert` / `insert_multi` + recursive
 //! `insert_at` dispatch + per-NodeType arms.
 
-use crate::api::errors::{Error, Result};
+use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::layout::{leaf_extent_size, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
 use std::sync::Arc;
 
@@ -10,7 +10,7 @@ use super::cow::{child_is_snapshot_shared, fork_child_if_shared};
 use super::lookup::lookup_at;
 use super::migrate::blob_needs_compaction;
 use super::readers::{ntype_of, read_leaf_key_ref, read_prefix};
-use super::route::{pin_route_parent, route_pin_not_found, validate_route_edge};
+use super::route::{pin_route_parent, validate_route_edge};
 use super::spillover::{compact_blob, spillover_blob};
 use super::types::{InsertCondition, InsertOutcome, InsertReturn, LookupResult};
 use super::writers::{
@@ -243,7 +243,7 @@ fn try_insert_from_optimistic_route(
 
     let parent_pin = match pin_route_parent(bm, root_pin, route) {
         Ok(pin) => pin,
-        Err(e) if route_pin_not_found(&e) => {
+        Err(e) if is_blob_store_not_found(&e) => {
             cache.invalidate(key, route);
             return Ok(None);
         }
@@ -262,7 +262,7 @@ fn try_insert_from_optimistic_route(
     }
     let child_pin = match bm.pin(route.child_guid) {
         Ok(pin) => pin,
-        Err(e) if route_pin_not_found(&e) => {
+        Err(e) if is_blob_store_not_found(&e) => {
             drop(parent_guard);
             cache.invalidate(key, route);
             return Ok(None);
@@ -470,7 +470,7 @@ fn try_insert_batch_from_route(
     let run_len = same_child_prefix_run_len(items, route.child_depth);
     let parent_pin = match pin_route_parent(bm, root_pin, route) {
         Ok(pin) => pin,
-        Err(e) if route_pin_not_found(&e) => {
+        Err(e) if is_blob_store_not_found(&e) => {
             cache.invalidate(first_key, route);
             return Ok(None);
         }
@@ -489,7 +489,7 @@ fn try_insert_batch_from_route(
     }
     let child_pin = match bm.pin(route.child_guid) {
         Ok(pin) => pin,
-        Err(e) if route_pin_not_found(&e) => {
+        Err(e) if is_blob_store_not_found(&e) => {
             drop(parent_guard);
             cache.invalidate(first_key, route);
             return Ok(None);

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::api::atomic::RecordVersion;
-use crate::api::errors::{Error, Result};
+use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::concurrency::Gate;
 use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
 use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
@@ -1414,7 +1414,9 @@ impl RangeIter {
                                 return Ok(InitResult::Ready);
                             }
                             self.stack[idx].next = 1;
-                            self.push_in_other_blob(child_guid, p_bytes.as_slice())?;
+                            if !self.push_in_other_blob(child_guid, p_bytes.as_slice())? {
+                                return Ok(InitResult::Restart);
+                            }
                         }
                     }
                 }
@@ -1699,7 +1701,9 @@ impl RangeIter {
                             )
                         };
                         self.stack[idx].next = 1;
-                        let child_pin = self.bm.pin_scan(child_guid)?;
+                        let Some(child_pin) = self.pin_scan_or_restart(child_guid)? else {
+                            return Ok(RangeAdvance::Restart);
+                        };
                         child_pin.prefetch_header();
                         let child_can_rollup = {
                             let guard = child_pin.read();
@@ -1792,10 +1796,21 @@ impl RangeIter {
         });
     }
 
-    fn push_in_other_blob(&mut self, child_guid: BlobGuid, prefix_bytes: &[u8]) -> Result<()> {
-        let child_pin = self.bm.pin_scan(child_guid)?;
+    fn push_in_other_blob(&mut self, child_guid: BlobGuid, prefix_bytes: &[u8]) -> Result<bool> {
+        let Some(child_pin) = self.pin_scan_or_restart(child_guid)? else {
+            return Ok(false);
+        };
         child_pin.prefetch_header();
-        self.push_pinned_other_blob(child_pin, child_guid, prefix_bytes)
+        self.push_pinned_other_blob(child_pin, child_guid, prefix_bytes)?;
+        Ok(true)
+    }
+
+    fn pin_scan_or_restart(&self, child_guid: BlobGuid) -> Result<Option<Arc<CachedBlob>>> {
+        match self.bm.pin_scan(child_guid) {
+            Ok(pin) => Ok(Some(pin)),
+            Err(e) if is_blob_store_not_found(&e) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn push_pinned_other_blob(

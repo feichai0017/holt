@@ -4,7 +4,7 @@
 //! [`BufferManager`] for the multi-blob variant) so the walker
 //! borrows into the cached buffer with **zero memcpy**.
 
-use crate::api::errors::{Error, Result};
+use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::engine::simd;
 use crate::engine::{RouteCache, RouteHit};
 use crate::layout::{
@@ -16,7 +16,7 @@ use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 
 use super::cast;
 use super::readers::{leaf_extent, resolve_typed};
-use super::route::{pin_route_parent, route_pin_not_found, validate_route_edge};
+use super::route::{pin_route_parent, validate_route_edge};
 use super::types::{BlobNodeCrossing, LookupHit, LookupResult};
 use super::SearchKey;
 
@@ -171,7 +171,7 @@ where
 {
     let parent_pin = match pin_route_parent(bm, root_pin, route) {
         Ok(pin) => pin,
-        Err(e) if route_pin_not_found(&e) => {
+        Err(e) if is_blob_store_not_found(&e) => {
             cache.invalidate(key, route);
             return Ok(RouteLookup::Stale);
         }
@@ -190,7 +190,7 @@ where
     }
     let child_pin = match bm.pin(route.child_guid) {
         Ok(pin) => pin,
-        Err(e) if route_pin_not_found(&e) => {
+        Err(e) if is_blob_store_not_found(&e) => {
             drop(parent_guard);
             cache.invalidate(key, route);
             return Ok(RouteLookup::Stale);

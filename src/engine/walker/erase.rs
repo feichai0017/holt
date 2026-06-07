@@ -1,7 +1,7 @@
 //! Erase path — `erase` / `erase_multi` + recursive `erase_at`
 //! dispatch + per-NodeType arms + collapse-on-lone-child rewiring.
 
-use crate::api::errors::{Error, Result};
+use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::layout::{BlobNode, NodeType, BLOB_MAX_INLINE};
 use std::sync::Arc;
 
@@ -11,7 +11,7 @@ use super::lookup::lookup_at;
 use super::readers::{
     ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48, read_prefix,
 };
-use super::route::{pin_route_parent, route_pin_not_found, validate_route_edge};
+use super::route::{pin_route_parent, validate_route_edge};
 use super::types::{EraseCondition, EraseOutcome, EraseReturn, EraseSignal, LookupResult};
 use super::writers::{
     finish_inner_with_sorted, inner_find_child, inner_update_child, set_prefix_child,
@@ -205,7 +205,7 @@ fn try_erase_from_route(
 
     let parent_pin = match pin_route_parent(bm, root_pin, route) {
         Ok(pin) => pin,
-        Err(e) if route_pin_not_found(&e) => {
+        Err(e) if is_blob_store_not_found(&e) => {
             cache.invalidate(key, route);
             return Ok(None);
         }
@@ -224,7 +224,7 @@ fn try_erase_from_route(
     }
     let child_pin = match bm.pin(route.child_guid) {
         Ok(pin) => pin,
-        Err(e) if route_pin_not_found(&e) => {
+        Err(e) if is_blob_store_not_found(&e) => {
             drop(parent_guard);
             cache.invalidate(key, route);
             return Ok(None);
