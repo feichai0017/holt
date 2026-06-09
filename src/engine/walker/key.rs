@@ -178,7 +178,12 @@ mod tests {
     #[test]
     fn fingerprint_is_non_zero_and_deterministic() {
         // Never 0 (0 is reserved for "no fingerprint" on the leaf).
-        for k in [&b""[..], b"a", b"hello", b"bucket-07/path/sub/file-0001.bin"] {
+        for k in [
+            &b""[..],
+            b"a",
+            b"hello",
+            b"bucket-07/path/sub/file-0001.bin",
+        ] {
             let fp = SearchKey::user(k).fingerprint();
             assert_ne!(fp, 0, "fingerprint must be non-zero for {k:?}");
             assert_eq!(fp, SearchKey::user(k).fingerprint(), "deterministic");

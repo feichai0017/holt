@@ -18,9 +18,9 @@ use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
 use super::cast;
 use super::readers::{child_offset, resolve_typed};
 use super::route::{pin_route_parent, validate_route_edge};
-use crate::store::decode_child_off;
 use super::types::{BlobNodeCrossing, LookupHit, LookupResult};
 use super::SearchKey;
+use crate::store::decode_child_off;
 
 /// Look up `key` in the tree whose root is the encoded offset
 /// `start_root` (depth 0).
@@ -37,7 +37,12 @@ pub(super) fn lookup<'a>(
     start_root: u16,
     key: &[u8],
 ) -> Result<LookupResult<'a>> {
-    descend(frame, decode_child_off(start_root), SearchKey::exact(key), 0)
+    descend(
+        frame,
+        decode_child_off(start_root),
+        SearchKey::exact(key),
+        0,
+    )
 }
 
 /// Continue a lookup at the encoded root `start_root` with a non-zero

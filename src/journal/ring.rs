@@ -150,8 +150,8 @@ unsafe impl Send for WalRing {}
 
 impl WalRing {
     /// Create a ring with the given capacity in bytes (rounded up to a power
-    /// of two, min 64). A record must fit in `capacity` (oversize fallback
-    /// is stage 5).
+    /// of two, min 64). Every record must fit in `capacity`; callers reject
+    /// larger records before reserving space.
     pub(crate) fn with_capacity(capacity_bytes: usize) -> Self {
         let cap = capacity_bytes.max(64).next_power_of_two();
         let buf = (0..cap)
@@ -205,7 +205,7 @@ impl WalRing {
         debug_assert_eq!(bytes.len(), ticket.len());
         debug_assert!(
             self.reserve_space_ready(ticket),
-            "ring overrun (stage 5: backpressure)"
+            "ring overrun: caller must wait for reserved space"
         );
         let cap = self.buf.len();
         let off = (ticket.start & self.mask) as usize;
@@ -299,7 +299,11 @@ impl WalRing {
         let adv = self.advance.lock().unwrap();
         debug_assert!(adv.pending.is_empty(), "unpublished intents at reset");
         let committed = self.committed_addr.load(Ordering::Relaxed);
-        debug_assert_eq!(self.tail.load(Ordering::Relaxed), committed, "tail not published");
+        debug_assert_eq!(
+            self.tail.load(Ordering::Relaxed),
+            committed,
+            "tail not published"
+        );
         debug_assert_eq!(
             self.flush_cursor.load(Ordering::Relaxed),
             committed,
@@ -394,7 +398,11 @@ mod tests {
 
         ring.fill(&t2, &r2);
         ring.publish(&t2);
-        assert_eq!(ring.committed_addr(), 0, "byte 0 interval missing => stalls");
+        assert_eq!(
+            ring.committed_addr(),
+            0,
+            "byte 0 interval missing => stalls"
+        );
         assert_eq!(ring.committed_records(), 0);
 
         ring.fill(&t3, &r3);
@@ -621,7 +629,9 @@ mod tests {
         let ring = Arc::new(WalRing::with_capacity(4096));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bg.wal");
-        let writer = Arc::new(Mutex::new(WalWriter::open_or_create(&path, tree_id).unwrap()));
+        let writer = Arc::new(Mutex::new(
+            WalWriter::open_or_create(&path, tree_id).unwrap(),
+        ));
         let stop = Arc::new(AtomicBool::new(false));
 
         let flusher = {
@@ -696,11 +706,21 @@ mod tests {
         let mut sink = Vec::new();
         ring.copy_committed_prefix(&mut |s| sink.extend_from_slice(s));
         assert_eq!(ring.committed_records(), 3);
-        assert_eq!((ring.tail(), ring.committed_addr(), ring.flush_cursor()), (60, 60, 60));
+        assert_eq!(
+            (ring.tail(), ring.committed_addr(), ring.flush_cursor()),
+            (60, 60, 60)
+        );
 
         ring.reset_after_drain();
-        assert_eq!((ring.tail(), ring.committed_addr(), ring.flush_cursor()), (0, 0, 0));
-        assert_eq!(ring.committed_records(), 3, "record count survives truncate reset");
+        assert_eq!(
+            (ring.tail(), ring.committed_addr(), ring.flush_cursor()),
+            (0, 0, 0)
+        );
+        assert_eq!(
+            ring.committed_records(),
+            3,
+            "record count survives truncate reset"
+        );
 
         let t = ring.append(&[9u8; 10]);
         assert_eq!(t.start, 0, "appends resume from byte 0 after reset");

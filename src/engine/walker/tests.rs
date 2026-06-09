@@ -65,7 +65,9 @@ fn replace_root_with_blob_node(buf: &mut AlignedBlobBuf, child_guid: BlobGuid) {
     let bn = BlobNode::new(b"", child_guid);
     // Write the BlobNode body by raw offset (the freshly-allocated body
     // has no `node_type` byte yet), then record the encoded root offset.
-    let body = frame.bytes_at_mut(off, std::mem::size_of::<BlobNode>() as u32).unwrap();
+    let body = frame
+        .bytes_at_mut(off, std::mem::size_of::<BlobNode>() as u32)
+        .unwrap();
     let bytes = unsafe {
         std::slice::from_raw_parts(
             std::ptr::from_ref(&bn).cast::<u8>(),
@@ -483,25 +485,19 @@ fn shrink_node16_to_node4_at_three_remaining() {
             let k = [b'k', b'0' + i];
             put(&mut frame, &k, &[i], i as u64 + 1);
         }
-        assert_eq!(
-            ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node16,
-        );
+        assert_eq!(ntype_at(&frame, inner_node_off(&frame)), NodeType::Node16,);
         // Erase two so 3 children remain live.
         del(&mut frame, b"k0");
         del(&mut frame, &[b'k', b'0' + 1]);
         // Inner node is still Node16 until compaction filters the
         // tombstones and rebuilds.
-        assert_eq!(
-            ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node16,
-        );
+        assert_eq!(ntype_at(&frame, inner_node_off(&frame)), NodeType::Node16,);
     }
     compact_in_place(&mut buf);
     let frame = BlobFrame::wrap(&mut buf);
     assert_eq!(
         ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node4,
+        NodeType::Node4,
         "Node16 with 3 live children should compact to Node4",
     );
     for i in 2..5u8 {
@@ -523,10 +519,7 @@ fn shrink_node48_to_node16_at_twelve_remaining() {
             let k = [b'p', i];
             put(&mut frame, &k, &[i], i as u64 + 1);
         }
-        assert_eq!(
-            ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node48,
-        );
+        assert_eq!(ntype_at(&frame, inner_node_off(&frame)), NodeType::Node48,);
         // Erase 8 so 12 live children remain.
         for i in 0..8u8 {
             let k = [b'p', i];
@@ -537,7 +530,7 @@ fn shrink_node48_to_node16_at_twelve_remaining() {
     let frame = BlobFrame::wrap(&mut buf);
     assert_eq!(
         ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node16,
+        NodeType::Node16,
         "Node48 with 12 live children should compact to Node16",
     );
     for i in 8..20u8 {
@@ -559,10 +552,7 @@ fn shrink_node256_to_node48_at_thirty_seven_remaining() {
             let k = [b'q', i];
             put(&mut frame, &k, &[i, i ^ 0xFF], i as u64 + 1);
         }
-        assert_eq!(
-            ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node256,
-        );
+        assert_eq!(ntype_at(&frame, inner_node_off(&frame)), NodeType::Node256,);
         // Erase 23 so 37 live children remain.
         for i in 0..23u8 {
             let k = [b'q', i];
@@ -573,7 +563,7 @@ fn shrink_node256_to_node48_at_thirty_seven_remaining() {
     let frame = BlobFrame::wrap(&mut buf);
     assert_eq!(
         ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node48,
+        NodeType::Node48,
         "Node256 with 37 live children should compact to Node48",
     );
     for i in 23..60u8 {
@@ -597,10 +587,7 @@ fn shrink_chain_node256_node48_node16_node4() {
             let k = [b'q', i];
             put(&mut frame, &k, &[i], i as u64 + 1);
         }
-        assert_eq!(
-            ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node256,
-        );
+        assert_eq!(ntype_at(&frame, inner_node_off(&frame)), NodeType::Node256,);
 
         // Erase 23 so 37 live children remain.
         for i in 0..23u8 {
@@ -610,10 +597,7 @@ fn shrink_chain_node256_node48_node16_node4() {
     compact_in_place(&mut buf);
     {
         let frame = BlobFrame::wrap(&mut buf);
-        assert_eq!(
-            ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node48,
-        );
+        assert_eq!(ntype_at(&frame, inner_node_off(&frame)), NodeType::Node48,);
     }
 
     {
@@ -626,10 +610,7 @@ fn shrink_chain_node256_node48_node16_node4() {
     compact_in_place(&mut buf);
     {
         let frame = BlobFrame::wrap(&mut buf);
-        assert_eq!(
-            ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node16,
-        );
+        assert_eq!(ntype_at(&frame, inner_node_off(&frame)), NodeType::Node16,);
     }
 
     {
@@ -641,10 +622,7 @@ fn shrink_chain_node256_node48_node16_node4() {
     }
     compact_in_place(&mut buf);
     let frame = BlobFrame::wrap(&mut buf);
-    assert_eq!(
-        ntype_at(&frame, inner_node_off(&frame)),
-            NodeType::Node4,
-    );
+    assert_eq!(ntype_at(&frame, inner_node_off(&frame)), NodeType::Node4,);
 
     // The last three keys (57, 58, 59) still readable.
     for i in 57..60u8 {

@@ -800,7 +800,9 @@ fn project_range_leaf(
             let (k, v) = leaf_extent(frame, off)?;
             (k, Some(v))
         }
-        RangeProjection::KeysOnly | RangeProjection::KeyRefs => (leaf_key_extent(frame, off)?, None),
+        RangeProjection::KeysOnly | RangeProjection::KeyRefs => {
+            (leaf_key_extent(frame, off)?, None)
+        }
     };
     let (tombstone, seq) = (leaf.tombstone, leaf.seq);
     if tombstone != 0 {
@@ -1954,7 +1956,11 @@ fn next_inner_child_ge(
             let min = min_byte.unwrap_or(0);
             for i in start..count {
                 if n.keys[i] >= min {
-                    return Ok(Some((n.keys[i], child_offset(n.children[i]), (i + 1) as u16)));
+                    return Ok(Some((
+                        n.keys[i],
+                        child_offset(n.children[i]),
+                        (i + 1) as u16,
+                    )));
                 }
             }
             Ok(None)
@@ -1966,7 +1972,11 @@ fn next_inner_child_ge(
             let min = min_byte.unwrap_or(0);
             for i in start..count {
                 if n.keys[i] >= min {
-                    return Ok(Some((n.keys[i], child_offset(n.children[i]), (i + 1) as u16)));
+                    return Ok(Some((
+                        n.keys[i],
+                        child_offset(n.children[i]),
+                        (i + 1) as u16,
+                    )));
                 }
             }
             Ok(None)
@@ -1985,7 +1995,11 @@ fn next_inner_child_ge(
                     "range::next_inner_child_ge: Node48 index out of range",
                 ));
             }
-            Ok(Some((b as u8, child_offset(n.children[ci]), (b + 1) as u16)))
+            Ok(Some((
+                b as u8,
+                child_offset(n.children[ci]),
+                (b + 1) as u16,
+            )))
         }
         NodeType::Node256 => {
             let n = read_node256(frame, off)?;
@@ -2021,7 +2035,11 @@ fn next_inner_child_from(
             if i >= count {
                 return Ok(None);
             }
-            Ok(Some((n.keys[i], child_offset(n.children[i]), (i + 1) as u16)))
+            Ok(Some((
+                n.keys[i],
+                child_offset(n.children[i]),
+                (i + 1) as u16,
+            )))
         }
         NodeType::Node16 => {
             let n = read_node16(frame, off)?;
@@ -2030,7 +2048,11 @@ fn next_inner_child_from(
             if i >= count {
                 return Ok(None);
             }
-            Ok(Some((n.keys[i], child_offset(n.children[i]), (i + 1) as u16)))
+            Ok(Some((
+                n.keys[i],
+                child_offset(n.children[i]),
+                (i + 1) as u16,
+            )))
         }
         NodeType::Node48 => {
             let n = read_node48(frame, off)?;
@@ -2048,7 +2070,11 @@ fn next_inner_child_from(
                     "range::next_inner_child: Node48 index out of range",
                 ));
             }
-            Ok(Some((b as u8, child_offset(n.children[ci]), (b + 1) as u16)))
+            Ok(Some((
+                b as u8,
+                child_offset(n.children[ci]),
+                (b + 1) as u16,
+            )))
         }
         NodeType::Node256 => {
             let n = read_node256(frame, off)?;

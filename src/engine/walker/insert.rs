@@ -20,8 +20,8 @@ use super::writers::{
 use super::SearchKey;
 use super::MAX_SPILLOVER_ATTEMPTS;
 use crate::engine::RouteCache;
-use crate::store::{decode_child_off, encode_child_off};
 use crate::store::BlobWriteGuard;
+use crate::store::{decode_child_off, encode_child_off};
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 // ---------- public entry points ----------
@@ -956,10 +956,7 @@ fn blob_node_insert_step(
     // before crossing to the unchanged child blob.
     let existing_tail = &prefix[common + 1..];
     let new_leaf = write_leaf(frame, key, value, seq)?;
-    let n4 = write_node4_with(
-        frame,
-        &[(existing_div_byte, off), (new_div_byte, new_leaf)],
-    )?;
+    let n4 = write_node4_with(frame, &[(existing_div_byte, off), (new_div_byte, new_leaf)])?;
     let final_off = if common == 0 {
         n4
     } else {
@@ -1105,9 +1102,9 @@ fn insert_into_leaf(
                     new_key.fingerprint(),
                 );
                 {
-                    let body = frame.body_at_offset_mut(leaf_off).ok_or(
-                        Error::node_corrupt("insert_into_leaf: leaf body (mut)"),
-                    )?;
+                    let body = frame
+                        .body_at_offset_mut(leaf_off)
+                        .ok_or(Error::node_corrupt("insert_into_leaf: leaf body (mut)"))?;
                     let hdr = unsafe {
                         std::slice::from_raw_parts(
                             std::ptr::from_ref::<Leaf>(&new_leaf).cast::<u8>(),

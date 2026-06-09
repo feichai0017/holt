@@ -408,10 +408,7 @@ fn clone_leaf(
     let total = src_body.len() as u32;
     debug_assert_eq!(
         total,
-        crate::layout::leaf_body_size(
-            u32::from(src_leaf.key_len),
-            u32::from(src_leaf.value_len),
-        )
+        crate::layout::leaf_body_size(u32::from(src_leaf.key_len), u32::from(src_leaf.value_len),)
     );
     let out = dst.alloc_leaf(total)?;
     let dst_off = dst
@@ -439,7 +436,8 @@ fn clone_prefix(
 ) -> Result<Option<u32>> {
     let p = *cast::<Prefix>(src_body);
     let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
-    let Some(new_child_off) = clone_subtree(src, dst, child_offset(p.child as u16), filter_tombstones)?
+    let Some(new_child_off) =
+        clone_subtree(src, dst, child_offset(p.child as u16), filter_tombstones)?
     else {
         return Ok(None);
     };
@@ -463,8 +461,7 @@ fn clone_node4(
     if filter_tombstones {
         let mut survivors: Vec<(u8, u32)> = Vec::with_capacity(count);
         for i in 0..count {
-            if let Some(new_child) =
-                clone_subtree(src, dst, child_offset(src_n.children[i]), true)?
+            if let Some(new_child) = clone_subtree(src, dst, child_offset(src_n.children[i]), true)?
             {
                 survivors.push((src_n.keys[i], new_child));
             }
@@ -501,8 +498,7 @@ fn clone_node16(
     if filter_tombstones {
         let mut survivors: Vec<(u8, u32)> = Vec::with_capacity(count);
         for i in 0..count {
-            if let Some(new_child) =
-                clone_subtree(src, dst, child_offset(src_n.children[i]), true)?
+            if let Some(new_child) = clone_subtree(src, dst, child_offset(src_n.children[i]), true)?
             {
                 survivors.push((src_n.keys[i], new_child));
             }

@@ -23,8 +23,8 @@ use super::writers::{
 };
 use super::SearchKey;
 use crate::engine::{simd, RouteCache};
-use crate::store::{decode_child_off, encode_child_off};
 use crate::store::BlobWriteGuard;
+use crate::store::{decode_child_off, encode_child_off};
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 // ---------- public entry points ----------
@@ -460,9 +460,7 @@ fn erase_at_step(
             mutated: false,
         })),
         NodeType::Leaf => erase_at_leaf(frame, off, key, condition).map(EraseStep::Done),
-        NodeType::Prefix => {
-            erase_at_prefix_step(frame, off, key, depth, condition, allow_crossing)
-        }
+        NodeType::Prefix => erase_at_prefix_step(frame, off, key, depth, condition, allow_crossing),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
             erase_at_inner_step(frame, off, ntype, key, depth, condition, allow_crossing)
         }

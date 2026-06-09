@@ -7,6 +7,40 @@ versioning follows [Semantic Versioning](https://semver.org/).
 For design background see [ARCHITECTURE.md](ARCHITECTURE.md);
 fine-grained per-commit history is in `git log`.
 
+## [0.6.0] — 2026-06-10
+
+### Added
+
+- Added a shared in-memory WAL byte ring as the only append path. Foreground
+  writers reserve byte ranges concurrently, copy encoded records directly into
+  the ring, and a single flusher drains committed byte prefixes to the WAL file.
+- Added loom coverage and crash-soak validation for the WAL ring's
+  reserve/publish/flush ordering, including multi-publisher gap-safety checks.
+
+### Changed
+
+- Flattened leaf storage and child addressing for the persistent ART layout:
+  small records can stay inline, child body offsets are stored directly, and
+  inner-node child scans use compact `u16` addressing with SIMD fast paths.
+- Reworked the WAL group-commit plumbing around ring backpressure instead of a
+  per-record channel/worker handoff, reducing the concurrent durable write
+  bottleneck while preserving the existing WAL record format and replay reader.
+- Tightened journal validation so empty or over-capacity records are rejected
+  before reservation instead of relying on debug-only assertions.
+
+### Removed
+
+- Removed the legacy WAL channel backend and its transitional design documents.
+  The ring-backed journal is now the only implementation.
+- Removed rejected experiment notes that were no longer part of the supported
+  architecture.
+
+### Validation
+
+- `cargo test --workspace --all-features --locked`
+- `cargo clippy --workspace --all-features --all-targets --locked -- -D warnings`
+- `RUSTFLAGS="--cfg loom" cargo test -p holt --lib journal::ring::loom --locked`
+
 ## [0.5.4] — 2026-06-07
 
 ### Removed

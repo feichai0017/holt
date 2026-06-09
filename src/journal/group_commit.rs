@@ -132,7 +132,8 @@ impl Shared {
         // which (addr-before-records publish ordering) is >= end(rc), so the
         // copy drains >= rc records and `base + rc` is a safe lower bound.
         let rc = self.ring.committed_records();
-        let want_sync = self.sync_target.load(Ordering::Acquire) > self.flushed.load(Ordering::Acquire);
+        let want_sync =
+            self.sync_target.load(Ordering::Acquire) > self.flushed.load(Ordering::Acquire);
 
         let mut sink_err: Option<&'static str> = None;
         let mut freed_space = false;
@@ -149,7 +150,8 @@ impl Shared {
                 return;
             }
             if copied > 0 {
-                self.written.fetch_max(self.record_base + rc, Ordering::AcqRel);
+                self.written
+                    .fetch_max(self.record_base + rc, Ordering::AcqRel);
                 self.batches.fetch_add(1, Ordering::Relaxed);
                 freed_space = true;
             }
@@ -160,7 +162,8 @@ impl Shared {
                     return;
                 }
                 self.syncs.fetch_add(1, Ordering::Relaxed);
-                self.flushed.fetch_max(self.record_base + rc, Ordering::AcqRel);
+                self.flushed
+                    .fetch_max(self.record_base + rc, Ordering::AcqRel);
             }
         }
         if want_sync {
@@ -316,12 +319,14 @@ impl Journal {
         if let Some(m) = self.shared.sticky_err() {
             return Err(Error::Internal(m));
         }
-        debug_assert!(
-            !bytes.is_empty() && bytes.len() as u64 <= self.shared.ring.capacity(),
-            "record must be non-empty and fit the ring (oversize fallback is stage 5)"
-        );
-        // Reserve → backpressure wait → memcpy → publish. Stage-1 ring has no
-        // built-in backpressure (stage 5); spin on the flusher freeing RAM.
+        if bytes.is_empty() {
+            return Err(Error::Internal("journal record must not be empty"));
+        }
+        if bytes.len() as u64 > self.shared.ring.capacity() {
+            return Err(Error::Internal("journal record exceeds WAL ring capacity"));
+        }
+        // Reserve → backpressure wait → memcpy → publish. Backpressure parks on
+        // the flusher advancing `flush_cursor`, so a full ring does not spin.
         let ticket = self.shared.ring.reserve(bytes.len() as u64);
         if !self.shared.ring.reserve_space_ready(&ticket) {
             self.shared.wait_for_ring_space(&ticket)?;
@@ -370,12 +375,15 @@ impl Journal {
             .map_err(|_| Error::Internal("journal flusher stopped before truncate"))?;
         rx.recv()
             .map_err(|_| Error::Internal("journal flusher dropped truncate acknowledgement"))??;
-        self.shared.checkpointed.fetch_max(observed, Ordering::AcqRel);
+        self.shared
+            .checkpointed
+            .fetch_max(observed, Ordering::AcqRel);
         Ok(())
     }
 
     pub(crate) fn needs_checkpoint(&self) -> bool {
-        self.shared.queued.load(Ordering::Acquire) != self.shared.checkpointed.load(Ordering::Acquire)
+        self.shared.queued.load(Ordering::Acquire)
+            != self.shared.checkpointed.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -484,7 +492,10 @@ mod tests {
 
         journal.truncate().unwrap();
         assert!(!journal.needs_checkpoint());
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), FILE_HEADER_SIZE as u64);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            FILE_HEADER_SIZE as u64
+        );
 
         let syncs_after_truncate = journal.stats().syncs;
         journal.flush_up_to(journal.queued_work()).unwrap();
@@ -528,6 +539,21 @@ mod tests {
         assert_eq!(journal.stats().syncs, 1);
         assert_eq!(journal.stats().appends, 1);
         assert!(journal.stats().batches >= 1);
+    }
+
+    #[test]
+    fn invalid_record_size_is_rejected_without_poisoning_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open_or_create(&dir.path().join("journal.wal"), 0).unwrap();
+
+        assert!(journal.submit(Vec::new(), false).is_err());
+        assert!(journal
+            .submit(vec![0; RING_CAPACITY_BYTES + 1], false)
+            .is_err());
+
+        journal.submit(vec![1, 2, 3, 4], false).unwrap();
+        journal.flush_up_to(journal.queued_work()).unwrap();
+        assert_eq!(journal.stats().appends, 1);
     }
 
     #[test]

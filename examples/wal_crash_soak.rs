@@ -38,7 +38,11 @@ fn value(i: u64) -> Vec<u8> {
 }
 
 fn parse_index(k: &[u8]) -> Option<u64> {
-    std::str::from_utf8(k).ok()?.strip_prefix("obj/")?.parse().ok()
+    std::str::from_utf8(k)
+        .ok()?
+        .strip_prefix("obj/")?
+        .parse()
+        .ok()
 }
 
 /// Child: open the tree and write `0,1,2,…` forever until SIGKILL'd.

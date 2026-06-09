@@ -64,7 +64,10 @@ pub fn encode_child_off(byte_offset: u32) -> u16 {
     );
     debug_assert!(byte_offset < PAGE_SIZE, "child body offset past page");
     let biased = byte_offset / 8 - DATA_BASE_DIV8 + 1;
-    debug_assert!(biased >= 1, "encoded child offset must never be the 0 sentinel");
+    debug_assert!(
+        biased >= 1,
+        "encoded child offset must never be the 0 sentinel"
+    );
     debug_assert!(biased <= MAX_CHILD_BIAS);
     biased as u16
 }
@@ -201,7 +204,6 @@ pub struct AllocOutcome {
     /// 1-based slot index of the allocated body.
     pub slot: u16,
 }
-
 
 /// Read-only typed view over a `PAGE_SIZE`-byte buffer.
 ///

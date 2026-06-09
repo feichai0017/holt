@@ -1,6 +1,6 @@
 [package]
 name = "holt"
-version = "0.5.4"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.82"
 autobenches = false
@@ -19,7 +19,7 @@ members = [".", "crates/holt-ffi"]
 exclude = ["benches", "fuzz", "tools/soak", "verified"]
 
 [dependencies]
-# Bounded channels for the background checkpointer threads.
+# Control channels for the journal flusher and background checkpointer threads.
 crossbeam-channel = "0.5"
 # Sharded blob cache map for the BufferManager.
 dashmap = "6"

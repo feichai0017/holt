@@ -8,10 +8,10 @@
 
 > A carefully crafted **adaptive radix tree** for path-shaped metadata.
 
-> ⚠️ **Pre-1.0 (v0.5.4 released).** The public API is now narrow and
+> ⚠️ **Pre-1.0 (v0.6.0 released).** The public API is now narrow and
 > SemVer-stable inside a minor release, but minor releases may
 > still break source compatibility before 1.0. Pin the exact
-> published version in your `Cargo.toml` (`holt = "=0.5.4"`) until 1.0
+> published version in your `Cargo.toml` (`holt = "=0.6.0"`) until 1.0
 > stabilises the surface.
 
 `holt` is an embedded Rust library for storing **hierarchical
@@ -73,10 +73,11 @@ buffer manager, 3-thread background checkpointer, SIMD CRC32 + node
 scans, copy-on-write snapshots, and stateful `Tree::range` with prefix,
 `start_after`, and S3 delimiter rollup.
 
-**0.5** keeps holt focused as an embedded metadata KV engine: local WAL
-durability with group commit, whole-DB checkpoint export/install,
-copy-on-write snapshots, `Tree::put_many_if_absent`, and per-scan
-`ScanStats`. Replication, external log replay, and shard ownership live
+**0.6** keeps holt focused as an embedded metadata KV engine while
+moving the persistent write path to a shared WAL byte ring. Local WAL
+durability, whole-DB checkpoint export/install, copy-on-write snapshots,
+`Tree::put_many_if_absent`, and per-scan `ScanStats` remain the core
+surface. Replication, external log replay, and shard ownership live
 above holt instead of inside the engine. See the
 [Durability](#durability) section below.
 
@@ -95,7 +96,7 @@ Add holt to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-holt = "0.5"
+holt = "0.6"
 ```
 
 The supported user surface is deliberately small:

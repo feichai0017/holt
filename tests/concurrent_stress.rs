@@ -109,7 +109,8 @@ fn concurrent_put_overwrite_delete_is_consistent() {
             }
             for i in 0..PER_THREAD {
                 // grow the value to force a realloc-not-in-place path
-                tree.put(&key(t, i), &val(t, i, 2_000_000_000)).expect("put2");
+                tree.put(&key(t, i), &val(t, i, 2_000_000_000))
+                    .expect("put2");
             }
             for i in (0..PER_THREAD).step_by(2) {
                 assert!(tree.delete(&key(t, i)).expect("delete"));
@@ -180,7 +181,10 @@ fn concurrent_overlapping_writes_no_torn_values() {
         let wi: usize = parts[1].parse().expect("bad index tag (torn)");
         let wr: u64 = parts[2].parse().expect("bad round tag (torn)");
         assert!(wt < THREADS, "impossible thread tag {wt}");
-        assert_eq!(wi, i, "value belongs to a different key (corruption): {s:?}");
+        assert_eq!(
+            wi, i,
+            "value belongs to a different key (corruption): {s:?}"
+        );
         assert!((wr as usize) < ROUNDS, "impossible round tag {wr}");
     }
 }

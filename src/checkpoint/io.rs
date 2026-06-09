@@ -621,7 +621,9 @@ mod tests {
             let node = BlobNode::new(&[], child);
             // Write the BlobNode body by raw offset (its `node_type` byte
             // isn't set yet, so `body_at_offset_mut` can't resolve it).
-            let body = frame.bytes_at_mut(off, size_of::<BlobNode>() as u32).unwrap();
+            let body = frame
+                .bytes_at_mut(off, size_of::<BlobNode>() as u32)
+                .unwrap();
             let bytes = unsafe {
                 std::slice::from_raw_parts(std::ptr::from_ref(&node).cast(), size_of::<BlobNode>())
             };

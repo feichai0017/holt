@@ -562,7 +562,9 @@ pub(super) fn abandon_subtree(frame: &mut BlobFrame<'_>, root: u32) -> Result<()
     // recursion reads a stable view.
     let body_copy = frame
         .body_at_offset(root)
-        .ok_or(Error::node_corrupt("abandon_subtree: body resolution failed"))?
+        .ok_or(Error::node_corrupt(
+            "abandon_subtree: body resolution failed",
+        ))?
         .to_vec();
 
     match ntype {
