@@ -692,6 +692,34 @@ impl BufferManager {
         self.telemetry.silent_full_blob_reads()
     }
 
+    /// Cold sidecar lookups that returned the requested leaf without
+    /// loading the full blob frame.
+    #[must_use]
+    pub fn cold_lookup_hits(&self) -> u64 {
+        self.telemetry.cold_lookup_hits()
+    }
+
+    /// Cold sidecar lookups that proved the key was absent from the
+    /// child blob.
+    #[must_use]
+    pub fn cold_lookup_negatives(&self) -> u64 {
+        self.telemetry.cold_lookup_negatives()
+    }
+
+    /// Cold sidecar lookups that resolved only the next child
+    /// crossing.
+    #[must_use]
+    pub fn cold_lookup_crossings(&self) -> u64 {
+        self.telemetry.cold_lookup_crossings()
+    }
+
+    /// Cold sidecar probes that could not answer and fell back to
+    /// the normal blob pin path.
+    #[must_use]
+    pub fn cold_lookup_fallbacks(&self) -> u64 {
+        self.telemetry.cold_lookup_fallbacks()
+    }
+
     /// Cumulative optimistic-read restarts. Bumped by the lookup
     /// walker every time a `validate()` after a wait-free read
     /// returns `false` — a concurrent writer lapped the snapshot
@@ -1127,15 +1155,24 @@ impl BufferManager {
         depth: usize,
     ) -> Result<ColdBlobLookup> {
         if self.is_pending_delete(guid) || self.cache.contains_key(&guid) {
+            self.telemetry.note_cold_lookup_fallback();
             return Ok(ColdBlobLookup::Unknown);
         }
         {
             let state = self.mutation_shard(guid).lock().unwrap();
             if state.is_protected_or_pending(&guid) {
+                self.telemetry.note_cold_lookup_fallback();
                 return Ok(ColdBlobLookup::Unknown);
             }
         }
-        self.store.cold_lookup_blob(guid, key, depth)
+        let lookup = self.store.cold_lookup_blob(guid, key, depth)?;
+        match &lookup {
+            ColdBlobLookup::Found { .. } => self.telemetry.note_cold_lookup_hit(),
+            ColdBlobLookup::NotFound => self.telemetry.note_cold_lookup_negative(),
+            ColdBlobLookup::Crossing { .. } => self.telemetry.note_cold_lookup_crossing(),
+            ColdBlobLookup::Unknown => self.telemetry.note_cold_lookup_fallback(),
+        }
+        Ok(lookup)
     }
 
     fn note_full_blob_read(&self, access: PinAccess) {

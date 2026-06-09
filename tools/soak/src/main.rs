@@ -672,6 +672,7 @@ fn print_stats(label: &str, tree: &Tree, progress: u64) -> Result<()> {
          \"blobs\":{},\"dirty\":{},\"pending_delete\":{},\"bm_hits\":{},\
          \"bm_misses\":{},\"bm_reads\":{},\"bm_read_bytes\":{},\
          \"bm_point_reads\":{},\"bm_scan_reads\":{},\"bm_silent_reads\":{},\
+         \"cold_hits\":{},\"cold_negatives\":{},\"cold_crossings\":{},\"cold_fallbacks\":{},\
          \"route_hits\":{},\"route_misses\":{},\
          \"wal_pending_work\":{pending_work},\"wal_checkpoint_debt\":{journal_debt},\
          \"checkpoint_failed\":{ck_failed},\"replay_records\":{},\
@@ -686,6 +687,10 @@ fn print_stats(label: &str, tree: &Tree, progress: u64) -> Result<()> {
         s.bm_point_full_blob_reads,
         s.bm_scan_full_blob_reads,
         s.bm_silent_full_blob_reads,
+        s.bm_cold_lookup_hits,
+        s.bm_cold_lookup_negatives,
+        s.bm_cold_lookup_crossings,
+        s.bm_cold_lookup_fallbacks,
         s.route_cache.hits,
         s.route_cache.misses,
         s.open.wal_replay_records,
@@ -704,6 +709,7 @@ fn print_db_stats(label: &str, db: &DB, progress: u64) {
          \"open_trees\":{},\"dirty\":{},\"pending_delete\":{},\"bm_hits\":{},\
          \"bm_misses\":{},\"bm_reads\":{},\"bm_read_bytes\":{},\
          \"bm_point_reads\":{},\"bm_scan_reads\":{},\"bm_silent_reads\":{},\
+         \"cold_hits\":{},\"cold_negatives\":{},\"cold_crossings\":{},\"cold_fallbacks\":{},\
          \"walker_ops\":{},\"max_blob_hops\":{},\
          \"wal_pending_work\":{pending_work},\"wal_checkpoint_debt\":{journal_debt},\
          \"checkpoint_failed\":{ck_failed},\"replay_records\":{},\
@@ -718,6 +724,10 @@ fn print_db_stats(label: &str, db: &DB, progress: u64) {
         s.bm_point_full_blob_reads,
         s.bm_scan_full_blob_reads,
         s.bm_silent_full_blob_reads,
+        s.bm_cold_lookup_hits,
+        s.bm_cold_lookup_negatives,
+        s.bm_cold_lookup_crossings,
+        s.bm_cold_lookup_fallbacks,
         s.bm_walker_ops,
         s.bm_max_blob_hops,
         s.open.wal_replay_records,
