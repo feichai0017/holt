@@ -88,21 +88,70 @@ hops (post-R1) and subtree locality. That is the product story.
    negatively and the tail explodes — and it is *not* architectural; it
    is fixable.
 
-   **Recommended fix:** optimistic write descent (LeanStore-style
-   optimistic lock coupling) — traverse the upper blobs
-   optimistically (snapshot `content_version`, read wait-free, validate)
-   exactly like the read path already does, and take the **exclusive
-   latch only on the target blob** where the mutation lands (fork/retry
-   on a validation miss). Writes to different child blobs would then run
-   in parallel. This is concurrency-correctness-critical: do it in a
-   focused session with concurrent stress + `checkpoint_failpoint` +
-   SIGKILL crash-soak, not as a drive-by.
+   **Attempted fix (REJECTED — measured regression):** optimistic write
+   descent (LeanStore-style optimistic lock coupling) — traverse the
+   upper blobs optimistically (snapshot `content_version`, read wait-free,
+   validate) exactly like the read path, and take the **exclusive latch
+   only on the target blob** where the mutation lands (revalidate the
+   parent chain by version, restart on a miss, escalate to pessimistic
+   after a 4-restart budget; CoW-fork escalates too). Fully implemented
+   and **validated for correctness** (lib +3 tests, concurrent_stress 5,
+   proptest 5, checkpoint_failpoint 8, restart counts bounded; aarch64
+   20/20 + x86 12/12 hardened-stress loops clean, both arches).
+
+   But a **clean same-machine A/B** (x86, `objstore put`, 50k ops/thread,
+   RocksDB reproduced identically both runs → clean attribution) showed
+   it is a **large regression at every thread count**, not a win:
+
+   | threads | baseline Mops/s | with descent | Δ | baseline p50 | descent p50 |
+   |--------:|----------------:|-------------:|---:|------------:|------------:|
+   | 1  | 0.105 | 0.087 | **−17%** | 1.9µs | 4.8µs (2.5×) |
+   | 4  | 0.453 | 0.138 | **−70%** | 2.9µs | 28.8µs (10×) |
+   | 8  | 0.316 | 0.127 | **−60%** | 6.6µs | 62µs (9×) |
+   | 16 | 0.287 | 0.134 | **−53%** | 7.3µs | 92µs (13×) |
+
+   **Why it lost:** the workload *grows* the tree, so node splits and blob
+   spillover are frequent. When a target mutation needs to split a node
+   across a blob boundary (`TargetMutation::Crossing`) or hits a
+   snapshot-shared child (`Escalate`), the optimistic attempt is wasted —
+   it descends, takes the target latch, discovers it can't complete,
+   restarts, burns the budget, and falls back to the full pessimistic
+   path, **paying for both descents**. The −17% / 2.5× single-thread p50
+   blowup (zero contention) is the proof: the fast path is mostly wasted
+   work here, not a parallelism win. Optimistic descent only pays off when
+   target blobs are disjoint *and* the mutation lands in-place (no split);
+   for a path-shaped, growing object-store keyspace neither holds often
+   enough. Code preserved at `docs/experiments/optimistic-write-descent.patch`;
+   do not re-attempt without first making the bail path cheap (skip the
+   optimistic attempt when the target node is full / a split is likely)
+   or solving the real bottleneck below.
+
+   **The real bottleneck is broader than intermediate-blob latching.**
+   The baseline *already* scales negatively (0.453 → 0.287 from 4→16
+   threads) with an exploding tail (p99 55µs → 286µs). Removing
+   intermediate-blob exclusive latches did not help because the
+   serialization survivors are (a) the **root/upper-blob exclusive latch**
+   — a growing tree mutates upper levels constantly as splits propagate,
+   and the root is on every descent — and (b) the **serialized WAL
+   group-commit**. Beating RocksDB on *concurrent* write would require
+   fine-grained or latch-free upper-level concurrency (ROWEX-style), which
+   is a large, high-risk project — not a focused session. Until then,
+   holt's write story is honest: **single-thread durable write is at
+   parity with RocksDB; concurrent write loses** (RocksDB's LSM absorbs
+   concurrent writes into a per-thread memtable/WAL far better). holt's
+   durable edge is **reads (2.2–2.44×), scans (~parity), and cold-miss**,
+   not write concurrency.
 
 ## Suggested next work (each its own focused session)
 
-- **Optimistic write descent** — fix the root-latch serialization above.
-  The single biggest write win; the only path to competitive concurrent
-  write throughput. Concurrency-critical.
+- ~~**Optimistic write descent**~~ — **DONE & REJECTED** (see diagnosis
+  above): implemented, proven correct on both arches, but a clean A/B
+  showed a 53–70% concurrent-write *regression* because the growing-tree
+  workload bails to pessimistic too often. Patch parked in
+  `docs/experiments/`. The remaining concurrent-write bottleneck is the
+  root/upper-blob exclusive latch + serialized WAL group-commit, which
+  needs latch-free upper-level concurrency (ROWEX-style) — a large
+  project, not a focused session.
 - **R2 — BlobNode prefix Bloom** — a per-edge Bloom (a Bloom *extent* in
   the parent, sized ~10 bits/key, not inline) so a negative lookup whose
   key matches a crossing's path prefix is answered without pinning +

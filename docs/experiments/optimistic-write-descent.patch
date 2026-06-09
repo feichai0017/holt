@@ -1,0 +1,1675 @@
+diff --git a/src/engine/walker/erase.rs b/src/engine/walker/erase.rs
+index cd003bf..ff61de2 100644
+--- a/src/engine/walker/erase.rs
++++ b/src/engine/walker/erase.rs
+@@ -8,7 +8,10 @@ use std::sync::Arc;
+ 
+ use super::cast;
+ use super::cow::{child_is_snapshot_shared, fork_child_if_shared};
+-use super::lookup::lookup_at;
++use super::lookup::{
++    lookup_at, optimistic_descend_to_target, revalidate_parent_chain, OPTIMISTIC_RESTART_BUDGET,
++};
++use super::types::DescentResult;
+ use super::readers::{
+     child_offset, ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48,
+     read_prefix,
+@@ -65,6 +68,7 @@ pub fn erase_multi(
+ /// Conditional variant of [`erase_multi`]. Used by
+ /// `Tree::delete_if_version` so the version check and tombstone
+ /// write happen under the same exclusive blob latch.
++#[allow(clippy::too_many_lines)]
+ pub fn erase_multi_conditional(
+     bm: &BufferManager,
+     root_pin: &Arc<CachedBlob>,
+@@ -87,6 +91,23 @@ pub fn erase_multi_conditional(
+     let mut blob_hops = 0u64;
+     let mut max_cross_blob_depth = 0usize;
+ 
++    // Optimistic write fast path (mirror of the insert path): descend
++    // the upper blobs wait-free, take the single exclusive latch only on
++    // the target blob, and re-validate the full ancestor chain
++    // (version-only) BEFORE tombstoning. Bounded restarts then escalate.
++    if let Some(outcome) = try_erase_optimistic(
++        bm,
++        root_pin,
++        route_cache,
++        key,
++        seq,
++        condition,
++        &mut blob_hops,
++        &mut max_cross_blob_depth,
++    )? {
++        return Ok(outcome);
++    }
++
+     if let Some(outcome) = try_erase_from_route(
+         bm,
+         root_pin,
+@@ -189,6 +210,127 @@ pub fn erase_multi_conditional(
+     outcome
+ }
+ 
++/// Optimistic write fast path for erase (mirror of
++/// `super::insert::try_insert_optimistic`). Descends the upper blobs
++/// wait-free, takes the single exclusive `write()` on the target blob,
++/// re-validates the full ancestor chain version-only (sacred
++/// validate-before-mutate ordering), then tombstones target-local via
++/// [`mutate_target_blob_erase`] (collapse stays target-local).
++///
++/// Returns `Ok(Some(outcome))` on completion, `Ok(None)` on escalation
++/// (snapshot-shared blob on the path) or restart-budget exhaustion.
++/// Result of one optimistic erase attempt (mirror of
++/// `super::insert::OptimisticAttempt`).
++enum OptimisticEraseAttempt {
++    Done(EraseOutcome),
++    Restart,
++    Escalate,
++}
++
++#[allow(clippy::too_many_arguments)]
++fn try_erase_optimistic(
++    bm: &BufferManager,
++    root_pin: &Arc<CachedBlob>,
++    route_cache: Option<&RouteCache>,
++    key: SearchKey<'_>,
++    seq: u64,
++    condition: EraseCondition,
++    blob_hops: &mut u64,
++    max_cross_blob_depth: &mut usize,
++) -> Result<Option<EraseOutcome>> {
++    for _attempt in 0..OPTIMISTIC_RESTART_BUDGET {
++        match one_erase_optimistic_attempt(
++            bm,
++            root_pin,
++            route_cache,
++            key,
++            seq,
++            condition,
++            blob_hops,
++            max_cross_blob_depth,
++        )? {
++            OptimisticEraseAttempt::Done(outcome) => return Ok(Some(outcome)),
++            OptimisticEraseAttempt::Escalate => return Ok(None),
++            OptimisticEraseAttempt::Restart => {}
++        }
++    }
++    // Budget exhausted → escalate to the pessimistic path.
++    Ok(None)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn one_erase_optimistic_attempt(
++    bm: &BufferManager,
++    root_pin: &Arc<CachedBlob>,
++    route_cache: Option<&RouteCache>,
++    key: SearchKey<'_>,
++    seq: u64,
++    condition: EraseCondition,
++    blob_hops: &mut u64,
++    max_cross_blob_depth: &mut usize,
++) -> Result<OptimisticEraseAttempt> {
++    let (target_pin, target_depth, parent_chain, is_top, hops) =
++        match optimistic_descend_to_target(bm, root_pin, route_cache, key)? {
++            DescentResult::Escalate(_) => return Ok(OptimisticEraseAttempt::Escalate),
++            DescentResult::Restart => {
++                bm.note_optimistic_restart();
++                return Ok(OptimisticEraseAttempt::Restart);
++            }
++            DescentResult::LandsInRoot => (Arc::clone(root_pin), 0usize, Vec::new(), true, 1u64),
++            DescentResult::Reached {
++                target_pin,
++                target_depth,
++                parent_chain,
++            } => {
++                let hops = parent_chain.len() as u64 + 1;
++                (target_pin, target_depth, parent_chain, false, hops)
++            }
++        };
++
++    // The ONE exclusive latch of the fast path.
++    let mut guard = target_pin.write();
++
++    // SACRED: validate-before-mutate. Re-confirm every ancestor's
++    // version. On ANY mismatch a concurrent structural change moved the
++    // path → drop + restart. (Empty chain for the root-target case →
++    // trivially valid.)
++    if !revalidate_parent_chain(&parent_chain) {
++        drop(guard);
++        bm.note_optimistic_restart();
++        return Ok(OptimisticEraseAttempt::Restart);
++    }
++
++    let target_guid = guard.frame().header().blob_guid;
++    *blob_hops = blob_hops.saturating_add(hops);
++    *max_cross_blob_depth = (*max_cross_blob_depth).max(target_depth);
++    match mutate_target_blob_erase(
++        bm,
++        &mut guard,
++        target_pin.as_ref(),
++        target_guid,
++        is_top,
++        key,
++        condition,
++        target_depth,
++        true,
++        seq,
++    )? {
++        TargetEraseMutation::Done(outcome) => {
++            drop(guard);
++            drop(target_pin);
++            bm.note_walker_blob_hops(*blob_hops, *max_cross_blob_depth);
++            Ok(OptimisticEraseAttempt::Done(outcome))
++        }
++        TargetEraseMutation::Crossing(_) => {
++            // Target grew a deeper crossing under us → restart.
++            drop(guard);
++            drop(target_pin);
++            bm.note_optimistic_restart();
++            Ok(OptimisticEraseAttempt::Restart)
++        }
++    }
++}
++
+ #[allow(clippy::too_many_arguments)]
+ fn try_erase_from_route(
+     bm: &BufferManager,
+@@ -282,88 +424,53 @@ enum EraseStep {
+     Crossing(EraseBlobCrossing),
+ }
+ 
+-#[allow(clippy::too_many_arguments)] // mirrors erase_at's call shape
+-fn lock_coupled_erase_in_blob(
++/// Outcome of a single-blob erase target mutation
++/// ([`mutate_target_blob_erase`]).
++enum TargetEraseMutation {
++    /// The erase landed in this blob; the guard is dropped and the
++    /// blob's dirty / compaction bookkeeping is done. Carries the final
++    /// per-blob [`EraseOutcome`].
++    Done(EraseOutcome),
++    /// The descent reached a `BlobNode` crossing (only when the caller
++    /// passed `allow_crossing = true`). The caller still owns the write
++    /// guard (passed by `&mut`) and continues lock-coupling into the
++    /// child (forking it first if snapshot-shared).
++    Crossing(EraseBlobCrossing),
++}
++
++/// Tombstone `key` inside the single blob currently latched by `guard`
++/// (the target-local erase extracted from the old
++/// `lock_coupled_erase_in_blob` `Done` arm): run one `erase_at_step`,
++/// resolve the new root after any lone-child collapse / shrink, and do
++/// the dirty / compaction bookkeeping. Collapse stays target-local (it
++/// only repoints this blob's own root_slot).
++///
++/// With `allow_crossing = false` (optimistic fast path) a `BlobNode`
++/// surfaces as `Error::NotYetImplemented`; the caller treats a returned
++/// `Crossing` (only possible with `allow_crossing = true`) as
++/// "restart". The collapse and shrink paths are all target-local.
++#[allow(clippy::too_many_arguments)]
++fn mutate_target_blob_erase(
+     bm: &BufferManager,
+-    mut guard: BlobWriteGuard<'_>,
++    guard: &mut BlobWriteGuard<'_>,
+     current_entry: &CachedBlob,
+     current_guid: crate::layout::BlobGuid,
+     is_top_blob: bool,
+     key: SearchKey<'_>,
+-    seq: u64,
+     condition: EraseCondition,
+     depth: usize,
+-    blob_hops: &mut u64,
+-    max_cross_blob_depth: &mut usize,
+-) -> Result<EraseOutcome> {
+-    *blob_hops = blob_hops.saturating_add(1);
+-    *max_cross_blob_depth = (*max_cross_blob_depth).max(depth);
++    allow_crossing: bool,
++    seq: u64,
++) -> Result<TargetEraseMutation> {
+     let step = {
+         let mut frame = guard.frame();
+         let root_off = decode_child_off(frame.header().root_slot);
+-        erase_at_step(&mut frame, root_off, key, depth, condition, true)
++        erase_at_step(&mut frame, root_off, key, depth, condition, allow_crossing)
+             .map_err(|e| e.with_blob_guid(current_guid))?
+     };
+-
+     let r = match step {
+         EraseStep::Done(r) => r,
+-        EraseStep::Crossing(crossing) => {
+-            let child_pin = bm.pin(crossing.child_guid)?;
+-            child_pin.prefetch_header();
+-            let child_guard = child_pin.write();
+-
+-            if let Some((fork_guid, fork_pin)) = fork_child_if_shared(
+-                bm,
+-                &mut guard,
+-                crossing.child_guid,
+-                child_guard.as_slice(),
+-                crossing.parent_off,
+-                seq,
+-            )? {
+-                drop(child_guard);
+-                drop(child_pin);
+-                let fork_guard = fork_pin.write();
+-                drop(guard);
+-                let mut outcome = lock_coupled_erase_in_blob(
+-                    bm,
+-                    fork_guard,
+-                    fork_pin.as_ref(),
+-                    fork_guid,
+-                    false,
+-                    key,
+-                    seq,
+-                    condition,
+-                    crossing.child_depth,
+-                    blob_hops,
+-                    max_cross_blob_depth,
+-                )?;
+-                drop(fork_pin);
+-                // Repointing this frame's BlobNode at the fork changed it.
+-                if is_top_blob {
+-                    outcome.root_dirty = true;
+-                } else {
+-                    bm.mark_dirty_cached(current_guid, seq, current_entry);
+-                }
+-                return Ok(outcome);
+-            }
+-
+-            drop(guard);
+-            let outcome = lock_coupled_erase_in_blob(
+-                bm,
+-                child_guard,
+-                child_pin.as_ref(),
+-                crossing.child_guid,
+-                false,
+-                key,
+-                seq,
+-                condition,
+-                crossing.child_depth,
+-                blob_hops,
+-                max_cross_blob_depth,
+-            )?;
+-            drop(child_pin);
+-            return Ok(outcome);
+-        }
++        EraseStep::Crossing(crossing) => return Ok(TargetEraseMutation::Crossing(crossing)),
+     };
+ 
+     let child_touched = {
+@@ -377,7 +484,6 @@ fn lock_coupled_erase_in_blob(
+         child_touched
+     };
+ 
+-    drop(guard);
+     if child_touched {
+         bm.note_compaction_candidate(current_guid);
+         if !is_top_blob {
+@@ -385,10 +491,103 @@ fn lock_coupled_erase_in_blob(
+         }
+     }
+ 
+-    Ok(EraseOutcome {
++    Ok(TargetEraseMutation::Done(EraseOutcome {
+         root_dirty: is_top_blob && child_touched,
+         mutated: r.mutated,
+-    })
++    }))
++}
++
++#[allow(clippy::too_many_arguments)] // mirrors erase_at's call shape
++fn lock_coupled_erase_in_blob(
++    bm: &BufferManager,
++    mut guard: BlobWriteGuard<'_>,
++    current_entry: &CachedBlob,
++    current_guid: crate::layout::BlobGuid,
++    is_top_blob: bool,
++    key: SearchKey<'_>,
++    seq: u64,
++    condition: EraseCondition,
++    depth: usize,
++    blob_hops: &mut u64,
++    max_cross_blob_depth: &mut usize,
++) -> Result<EraseOutcome> {
++    *blob_hops = blob_hops.saturating_add(1);
++    *max_cross_blob_depth = (*max_cross_blob_depth).max(depth);
++
++    let crossing = match mutate_target_blob_erase(
++        bm,
++        &mut guard,
++        current_entry,
++        current_guid,
++        is_top_blob,
++        key,
++        condition,
++        depth,
++        true,
++        seq,
++    )? {
++        TargetEraseMutation::Done(outcome) => {
++            drop(guard);
++            return Ok(outcome);
++        }
++        TargetEraseMutation::Crossing(crossing) => crossing,
++    };
++
++    let child_pin = bm.pin(crossing.child_guid)?;
++    child_pin.prefetch_header();
++    let child_guard = child_pin.write();
++
++    if let Some((fork_guid, fork_pin)) = fork_child_if_shared(
++        bm,
++        &mut guard,
++        crossing.child_guid,
++        child_guard.as_slice(),
++        crossing.parent_off,
++        seq,
++    )? {
++        drop(child_guard);
++        drop(child_pin);
++        let fork_guard = fork_pin.write();
++        drop(guard);
++        let mut outcome = lock_coupled_erase_in_blob(
++            bm,
++            fork_guard,
++            fork_pin.as_ref(),
++            fork_guid,
++            false,
++            key,
++            seq,
++            condition,
++            crossing.child_depth,
++            blob_hops,
++            max_cross_blob_depth,
++        )?;
++        drop(fork_pin);
++        // Repointing this frame's BlobNode at the fork changed it.
++        if is_top_blob {
++            outcome.root_dirty = true;
++        } else {
++            bm.mark_dirty_cached(current_guid, seq, current_entry);
++        }
++        return Ok(outcome);
++    }
++
++    drop(guard);
++    let outcome = lock_coupled_erase_in_blob(
++        bm,
++        child_guard,
++        child_pin.as_ref(),
++        crossing.child_guid,
++        false,
++        key,
++        seq,
++        condition,
++        crossing.child_depth,
++        blob_hops,
++        max_cross_blob_depth,
++    )?;
++    drop(child_pin);
++    Ok(outcome)
+ }
+ 
+ fn resolve_new_root_after_erase(
+diff --git a/src/engine/walker/insert.rs b/src/engine/walker/insert.rs
+index a5428fb..d75c94a 100644
+--- a/src/engine/walker/insert.rs
++++ b/src/engine/walker/insert.rs
+@@ -7,12 +7,16 @@ use std::sync::Arc;
+ 
+ use super::cast;
+ use super::cow::{child_is_snapshot_shared, fork_child_if_shared};
+-use super::lookup::lookup_at;
++use super::lookup::{
++    lookup_at, optimistic_descend_to_target, revalidate_parent_chain, OPTIMISTIC_RESTART_BUDGET,
++};
+ use super::migrate::blob_needs_compaction;
+ use super::readers::{child_offset, ntype_of, read_leaf_key_ref, read_prefix};
+ use super::route::{pin_route_parent, validate_route_edge};
+ use super::spillover::{compact_blob, spillover_blob};
+-use super::types::{InsertCondition, InsertOutcome, InsertReturn, LookupResult};
++use super::types::{
++    DescentResult, InsertCondition, InsertOutcome, InsertReturn, LookupResult,
++};
+ use super::writers::{
+     inner_add_child, inner_find_child, inner_update_child, set_prefix_child, write_leaf,
+     write_node4_with, write_prefix_chain, write_struct_at,
+@@ -91,7 +95,7 @@ pub fn insert_multi(
+ /// Conditional variant of [`insert_multi`]. Used by the public
+ /// compare-and-set APIs so the existence/version check and mutation
+ /// happen while the target blob is exclusively latched.
+-#[allow(clippy::too_many_arguments)]
++#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+ pub fn insert_multi_conditional(
+     bm: &BufferManager,
+     root_pin: &Arc<CachedBlob>,
+@@ -111,6 +115,26 @@ pub fn insert_multi_conditional(
+     let mut blob_hops = 0u64;
+     let mut max_cross_blob_depth = 0usize;
+ 
++    // Optimistic write fast path (LeanStore-style optimistic lock
++    // coupling): descend the upper blobs wait-free, take the single
++    // exclusive latch only on the target blob, and re-validate the full
++    // ancestor chain (version-only) BEFORE mutating. Different-key
++    // writers on shared upper blobs run in parallel. Bounded restarts
++    // then escalate to the pessimistic path for guaranteed progress.
++    if let Some(outcome) = try_insert_optimistic(
++        bm,
++        root_pin,
++        route_cache,
++        key,
++        value,
++        seq,
++        condition,
++        &mut blob_hops,
++        &mut max_cross_blob_depth,
++    )? {
++        return Ok(outcome);
++    }
++
+     if let Some(outcome) = try_insert_from_optimistic_route(
+         bm,
+         root_pin,
+@@ -219,6 +243,147 @@ pub fn insert_multi_conditional(
+     outcome
+ }
+ 
++/// Optimistic write fast path. Descends the upper blobs wait-free
++/// ([`optimistic_descend_to_target`]), takes the single exclusive
++/// `write()` on the target blob, re-validates the full ancestor chain
++/// version-only (the sacred validate-before-mutate ordering), then
++/// mutates target-local via [`mutate_target_blob`].
++///
++/// Returns `Ok(Some(outcome))` when the fast path completed the
++/// mutation, or `Ok(None)` when it must escalate to the pessimistic
++/// lock-coupled path (snapshot-shared blob on the path → CoW fork
++/// needs the parent's exclusive latch, or the optimistic-restart budget
++/// was exhausted → guarantee progress).
++/// Result of one optimistic insert attempt.
++enum OptimisticAttempt {
++    /// The fast path completed the mutation.
++    Done(InsertOutcome),
++    /// A torn read / moved path / target-grew-a-crossing was observed;
++    /// `note_optimistic_restart` was already bumped — retry within
++    /// budget.
++    Restart,
++    /// A snapshot-shared blob on the path needs a CoW fork → hand off to
++    /// the pessimistic path.
++    Escalate,
++}
++
++#[allow(clippy::too_many_arguments)]
++fn try_insert_optimistic(
++    bm: &BufferManager,
++    root_pin: &Arc<CachedBlob>,
++    route_cache: Option<&RouteCache>,
++    key: SearchKey<'_>,
++    value: &[u8],
++    seq: u64,
++    condition: InsertCondition,
++    blob_hops: &mut u64,
++    max_cross_blob_depth: &mut usize,
++) -> Result<Option<InsertOutcome>> {
++    for _attempt in 0..OPTIMISTIC_RESTART_BUDGET {
++        match one_insert_optimistic_attempt(
++            bm,
++            root_pin,
++            route_cache,
++            key,
++            value,
++            seq,
++            condition,
++            blob_hops,
++            max_cross_blob_depth,
++        )? {
++            OptimisticAttempt::Done(outcome) => return Ok(Some(outcome)),
++            OptimisticAttempt::Escalate => return Ok(None),
++            OptimisticAttempt::Restart => {}
++        }
++    }
++    // Budget exhausted → escalate to the pessimistic path (always
++    // progresses) to guarantee forward progress under contention.
++    Ok(None)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn one_insert_optimistic_attempt(
++    bm: &BufferManager,
++    root_pin: &Arc<CachedBlob>,
++    route_cache: Option<&RouteCache>,
++    key: SearchKey<'_>,
++    value: &[u8],
++    seq: u64,
++    condition: InsertCondition,
++    blob_hops: &mut u64,
++    max_cross_blob_depth: &mut usize,
++) -> Result<OptimisticAttempt> {
++    let (target_pin, target_depth, parent_chain, is_top, hops) =
++        match optimistic_descend_to_target(bm, root_pin, route_cache, key)? {
++            DescentResult::Escalate(_) => return Ok(OptimisticAttempt::Escalate),
++            DescentResult::Restart => {
++                bm.note_optimistic_restart();
++                return Ok(OptimisticAttempt::Restart);
++            }
++            // The key resolves within the root blob — the root is the
++            // target; no ancestor chain to validate.
++            DescentResult::LandsInRoot => (Arc::clone(root_pin), 0usize, Vec::new(), true, 1u64),
++            DescentResult::Reached {
++                target_pin,
++                target_depth,
++                parent_chain,
++            } => {
++                let hops = parent_chain.len() as u64 + 1;
++                (target_pin, target_depth, parent_chain, false, hops)
++            }
++        };
++
++    // The ONE exclusive latch of the fast path.
++    let mut guard = target_pin.write();
++
++    // SACRED: validate-before-mutate. Re-confirm every ancestor's
++    // version (version-only is sound — every structural mutation bumps
++    // the blob's version on release_exclusive). On ANY mismatch a
++    // concurrent spillover/fork of an ancestor moved the path → drop the
++    // target guard and restart from the root. This closes the
++    // silent-persisted-corruption hazard. (Empty chain for the
++    // root-target case → trivially valid.)
++    if !revalidate_parent_chain(&parent_chain) {
++        drop(guard);
++        bm.note_optimistic_restart();
++        return Ok(OptimisticAttempt::Restart);
++    }
++
++    let target_guid = guard.frame().header().blob_guid;
++    let mut current_dirty = false;
++    *blob_hops = blob_hops.saturating_add(hops);
++    *max_cross_blob_depth = (*max_cross_blob_depth).max(target_depth);
++    match mutate_target_blob(
++        bm,
++        &mut guard,
++        target_pin.as_ref(),
++        target_guid,
++        is_top,
++        key,
++        value,
++        seq,
++        condition,
++        target_depth,
++        true,
++        &mut current_dirty,
++    )? {
++        TargetMutation::Done(outcome) => {
++            drop(guard);
++            drop(target_pin);
++            bm.note_walker_blob_hops(*blob_hops, *max_cross_blob_depth);
++            Ok(OptimisticAttempt::Done(outcome))
++        }
++        TargetMutation::Crossing { .. } => {
++            // The target grew a deeper crossing for this key under us (a
++            // concurrent spillover pushed the subtree down) → restart.
++            drop(guard);
++            drop(target_pin);
++            bm.note_optimistic_restart();
++            Ok(OptimisticAttempt::Restart)
++        }
++    }
++}
++
+ /// Try the large-tree steady-state route-cache path without a full
+ /// root descent. The cached parent edge is validated under the
+ /// parent's shared latch before the child is pinned + exclusively
+@@ -612,10 +777,47 @@ enum InsertStep {
+     Crossing(InsertBlobCrossing),
+ }
+ 
+-#[allow(clippy::too_many_arguments)] // hot-path helper mirrors insert_at's call shape
+-fn lock_coupled_insert_in_blob(
++/// Outcome of a single-blob target mutation ([`mutate_target_blob`]).
++enum TargetMutation {
++    /// The mutation landed in this blob; the guard has been dropped
++    /// and any dirty / compaction bookkeeping for the target blob is
++    /// done. The carried [`InsertOutcome`] is final for this blob.
++    Done(InsertOutcome),
++    /// The descent reached a `BlobNode` crossing (only when the caller
++    /// passed `allow_crossing = true`). The caller still owns the write
++    /// guard (passed in by `&mut`) and continues lock-coupling into the
++    /// child. `current_dirty` carries any dirtiness this frame accrued
++    /// in the retry loop (e.g. from a spillover before the crossing
++    /// surfaced).
++    Crossing {
++        crossing: InsertBlobCrossing,
++        current_dirty: bool,
++    },
++}
++
++/// Mutate `key`→`value` inside the single blob currently latched by
++/// `guard`, running the spillover / inline-compaction / OutOfSlots
++/// retry loop. This is the target-local mutation extracted from the
++/// old `lock_coupled_insert_in_blob` body — it handles the
++/// `Done`/`OutOfSpace`/`OutOfSlots` arms verbatim.
++///
++/// When `allow_crossing` is `false` (optimistic fast path) and the
++/// descent reaches a `BlobNode`, the inner `insert_at_step` surfaces
++/// [`Error::NotYetImplemented`] which the caller treats as
++/// "the target changed under us → restart". When `allow_crossing` is
++/// `true` (pessimistic lock-coupling) a crossing is returned via
++/// [`TargetMutation::Crossing`] with the guard handed back so the
++/// caller can recurse into the child.
++///
++/// On [`TargetMutation::Done`] the guard has already been dropped and
++/// dirty/compaction bookkeeping for this blob is complete. On
++/// [`TargetMutation::Crossing`] the guard is **still held** (returned to
++/// the caller via the `guard` field, which is `()` because the guard is
++/// moved back through the return — see the call site).
++#[allow(clippy::too_many_arguments)]
++fn mutate_target_blob(
+     bm: &BufferManager,
+-    mut guard: BlobWriteGuard<'_>,
++    guard: &mut BlobWriteGuard<'_>,
+     current_entry: &CachedBlob,
+     current_guid: crate::layout::BlobGuid,
+     is_top_blob: bool,
+@@ -624,19 +826,22 @@ fn lock_coupled_insert_in_blob(
+     seq: u64,
+     condition: InsertCondition,
+     depth: usize,
+-    blob_hops: &mut u64,
+-    max_cross_blob_depth: &mut usize,
+-) -> Result<InsertOutcome> {
+-    *blob_hops = blob_hops.saturating_add(1);
+-    *max_cross_blob_depth = (*max_cross_blob_depth).max(depth);
+-    let mut current_dirty = false;
+-
++    allow_crossing: bool,
++    current_dirty: &mut bool,
++) -> Result<TargetMutation> {
+     for _attempt in 0..MAX_SPILLOVER_ATTEMPTS {
+         let r = {
+             let mut frame = guard.frame();
+             let root_off = decode_child_off(frame.header().root_slot);
+             insert_at_step(
+-                &mut frame, root_off, key, value, depth, seq, condition, true,
++                &mut frame,
++                root_off,
++                key,
++                value,
++                depth,
++                seq,
++                condition,
++                allow_crossing,
+             )
+         };
+         match r {
+@@ -650,35 +855,22 @@ fn lock_coupled_insert_in_blob(
+                         false
+                     }
+                 };
+-                drop(guard);
+                 if needs_compaction {
+                     bm.note_compaction_candidate(current_guid);
+                 }
+                 if out.mutated && !is_top_blob {
+                     bm.mark_dirty_cached(current_guid, seq, current_entry);
+                 }
+-
+-                return Ok(InsertOutcome {
++                return Ok(TargetMutation::Done(InsertOutcome {
+                     root_dirty: is_top_blob && out.mutated,
+                     mutated: out.mutated,
+-                });
++                }));
+             }
+             Ok(InsertStep::Crossing(crossing)) => {
+-                return cross_and_insert(
+-                    bm,
+-                    guard,
++                return Ok(TargetMutation::Crossing {
+                     crossing,
+-                    is_top_blob,
+-                    current_guid,
+-                    current_entry,
+-                    current_dirty,
+-                    key,
+-                    value,
+-                    seq,
+-                    condition,
+-                    blob_hops,
+-                    max_cross_blob_depth,
+-                );
++                    current_dirty: *current_dirty,
++                });
+             }
+             Err(Error::Alloc(crate::store::AllocError::OutOfSpace { .. })) => {
+                 {
+@@ -688,8 +880,8 @@ fn lock_coupled_insert_in_blob(
+                 }
+                 bm.note_merge_candidate(current_guid);
+                 bm.note_spillover();
+-                compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
+-                current_dirty = true;
++                compact_blob(guard).map_err(|e| e.with_blob_guid(current_guid))?;
++                *current_dirty = true;
+             }
+             Err(Error::Alloc(crate::store::AllocError::OutOfSlots)) => {
+                 // The slot table filled. Structural ops abandon old nodes
+@@ -703,8 +895,8 @@ fn lock_coupled_insert_in_blob(
+                 // subtree out (now with post-compaction slot headroom for
+                 // the spillover BlobNode).
+                 let before = guard.frame().header().num_slots;
+-                compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
+-                current_dirty = true;
++                compact_blob(guard).map_err(|e| e.with_blob_guid(current_guid))?;
++                *current_dirty = true;
+                 if guard.frame().header().num_slots >= before {
+                     {
+                         let mut frame = guard.frame();
+@@ -713,7 +905,7 @@ fn lock_coupled_insert_in_blob(
+                     }
+                     bm.note_merge_candidate(current_guid);
+                     bm.note_spillover();
+-                    compact_blob(&mut guard).map_err(|e| e.with_blob_guid(current_guid))?;
++                    compact_blob(guard).map_err(|e| e.with_blob_guid(current_guid))?;
+                 }
+             }
+             Err(e) => return Err(e.with_blob_guid(current_guid)),
+@@ -721,10 +913,68 @@ fn lock_coupled_insert_in_blob(
+     }
+ 
+     Err(Error::NotYetImplemented(
+-        "lock_coupled_insert_in_blob: spillover retry loop exhausted",
++        "mutate_target_blob: spillover retry loop exhausted",
+     ))
+ }
+ 
++#[allow(clippy::too_many_arguments)] // hot-path helper mirrors insert_at's call shape
++fn lock_coupled_insert_in_blob(
++    bm: &BufferManager,
++    mut guard: BlobWriteGuard<'_>,
++    current_entry: &CachedBlob,
++    current_guid: crate::layout::BlobGuid,
++    is_top_blob: bool,
++    key: SearchKey<'_>,
++    value: &[u8],
++    seq: u64,
++    condition: InsertCondition,
++    depth: usize,
++    blob_hops: &mut u64,
++    max_cross_blob_depth: &mut usize,
++) -> Result<InsertOutcome> {
++    *blob_hops = blob_hops.saturating_add(1);
++    *max_cross_blob_depth = (*max_cross_blob_depth).max(depth);
++    let mut current_dirty = false;
++
++    match mutate_target_blob(
++        bm,
++        &mut guard,
++        current_entry,
++        current_guid,
++        is_top_blob,
++        key,
++        value,
++        seq,
++        condition,
++        depth,
++        true,
++        &mut current_dirty,
++    )? {
++        TargetMutation::Done(outcome) => {
++            drop(guard);
++            Ok(outcome)
++        }
++        TargetMutation::Crossing {
++            crossing,
++            current_dirty,
++        } => cross_and_insert(
++            bm,
++            guard,
++            crossing,
++            is_top_blob,
++            current_guid,
++            current_entry,
++            current_dirty,
++            key,
++            value,
++            seq,
++            condition,
++            blob_hops,
++            max_cross_blob_depth,
++        ),
++    }
++}
++
+ /// Handle an insert that crosses a `BlobNode` into a child frame.
+ ///
+ /// If a live snapshot may reference the child, fork it first (repointing
+diff --git a/src/engine/walker/lookup.rs b/src/engine/walker/lookup.rs
+index bf33df8..67f1aa1 100644
+--- a/src/engine/walker/lookup.rs
++++ b/src/engine/walker/lookup.rs
+@@ -16,12 +16,20 @@ use std::sync::Arc;
+ use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
+ 
+ use super::cast;
++use super::cow::child_is_snapshot_shared;
+ use super::readers::{child_offset, resolve_typed};
+ use super::route::{pin_route_parent, validate_route_edge};
+ use crate::store::decode_child_off;
+-use super::types::{BlobNodeCrossing, LookupHit, LookupResult};
++use super::types::{
++    BlobNodeCrossing, DescentResult, EscalationReason, LookupHit, LookupResult, ParentChainEntry,
++};
+ use super::SearchKey;
+ 
++/// Budget of optimistic restarts before the write fast path escalates
++/// to the pessimistic exclusive lock-coupled path to guarantee
++/// progress (livelock guard).
++pub(super) const OPTIMISTIC_RESTART_BUDGET: u32 = 4;
++
+ /// Look up `key` in the tree whose root is the encoded offset
+ /// `start_root` (depth 0).
+ ///
+@@ -324,6 +332,244 @@ fn pin_validated_child(
+     Ok(Some((child_pin, actual.child_depth)))
+ }
+ 
++// ---------- optimistic write descent ----------
++
++/// Descend the upper blobs OPTIMISTICALLY (LeanStore-style optimistic
++/// lock coupling) toward the *target* blob where the mutation for
++/// `key` will land, recording a `parent_chain` of `(pin, version,
++/// child_guid, child_depth)` per crossing.
++///
++/// This mirrors the read path [`lookup_multi_with`]:
++/// - each blob is read under [`CachedBlob::read_optimistic`], then
++///   `validate()`d after consuming any borrowed data — a torn read
++///   restarts from the root;
++/// - each crossing is re-confirmed under a SHORT `parent.read()`
++///   (shared) latch, exactly as [`pin_validated_child`] does, before
++///   the child is pinned and the parent latch dropped. NEVER are two
++///   blobs latched simultaneously.
++///
++/// Unlike the read path, the parent pins are retained in `parent_chain`
++/// so the caller can re-validate every ancestor's version *after*
++/// taking the target's exclusive guard and *before* mutating (the
++/// validate-before-mutate hazard closure).
++///
++/// Returns:
++/// - [`DescentResult::Reached`] when `lookup_at` resolves the key
++///   WITHIN a blob (Found/NotFound — not Crossing); that blob is the
++///   target. The target pin is returned unlatched; the caller takes
++///   the single `write()`.
++/// - [`DescentResult::LandsInRoot`] when the key resolves within the
++///   root blob (no crossing).
++/// - [`DescentResult::Escalate`] when a blob on the path is
++///   snapshot-shared (CoW fork needs the parent's exclusive latch).
++/// - [`DescentResult::Restart`] on a torn optimistic read / moved
++///   crossing — the caller bumps `note_optimistic_restart` and retries.
++pub(super) fn optimistic_descend_to_target(
++    bm: &BufferManager,
++    root_pin: &Arc<CachedBlob>,
++    route_cache: Option<&RouteCache>,
++    key: SearchKey<'_>,
++) -> Result<DescentResult> {
++    // Hop 0: the cached root blob, read optimistically.
++    let crossing = {
++        let root_version = root_pin.content_version();
++        let guard = root_pin.read_optimistic();
++        let frame = BlobFrameRef::wrap(guard.as_slice());
++        let root_slot = frame.header().root_slot;
++        let result = lookup_at(frame, root_slot, key, 0);
++        if !guard.validate() || !root_pin.validate_content_version(root_version) {
++            return Ok(DescentResult::Restart);
++        }
++        match result {
++            Err(e) => return Err(e),
++            // Resolves within the root blob — no crossing.
++            Ok(LookupResult::Found(_) | LookupResult::NotFound) => {
++                return Ok(DescentResult::LandsInRoot);
++            }
++            Ok(LookupResult::Crossing(crossing)) => crossing,
++        }
++    };
++
++    let mut parent_chain: Vec<ParentChainEntry> = Vec::new();
++
++    // Re-confirm + pin the root's child under a short shared latch.
++    let (mut pin, mut depth) = match pin_validated_child_for_write(
++        bm,
++        route_cache,
++        key,
++        root_pin,
++        0,
++        crossing,
++        &mut parent_chain,
++    )? {
++        ChildPin::Pinned(pin, depth) => (pin, depth),
++        ChildPin::Moved => return Ok(DescentResult::Restart),
++        ChildPin::SnapshotShared => {
++            return Ok(DescentResult::Escalate(EscalationReason::SnapshotSharedChild));
++        }
++    };
++
++    // Cross-blob hops, all optimistic. On a torn read or moved crossing
++    // we restart the whole descent from the root (the parent BlobNode
++    // that pointed here may also have moved).
++    loop {
++        pin.prefetch_header();
++        // Optimistic read of this blob. Capture only the crossing (which
++        // borrows nothing from the frame) so the guard can be dropped
++        // before we potentially move `pin` into the `Reached` result.
++        let crossing = {
++            let version = pin.content_version();
++            let guard = pin.read_optimistic();
++            let frame = BlobFrameRef::wrap(guard.as_slice());
++            let start_slot = frame.header().root_slot;
++            let result = lookup_at(frame, start_slot, key, depth);
++            if !guard.validate() || !pin.validate_content_version(version) {
++                return Ok(DescentResult::Restart);
++            }
++            match result {
++                Err(e) => return Err(e),
++                // Resolves within this blob — it is the target. The
++                // optimistic guard is dropped at the end of this block,
++                // releasing the borrow on `pin` so it can be moved out.
++                Ok(LookupResult::Found(_) | LookupResult::NotFound) => None,
++                Ok(LookupResult::Crossing(crossing)) => Some(crossing),
++            }
++        };
++        let Some(crossing) = crossing else {
++            return Ok(DescentResult::Reached {
++                target_pin: pin,
++                target_depth: depth,
++                parent_chain,
++            });
++        };
++
++        let (child_pin, child_depth) = match pin_validated_child_for_write(
++            bm,
++            route_cache,
++            key,
++            &pin,
++            depth,
++            crossing,
++            &mut parent_chain,
++        )? {
++            ChildPin::Pinned(p, d) => (p, d),
++            ChildPin::Moved => return Ok(DescentResult::Restart),
++            ChildPin::SnapshotShared => {
++                return Ok(DescentResult::Escalate(EscalationReason::SnapshotSharedChild));
++            }
++        };
++        pin = child_pin;
++        depth = child_depth;
++    }
++}
++
++/// Result of re-confirming + pinning a crossing's child on the write
++/// descent.
++enum ChildPin {
++    /// Child pinned; carries the child pin + the depth to continue at.
++    Pinned(Arc<CachedBlob>, usize),
++    /// The crossing moved under us (torn parent edge) — restart.
++    Moved,
++    /// The child may be visible to a live snapshot → CoW fork needs the
++    /// parent's exclusive latch → escalate to the pessimistic path.
++    SnapshotShared,
++}
++
++/// Write-path mirror of [`pin_validated_child`]. Re-confirms the
++/// crossing edge under a SHORT shared latch on `parent_pin`, snapshots
++/// the parent's `content_version` under that same latch, pins the
++/// child, then drops the parent latch. NEVER holds two latches at once.
++///
++/// Differs from the read-path helper in three ways:
++/// 1. After pinning the child it checks [`child_is_snapshot_shared`]; a
++///    snapshot-shared child needs a CoW fork (parent exclusive latch),
++///    so the fast path cannot proceed → [`ChildPin::SnapshotShared`].
++/// 2. It learns the route ONLY after the edge re-confirm succeeds AND
++///    the child is not snapshot-shared (rule #5: learn with the SAME
++///    version that was validated).
++/// 3. It pushes a [`ParentChainEntry`] (parent pin + snapshotted
++///    version) so the caller can re-validate the full chain before
++///    mutating.
++#[allow(clippy::too_many_arguments)]
++fn pin_validated_child_for_write(
++    bm: &BufferManager,
++    route_cache: Option<&RouteCache>,
++    key: SearchKey<'_>,
++    parent_pin: &Arc<CachedBlob>,
++    parent_depth: usize,
++    expected: BlobNodeCrossing,
++    parent_chain: &mut Vec<ParentChainEntry>,
++) -> Result<ChildPin> {
++    let parent_guard = parent_pin.read();
++    let parent_version = parent_pin.content_version();
++    let actual = {
++        let frame = BlobFrameRef::wrap(parent_guard.as_slice());
++        match lookup_at(frame, frame.header().root_slot, key, parent_depth)? {
++            LookupResult::Crossing(crossing)
++                if crossing.child_guid == expected.child_guid
++                    && crossing.child_depth == expected.child_depth =>
++            {
++                crossing
++            }
++            LookupResult::Crossing(_) | LookupResult::Found(_) | LookupResult::NotFound => {
++                return Ok(ChildPin::Moved);
++            }
++        }
++    };
++    let parent_guid: BlobGuid = BlobFrameRef::wrap(parent_guard.as_slice())
++        .header()
++        .blob_guid;
++
++    let child_pin = bm.pin(actual.child_guid)?;
++    child_pin.prefetch_header();
++    // CoW: a snapshot-shared child must be forked under the parent's
++    // exclusive latch — the fast path can't do that, so escalate. The
++    // route is intentionally NOT learned in this case (the pessimistic
++    // path will fork + re-establish the edge).
++    if child_is_snapshot_shared(bm, child_pin.as_ref()) {
++        drop(parent_guard);
++        return Ok(ChildPin::SnapshotShared);
++    }
++
++    if let Some(cache) = route_cache {
++        cache.learn(
++            key,
++            parent_guid,
++            parent_depth,
++            parent_version,
++            actual.child_guid,
++            actual.child_depth,
++        );
++        bm.mark_route_resident(actual.child_guid);
++    }
++    // Record the crossing for the post-target-latch chain re-validation.
++    // The version snapshotted here is stable under `parent_guard` and is
++    // exactly the version the route-cache learned, so a later
++    // `validate_content_version(version)` mismatch means the ancestor
++    // mutated structurally after we crossed it.
++    parent_chain.push(ParentChainEntry {
++        pin: Arc::clone(parent_pin),
++        version: parent_version,
++    });
++    drop(parent_guard);
++    Ok(ChildPin::Pinned(child_pin, actual.child_depth))
++}
++
++/// Re-validate (version-only) every recorded ancestor crossing. Sound
++/// because every structural mutation bumps the blob's content version
++/// on `release_exclusive` — the same trust model the read path uses.
++///
++/// MUST be called AFTER the target's exclusive guard is taken and
++/// BEFORE any mutation (the sacred validate-before-mutate ordering).
++/// Returns `false` on any mismatch → the caller drops the target guard
++/// and restarts from the root.
++#[must_use]
++pub(super) fn revalidate_parent_chain(parent_chain: &[ParentChainEntry]) -> bool {
++    parent_chain
++        .iter()
++        .all(|entry| entry.pin.validate_content_version(entry.version))
++}
++
+ // ---------- descent dispatch ----------
+ 
+ fn descend<'a>(
+diff --git a/src/engine/walker/tests.rs b/src/engine/walker/tests.rs
+index e71c52b..fb70a5c 100644
+--- a/src/engine/walker/tests.rs
++++ b/src/engine/walker/tests.rs
+@@ -1343,3 +1343,166 @@ fn tree_put_and_delete_follow_nested_child_header_roots() {
+     assert_eq!(keys.first().map(Vec::as_slice), Some(&b"k00"[..]));
+     assert_eq!(keys.last().map(Vec::as_slice), Some(&b"k99"[..]));
+ }
++
++// ============================================================
++// Optimistic write descent — `optimistic_descend_to_target`
++// ============================================================
++
++mod optimistic_descent {
++    use super::super::lookup::{optimistic_descend_to_target, revalidate_parent_chain};
++    use super::super::types::{DescentResult, EscalationReason};
++    use super::*;
++    use crate::store::blob_store::{BlobStore, MemoryBlobStore};
++    use crate::store::BufferManager;
++    use std::sync::Arc;
++
++    const ROOT_GUID: BlobGuid = crate::layout::ROOT_BLOB_GUID;
++    const CHILD_GUID: BlobGuid = [0x55; 16];
++
++    /// Build a root blob holding a single `BlobNode(prefix -> CHILD_GUID)`
++    /// crossing, and a child blob holding `child_keys`. Returns a
++    /// `BufferManager` over a `MemoryBlobStore` plus the root pin.
++    fn two_blob_fixture(prefix: &[u8], child_keys: &[(&[u8], &[u8])]) -> (BufferManager, Arc<crate::store::CachedBlob>) {
++        // Root frame: a BlobNode crossing.
++        let mut root = AlignedBlobBuf::zeroed();
++        BlobFrame::init(root.as_mut_slice(), ROOT_GUID).unwrap();
++        {
++            let mut frame = BlobFrame::wrap(root.as_mut_slice());
++            let out = frame.alloc_node(NodeType::Blob).unwrap();
++            let off = frame.offset_of_slot(out.slot).unwrap();
++            let bn = BlobNode::new(prefix, CHILD_GUID);
++            let body = frame
++                .bytes_at_mut(off, std::mem::size_of::<BlobNode>() as u32)
++                .unwrap();
++            let bytes = unsafe {
++                std::slice::from_raw_parts(
++                    std::ptr::from_ref(&bn).cast::<u8>(),
++                    std::mem::size_of::<BlobNode>(),
++                )
++            };
++            body.copy_from_slice(bytes);
++            frame.header_mut().root_slot = crate::store::encode_child_off(off);
++        }
++
++        // Child frame: real keys inserted via the single-blob walker at
++        // the crossing depth.
++        let mut child = AlignedBlobBuf::zeroed();
++        BlobFrame::init(child.as_mut_slice(), CHILD_GUID).unwrap();
++        {
++            let mut frame = BlobFrame::wrap(child.as_mut_slice());
++            for (seq, (k, v)) in child_keys.iter().enumerate() {
++                let root_off = frame.header().root_slot;
++                // Insert at depth 0 within the child blob — the child's own
++                // tree is keyed by the full user key (depth is a descent
++                // convenience; lookups into the child pass child_depth).
++                super::super::insert::insert(&mut frame, root_off, k, v, seq as u64 + 1).unwrap();
++            }
++        }
++
++        let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
++        store.write_blob(ROOT_GUID, &root).unwrap();
++        store.write_blob(CHILD_GUID, &child).unwrap();
++        let bm = BufferManager::new(store, 16);
++        let root_pin = bm.pin(ROOT_GUID).unwrap();
++        (bm, root_pin)
++    }
++
++    #[test]
++    fn descent_reaches_child_target_with_parent_chain() {
++        let (bm, root_pin) = two_blob_fixture(b"img/", &[(b"img/01.jpg", b"v1")]);
++        let key = SearchKey::user(b"img/01.jpg");
++        match optimistic_descend_to_target(&bm, &root_pin, None, key).unwrap() {
++            DescentResult::Reached {
++                target_pin,
++                target_depth,
++                parent_chain,
++            } => {
++                // Target is the child blob, at the crossing depth.
++                assert_eq!(target_depth, b"img/".len());
++                assert_eq!(parent_chain.len(), 1, "one crossing (root -> child)");
++                // The target pin resolves to the child blob.
++                {
++                    let g = target_pin.read();
++                    let frame = crate::store::BlobFrameRef::wrap(g.as_slice());
++                    assert_eq!(
++                        frame.header().blob_guid,
++                        CHILD_GUID,
++                        "target pin must be the child blob"
++                    );
++                }
++                // The full chain re-validates (nothing mutated since).
++                assert!(revalidate_parent_chain(&parent_chain));
++
++                // Now mutate the root (bump its version) and confirm the
++                // chain re-validation FAILS (validate-before-mutate guard).
++                {
++                    let mut g = root_pin.write();
++                    let _ = g.frame();
++                }
++                assert!(
++                    !revalidate_parent_chain(&parent_chain),
++                    "a concurrent root mutation must fail chain re-validation"
++                );
++            }
++            other => panic!("expected Reached, got {:?}", DescentDbg(&other)),
++        }
++    }
++
++    #[test]
++    fn descent_lands_in_root_when_key_resolves_in_root_blob() {
++        // Key diverges from the crossing prefix -> resolves NotFound
++        // within the root blob (no crossing taken).
++        let (bm, root_pin) = two_blob_fixture(b"img/", &[(b"img/01.jpg", b"v1")]);
++        let key = SearchKey::user(b"doc/page.txt");
++        match optimistic_descend_to_target(&bm, &root_pin, None, key).unwrap() {
++            DescentResult::LandsInRoot => {}
++            other => panic!("expected LandsInRoot, got {:?}", DescentDbg(&other)),
++        }
++    }
++
++    #[test]
++    fn descent_lands_in_root_for_single_blob_tree() {
++        // Single-blob tree (no crossing at all).
++        let mut root = AlignedBlobBuf::zeroed();
++        BlobFrame::init(root.as_mut_slice(), ROOT_GUID).unwrap();
++        {
++            let mut frame = BlobFrame::wrap(root.as_mut_slice());
++            let root_off = frame.header().root_slot;
++            super::super::insert::insert(&mut frame, root_off, b"solo", b"v", 1).unwrap();
++        }
++        let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
++        store.write_blob(ROOT_GUID, &root).unwrap();
++        let bm = BufferManager::new(store, 8);
++        let root_pin = bm.pin(ROOT_GUID).unwrap();
++
++        let key = SearchKey::user(b"solo");
++        match optimistic_descend_to_target(&bm, &root_pin, None, key).unwrap() {
++            DescentResult::LandsInRoot => {}
++            other => panic!("expected LandsInRoot, got {:?}", DescentDbg(&other)),
++        }
++        // A missing key in the single-blob tree is also LandsInRoot.
++        let miss = SearchKey::user(b"absent");
++        match optimistic_descend_to_target(&bm, &root_pin, None, miss).unwrap() {
++            DescentResult::LandsInRoot => {}
++            other => panic!("expected LandsInRoot (miss), got {:?}", DescentDbg(&other)),
++        }
++    }
++
++    // `DescentResult` deliberately does not derive Debug (it holds a
++    // CachedBlob pin). This tiny adapter renders the variant name for
++    // panic messages without requiring Debug on the pin.
++    struct DescentDbg<'a>(&'a DescentResult);
++    impl std::fmt::Debug for DescentDbg<'_> {
++        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++            let name = match self.0 {
++                DescentResult::Reached { .. } => "Reached",
++                DescentResult::LandsInRoot => "LandsInRoot",
++                DescentResult::Restart => "Restart",
++                DescentResult::Escalate(EscalationReason::SnapshotSharedChild) => {
++                    "Escalate(SnapshotSharedChild)"
++                }
++            };
++            f.write_str(name)
++        }
++    }
++}
+diff --git a/src/engine/walker/types.rs b/src/engine/walker/types.rs
+index 765126a..6554709 100644
+--- a/src/engine/walker/types.rs
++++ b/src/engine/walker/types.rs
+@@ -95,6 +95,60 @@ pub enum EraseCondition {
+     IfVersion(u64),
+ }
+ 
++// ---------- optimistic write descent (pub(super)) ----------
++
++/// One crossing recorded while descending optimistically toward the
++/// target blob. Mirrors the read path's `pin_validated_child`: the
++/// `version` is the parent blob's `content_version` snapshotted at the
++/// moment the crossing edge was re-confirmed under a short shared
++/// latch.
++///
++/// The whole chain is re-validated (version-only) *after* the target's
++/// exclusive guard is taken and *before* any mutation — a concurrent
++/// structural change to any ancestor bumps that ancestor's version via
++/// `release_exclusive` and is caught here. This is the
++/// validate-before-mutate hazard closure.
++#[derive(Clone)]
++pub(super) struct ParentChainEntry {
++    /// The parent blob's pin, kept alive so its version stays
++    /// validatable until the target mutation commits.
++    pub(super) pin: std::sync::Arc<crate::store::CachedBlob>,
++    /// `content_version` snapshotted under the short shared re-confirm.
++    /// A later `validate_content_version(version)` mismatch means this
++    /// ancestor mutated structurally after we crossed it.
++    pub(super) version: u64,
++}
++
++/// Why the optimistic write fast path must hand off to the pessimistic
++/// exclusive lock-coupled path.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(super) enum EscalationReason {
++    /// A blob on the descent path may be visible to a live snapshot, so
++    /// a CoW fork is required, which needs the parent's exclusive latch.
++    SnapshotSharedChild,
++}
++
++/// Outcome of [`super::lookup::optimistic_descend_to_target`].
++pub(super) enum DescentResult {
++    /// The target blob (where the mutation lands) was reached. The pin
++    /// is held; the caller takes the single exclusive `write()` on it,
++    /// re-validates `parent_chain` (version-only), then mutates.
++    Reached {
++        target_pin: std::sync::Arc<crate::store::CachedBlob>,
++        target_depth: usize,
++        parent_chain: Vec<ParentChainEntry>,
++    },
++    /// The key resolves within the root blob itself (no crossing). The
++    /// caller takes the root's exclusive guard and mutates target-local.
++    LandsInRoot,
++    /// A torn optimistic read or a moved crossing was observed; the
++    /// caller restarts the descent from the root.
++    Restart,
++    /// The fast path cannot proceed safely (e.g. snapshot-shared child);
++    /// the caller falls back to the pessimistic exclusive path.
++    Escalate(EscalationReason),
++}
++
+ // ---------- internal types (pub(super) for sibling submodules) ----------
+ 
+ /// Return-value carried up an `insert_at` recursion.
+diff --git a/tests/concurrent_stress.rs b/tests/concurrent_stress.rs
+index 69cedcf..3c183de 100644
+--- a/tests/concurrent_stress.rs
++++ b/tests/concurrent_stress.rs
+@@ -1,18 +1,26 @@
+ //! Concurrent-write **correctness** stress harness.
+ //!
+-//! holt's write path is lock-coupled with exclusive blob latches, so
+-//! today concurrent writes are serialized (correct but they serialize
+-//! on the root blob's latch — see PERF_FINDINGS.md). This harness is
+-//! the *gate* for the planned optimistic-write-descent change: it
+-//! hammers the write path from many threads with the background
+-//! journal + checkpointer running and asserts no write is lost,
+-//! torn, or corrupted. It must stay green before and after that
+-//! change — a racy optimistic descent would surface here even though
+-//! the single-threaded proptest / failpoint suites cannot catch it.
++//! holt's write path now takes an optimistic lock-coupled descent
++//! (LeanStore-style): the upper blobs are traversed wait-free and the
++//! single exclusive blob latch is taken only on the *target* blob,
++//! after the full ancestor chain is re-validated (version-only) — the
++//! sacred validate-before-mutate ordering. A snapshot-shared blob on
++//! the path or an exhausted restart budget escalates to the legacy
++//! pessimistic exclusive lock-coupled path.
++//!
++//! This harness is the *gate* for that change: it hammers the write
++//! path from many threads (oversubscribed past num_cpus, the negative-
++//! scaling regime) with the background journal + checkpointer running
++//! and asserts no write is lost, torn, or corrupted. A racy optimistic
++//! descent (a missed chain re-validation) would surface here even
++//! though the single-threaded proptest / failpoint suites cannot catch
++//! it. After each run it also asserts the cumulative
++//! optimistic-restart count stays BOUNDED — an unbounded climb means a
++//! livelock (the budget→pessimistic-fallback guard failed).
+ //!
+ //! Run: `cargo test --test concurrent_stress -- --nocapture`
+-//! (or `--test-threads=1` to keep the three scenarios from contending
+-//! for the box; each scenario is itself multi-threaded).
++//! (or `--test-threads=1` to keep the scenarios from contending for
++//! the box; each scenario is itself multi-threaded).
+ 
+ use std::sync::{Arc, Barrier};
+ use std::thread;
+@@ -21,6 +29,49 @@ use std::time::Duration;
+ use holt::{CheckpointConfig, Tree, TreeBuilder};
+ use tempfile::TempDir;
+ 
++/// ~2x num_cpus so every scenario oversubscribes the box and lands in
++/// the negative-scaling regime the perf work measured — maximum latch
++/// contention + optimistic-restart pressure.
++fn oversubscribed_threads() -> usize {
++    let cpus = std::thread::available_parallelism()
++        .map(std::num::NonZeroUsize::get)
++        .unwrap_or(4);
++    (cpus * 2).max(8)
++}
++
++/// Cumulative optimistic-write/read restarts observed by the buffer
++/// manager. Asserted to be bounded after each scenario (livelock
++/// detector): the restart budget escalates to the always-progressing
++/// pessimistic path, so restarts must stay a small multiple of the op
++/// count, never an unbounded climb.
++fn optimistic_restarts(tree: &Tree) -> u64 {
++    tree.stats().expect("stats").bm_optimistic_restarts
++}
++
++/// Optimistic-restart budget per op before the walker escalates to the
++/// always-progressing pessimistic path (mirrors
++/// `walker::lookup::OPTIMISTIC_RESTART_BUDGET`). Each foreground op can
++/// thus contribute at most this many restarts; a cumulative count above
++/// `ops * BUDGET` (with generous slack) means the budget→fallback
++/// livelock guard failed.
++const RESTART_BUDGET_PER_OP: u64 = 4;
++
++/// Assert the cumulative optimistic-restart count is bounded by the
++/// per-op budget (livelock detector). `total_ops` is the number of
++/// mutating ops issued; the bound includes generous slack for read-path
++/// restarts in the verification phase.
++fn assert_restarts_bounded(tree: &Tree, total_ops: u64) {
++    let restarts = optimistic_restarts(tree);
++    let ceiling = total_ops
++        .saturating_mul(RESTART_BUDGET_PER_OP)
++        .saturating_add(1_000);
++    assert!(
++        restarts <= ceiling,
++        "optimistic restarts {restarts} exceed budget ceiling {ceiling} \
++         for {total_ops} ops (livelock — budget→pessimistic fallback failed?)"
++    );
++}
++
+ /// A durable tree with the background checkpointer + journal running,
+ /// WAL without per-op fsync (the "hot service" profile the perf work
+ /// measured). Returns `(dir, tree)` with `dir` first so the `Tree`
+@@ -56,13 +107,13 @@ fn val(thread: usize, i: usize, rev: u64) -> Vec<u8> {
+ /// lost or cross-thread-corrupted write fails here.
+ #[test]
+ fn concurrent_disjoint_writes_all_durable() {
+-    const THREADS: usize = 8;
+-    const PER_THREAD: usize = 4_000; // 32k keys -> spans several blobs
++    let threads = oversubscribed_threads();
++    const PER_THREAD: usize = 4_000; // 32k+ keys -> spans several blobs
+ 
+     let (_dir, tree) = durable_tree();
+-    let barrier = Arc::new(Barrier::new(THREADS));
++    let barrier = Arc::new(Barrier::new(threads));
+     let mut handles = Vec::new();
+-    for t in 0..THREADS {
++    for t in 0..threads {
+         let tree = tree.clone();
+         let barrier = barrier.clone();
+         handles.push(thread::spawn(move || {
+@@ -76,7 +127,7 @@ fn concurrent_disjoint_writes_all_durable() {
+         h.join().expect("thread");
+     }
+ 
+-    for t in 0..THREADS {
++    for t in 0..threads {
+         for i in 0..PER_THREAD {
+             assert_eq!(
+                 tree.get(&key(t, i)).expect("get").as_deref(),
+@@ -85,6 +136,9 @@ fn concurrent_disjoint_writes_all_durable() {
+             );
+         }
+     }
++
++    let total_ops = (threads * PER_THREAD) as u64;
++    assert_restarts_bounded(&tree, total_ops);
+ }
+ 
+ /// Disjoint ranges, but each thread put → overwrite → delete-evens.
+@@ -93,13 +147,13 @@ fn concurrent_disjoint_writes_all_durable() {
+ /// concurrency.
+ #[test]
+ fn concurrent_put_overwrite_delete_is_consistent() {
+-    const THREADS: usize = 8;
++    let threads = oversubscribed_threads();
+     const PER_THREAD: usize = 3_000;
+ 
+     let (_dir, tree) = durable_tree();
+-    let barrier = Arc::new(Barrier::new(THREADS));
++    let barrier = Arc::new(Barrier::new(threads));
+     let mut handles = Vec::new();
+-    for t in 0..THREADS {
++    for t in 0..threads {
+         let tree = tree.clone();
+         let barrier = barrier.clone();
+         handles.push(thread::spawn(move || {
+@@ -120,7 +174,7 @@ fn concurrent_put_overwrite_delete_is_consistent() {
+         h.join().expect("thread");
+     }
+ 
+-    for t in 0..THREADS {
++    for t in 0..threads {
+         for i in 0..PER_THREAD {
+             let got = tree.get(&key(t, i)).expect("get");
+             if i % 2 == 0 {
+@@ -134,6 +188,10 @@ fn concurrent_put_overwrite_delete_is_consistent() {
+             }
+         }
+     }
++
++    // put + overwrite + delete-evens = 2.5 mutating ops per key.
++    let total_ops = (threads * PER_THREAD) as u64 * 3;
++    assert_restarts_bounded(&tree, total_ops);
+ }
+ 
+ /// All threads write the SAME shared keys (maximum latch contention on
+@@ -143,14 +201,14 @@ fn concurrent_put_overwrite_delete_is_consistent() {
+ /// catching torn/corrupted writes under contention.
+ #[test]
+ fn concurrent_overlapping_writes_no_torn_values() {
+-    const THREADS: usize = 8;
++    let threads = oversubscribed_threads();
+     const SHARED_KEYS: usize = 2_000;
+     const ROUNDS: usize = 3;
+ 
+     let (_dir, tree) = durable_tree();
+-    let barrier = Arc::new(Barrier::new(THREADS));
++    let barrier = Arc::new(Barrier::new(threads));
+     let mut handles = Vec::new();
+-    for t in 0..THREADS {
++    for t in 0..threads {
+         let tree = tree.clone();
+         let barrier = barrier.clone();
+         handles.push(thread::spawn(move || {
+@@ -179,8 +237,139 @@ fn concurrent_overlapping_writes_no_torn_values() {
+         let wt: usize = parts[0].parse().expect("bad thread tag (torn)");
+         let wi: usize = parts[1].parse().expect("bad index tag (torn)");
+         let wr: u64 = parts[2].parse().expect("bad round tag (torn)");
+-        assert!(wt < THREADS, "impossible thread tag {wt}");
++        assert!(wt < threads, "impossible thread tag {wt}");
+         assert_eq!(wi, i, "value belongs to a different key (corruption): {s:?}");
+         assert!((wr as usize) < ROUNDS, "impossible round tag {wr}");
+     }
++
++    let total_ops = (threads * SHARED_KEYS * ROUNDS) as u64;
++    assert_restarts_bounded(&tree, total_ops);
++}
++
++/// SHARED-UPPER-BLOB scenario: every thread writes DIFFERENT keys that
++/// share a long common path prefix, so they all route through the SAME
++/// intermediate blob (max upper-blob version churn + optimistic-restart
++/// pressure) but their leaves land in different leaf blobs once the
++/// prefix subtree spills. This is the *primary* detector for the
++/// optimistic write descent: a thread inserting under the shared prefix
++/// bumps the intermediate blob's version, and every other in-flight
++/// writer's parent-chain re-validation must catch that (restart) rather
++/// than mutate against a moved path. A missed re-validation persists a
++/// cross-key corruption that the per-key read-back below catches.
++#[test]
++fn concurrent_shared_upper_blob_disjoint_leaves() {
++    let threads = oversubscribed_threads();
++    const PER_THREAD: usize = 6_000;
++
++    let (_dir, tree) = durable_tree();
++    let barrier = Arc::new(Barrier::new(threads));
++    let mut handles = Vec::new();
++    for t in 0..threads {
++        let tree = tree.clone();
++        let barrier = barrier.clone();
++        handles.push(thread::spawn(move || {
++            barrier.wait();
++            for i in 0..PER_THREAD {
++                // Long shared prefix `deep/shared/prefix/` forces every
++                // writer through one intermediate blob; the disjoint
++                // `t{t}/{i}` suffix lands each leaf in its owning region.
++                let k = format!("deep/shared/prefix/t{t:03}/{i:08}").into_bytes();
++                let v = format!("leaf-{t}-{i}").into_bytes();
++                tree.put(&k, &v).expect("put");
++            }
++        }));
++    }
++    for h in handles {
++        h.join().expect("thread");
++    }
++
++    for t in 0..threads {
++        for i in 0..PER_THREAD {
++            let k = format!("deep/shared/prefix/t{t:03}/{i:08}").into_bytes();
++            let got = tree.get(&k).expect("get");
++            assert_eq!(
++                got.as_deref(),
++                Some(format!("leaf-{t}-{i}").as_bytes()),
++                "lost/cross-key-corrupt write at t{t} i{i}",
++            );
++        }
++    }
++
++    let total_ops = (threads * PER_THREAD) as u64;
++    assert_restarts_bounded(&tree, total_ops);
++}
++
++/// CoW-fork escalation under concurrency: a reader thread holds a
++/// whole-tree snapshot/view alive across a window while writer threads
++/// hammer DISJOINT keys. The live snapshot raises the buffer manager's
++/// fork barrier, so every writer that descends into a snapshot-shared
++/// blob must escalate (`Escalate(SnapshotSharedChild)`) to the
++/// pessimistic path, which forks the frame under the parent's exclusive
++/// latch. This exercises the escalation branch + the CoW fork
++/// concurrently with the optimistic fast path. The snapshot must stay a
++/// stable point-in-time view, and the live tree must read back every
++/// writer's value.
++#[test]
++fn concurrent_writes_with_live_snapshot_force_cow_escalation() {
++    let threads = oversubscribed_threads();
++    const PER_THREAD: usize = 3_000;
++
++    let (_dir, tree) = durable_tree();
++
++    // Seed a baseline the snapshot will freeze.
++    for t in 0..threads {
++        for i in 0..PER_THREAD {
++            tree.put(&key(t, i), &val(t, i, 1)).expect("seed");
++        }
++    }
++
++    // Capture a whole-tree snapshot and hold it live across the writers
++    // (raising the fork barrier for the entire write window).
++    let snap = tree.snapshot(b"").expect("snapshot");
++
++    let barrier = Arc::new(Barrier::new(threads));
++    let mut handles = Vec::new();
++    for t in 0..threads {
++        let tree = tree.clone();
++        let barrier = barrier.clone();
++        handles.push(thread::spawn(move || {
++            barrier.wait();
++            // Overwrite each seeded key to a new revision — these writes
++            // must CoW-fork frames the snapshot still references.
++            for i in 0..PER_THREAD {
++                tree.put(&key(t, i), &val(t, i, 2)).expect("overwrite");
++            }
++        }));
++    }
++    for h in handles {
++        h.join().expect("thread");
++    }
++
++    // The snapshot is a frozen point-in-time view: every key still reads
++    // its rev-1 value despite the concurrent rev-2 overwrites + forks.
++    let view = snap.view();
++    for t in 0..threads {
++        for i in 0..PER_THREAD {
++            assert_eq!(
++                view.get(&key(t, i)).expect("snap get").as_deref(),
++                Some(val(t, i, 1).as_slice()),
++                "snapshot saw a concurrent overwrite at t{t} i{i}",
++            );
++        }
++    }
++    drop(snap);
++
++    // The live tree reflects every rev-2 overwrite, none lost/corrupted.
++    for t in 0..threads {
++        for i in 0..PER_THREAD {
++            assert_eq!(
++                tree.get(&key(t, i)).expect("get").as_deref(),
++                Some(val(t, i, 2).as_slice()),
++                "lost/corrupt overwrite at t{t} i{i}",
++            );
++        }
++    }
++
++    let total_ops = (threads * PER_THREAD * 2) as u64; // seed + overwrite
++    assert_restarts_bounded(&tree, total_ops);
+ }
