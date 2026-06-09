@@ -2,11 +2,11 @@ use crate::api::errors::{Error, Result};
 use crate::layout::{
     BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
 };
-use crate::store::{BlobFrameRef, ColdBlobLookup};
+use crate::store::BlobFrameRef;
 use std::mem::size_of;
 
+use super::cast;
 use super::readers::{child_offset, resolve_typed};
-use super::{cast, SearchKey};
 
 #[derive(Debug, Default)]
 pub(crate) struct ColdBlobSummary {
@@ -40,44 +40,6 @@ pub(crate) fn summarize_blob_for_cold_index(
     let root = child_offset(root_slot);
     summarize_node(frame, root, inline_value_limit, &mut prefix, &mut out)?;
     Ok(out)
-}
-
-pub(crate) fn lookup_cold_summary(
-    summary: &ColdBlobSummary,
-    key: &[u8],
-    depth: usize,
-) -> ColdBlobLookup {
-    for leaf in &summary.leaves {
-        if leaf.key == key {
-            return match &leaf.value {
-                Some(value) => ColdBlobLookup::Found {
-                    value: value.clone(),
-                    seq: leaf.seq,
-                },
-                None => ColdBlobLookup::Unknown,
-            };
-        }
-    }
-
-    let search = SearchKey::user(key);
-    let mut best: Option<&ColdCrossing> = None;
-    for crossing in &summary.crossings {
-        if search.range_eq(depth, &crossing.prefix) {
-            match best {
-                Some(existing) if existing.prefix.len() >= crossing.prefix.len() => {}
-                _ => best = Some(crossing),
-            }
-        }
-    }
-
-    if let Some(crossing) = best {
-        return ColdBlobLookup::Crossing {
-            child_guid: crossing.child_guid,
-            child_depth: depth + crossing.prefix.len(),
-        };
-    }
-
-    ColdBlobLookup::NotFound
 }
 
 fn summarize_node(

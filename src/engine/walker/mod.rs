@@ -62,9 +62,7 @@ mod writers;
 // submodule paths and are only consumed by sibling submodules and
 // the walker's own `tests`.
 
-pub(crate) use cold::{
-    lookup_cold_summary, summarize_blob_for_cold_index, ColdBlobSummary, ColdCrossing, ColdLeaf,
-};
+pub(crate) use cold::{summarize_blob_for_cold_index, ColdBlobSummary, ColdCrossing, ColdLeaf};
 pub use erase::{erase_multi, erase_multi_conditional};
 pub use insert::{insert_multi, insert_multi_conditional};
 pub(crate) use insert::{insert_multi_batch_conditional, InsertBatchItem};

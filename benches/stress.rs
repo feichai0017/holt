@@ -21,8 +21,11 @@ use std::time::{Duration, Instant};
 
 use holt::{KeyRangeEntry, RangeEntry, Tree, TreeConfig};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
+#[cfg(feature = "comparators")]
 use rocksdb::{Options, WriteBatch, WriteOptions, DB};
+#[cfg(feature = "comparators")]
 use rusqlite::{params, Connection, OptionalExtension};
+#[cfg(feature = "comparators")]
 use sled::{Db as SledDb, Mode as SledMode};
 use tempfile::TempDir;
 
@@ -32,8 +35,13 @@ const DEFAULT_LIST_OPS: usize = 1_000_000;
 const DEFAULT_LIST_TAKE: usize = 100;
 const DEFAULT_DIR_TAKE: usize = 8;
 const DEFAULT_BUFFER_POOL: usize = 64;
+#[cfg(feature = "comparators")]
 const PRELOAD_BATCH: usize = 10_000;
 const SEED: u64 = 0xD15E_A5ED_2000_0001;
+#[cfg(feature = "comparators")]
+const DEFAULT_ENGINES: &str = "holt,rocksdb,sqlite";
+#[cfg(not(feature = "comparators"))]
+const DEFAULT_ENGINES: &str = "holt";
 
 #[derive(Debug, Clone, Copy)]
 enum Workload {
@@ -141,6 +149,7 @@ struct StressConfig {
     buffer_pool_size: usize,
     wal_sync: bool,
     reopen_after_preload: bool,
+    drop_cold_index_after_preload: bool,
     engines: Vec<String>,
     ops: Vec<String>,
 }
@@ -153,7 +162,7 @@ impl StressConfig {
             .map(Workload::parse)
             .unwrap_or(Workload::Objstore);
         let engines = env::var("HOLT_STRESS_ENGINES")
-            .unwrap_or_else(|_| "holt,rocksdb,sqlite".to_string())
+            .unwrap_or_else(|_| DEFAULT_ENGINES.to_string())
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -182,6 +191,10 @@ impl StressConfig {
             reopen_after_preload: env::var("HOLT_STRESS_REOPEN_AFTER_PRELOAD")
                 .as_deref()
                 .map(|s| parse_bool_env("HOLT_STRESS_REOPEN_AFTER_PRELOAD", s))
+                .unwrap_or(false),
+            drop_cold_index_after_preload: env::var("HOLT_STRESS_DROP_COLD_INDEX_AFTER_PRELOAD")
+                .as_deref()
+                .map(|s| parse_bool_env("HOLT_STRESS_DROP_COLD_INDEX_AFTER_PRELOAD", s))
                 .unwrap_or(false),
             engines,
             ops,
@@ -222,24 +235,40 @@ fn main() {
         cfg.ops.join(","),
     );
     println!(
-        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={}",
-        cfg.wal_sync, cfg.reopen_after_preload
+        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={},drop_cold_index_after_preload={}",
+        cfg.wal_sync, cfg.reopen_after_preload, cfg.drop_cold_index_after_preload
     );
 
     let samples = make_samples(cfg.workload, cfg.n_keys, cfg.point_ops);
+    reject_missing_comparators(&cfg);
     if cfg.selected("holt") {
         run_holt(&cfg, &samples);
     }
+    #[cfg(feature = "comparators")]
     if cfg.selected("rocksdb") {
         run_rocksdb(&cfg, &samples);
     }
+    #[cfg(feature = "comparators")]
     if cfg.selected("sqlite") {
         run_sqlite(&cfg, &samples);
     }
+    #[cfg(feature = "comparators")]
     if cfg.selected("sled") {
         run_sled(&cfg, &samples);
     }
 }
+
+#[cfg(not(feature = "comparators"))]
+fn reject_missing_comparators(cfg: &StressConfig) {
+    for engine in ["rocksdb", "sqlite", "sled"] {
+        if cfg.selected(engine) {
+            panic!("stress comparator `{engine}` requires the `comparators` feature");
+        }
+    }
+}
+
+#[cfg(feature = "comparators")]
+fn reject_missing_comparators(_cfg: &StressConfig) {}
 
 fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     let dir = TempDir::new().expect("holt tempdir");
@@ -253,6 +282,15 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     print_holt_shape("ready", &tree);
     if cfg.reopen_after_preload {
         drop(tree);
+        if cfg.drop_cold_index_after_preload {
+            let path = dir.path().join("cold.idx");
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    panic!("remove cold index before reopen: {e}");
+                }
+            }
+            println!("holt_shape dropped_cold_index_before_reopen=1");
+        }
         tree = Tree::open(tree_cfg).expect("holt reopen");
         println!("holt_shape reopened deferred_until_after_timing=1");
     }
@@ -317,6 +355,7 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
     print_holt_shape("final", &tree);
 }
 
+#[cfg(feature = "comparators")]
 fn run_rocksdb(cfg: &StressConfig, samples: &[OpSample]) {
     let rocksdb_dir = TempDir::new().expect("rocksdb tempdir");
     let mut db = make_rocksdb(&rocksdb_dir);
@@ -383,6 +422,7 @@ fn run_rocksdb(cfg: &StressConfig, samples: &[OpSample]) {
     }
 }
 
+#[cfg(feature = "comparators")]
 fn run_sqlite(cfg: &StressConfig, samples: &[OpSample]) {
     let sqlite_dir = TempDir::new().expect("sqlite tempdir");
     let mut conn = make_sqlite_persistent(&sqlite_dir);
@@ -451,6 +491,7 @@ fn run_sqlite(cfg: &StressConfig, samples: &[OpSample]) {
     }
 }
 
+#[cfg(feature = "comparators")]
 fn run_sled(cfg: &StressConfig, samples: &[OpSample]) {
     let sled_dir = TempDir::new().expect("sled tempdir");
     let mut db = make_sled_persistent(&sled_dir);
@@ -532,6 +573,7 @@ fn preload_holt(tree: &Tree, workload: Workload, n_keys: usize) {
     }
 }
 
+#[cfg(feature = "comparators")]
 fn preload_rocksdb(db: &DB, workload: Workload, n_keys: usize) {
     let wo = rocksdb_write_opts();
     let mut batch = WriteBatch::default();
@@ -556,6 +598,7 @@ fn preload_rocksdb(db: &DB, workload: Workload, n_keys: usize) {
     }
 }
 
+#[cfg(feature = "comparators")]
 fn preload_sqlite(conn: &Connection, workload: Workload, n_keys: usize) {
     progress("sqlite", "preload", 0, n_keys);
     let tx = conn.unchecked_transaction().expect("sqlite preload tx");
@@ -576,6 +619,7 @@ fn preload_sqlite(conn: &Connection, workload: Workload, n_keys: usize) {
     tx.commit().expect("sqlite preload commit");
 }
 
+#[cfg(feature = "comparators")]
 fn preload_sled(db: &SledDb, workload: Workload, n_keys: usize) {
     progress("sled", "preload", 0, n_keys);
     for i in 0..n_keys {
@@ -612,12 +656,14 @@ fn time_mixed_holt(tree: &Tree, samples: &[OpSample]) -> Duration {
     })
 }
 
+#[cfg(feature = "comparators")]
 fn time_get_rocksdb(db: &DB, samples: &[OpSample]) -> Duration {
     time_samples(samples, |sample| {
         black_box(db.get(black_box(&sample.key)).expect("rocksdb get"));
     })
 }
 
+#[cfg(feature = "comparators")]
 fn time_put_rocksdb(db: &DB, wo: &WriteOptions, samples: &[OpSample]) -> Duration {
     time_samples(samples, |sample| {
         db.put_opt(black_box(&sample.key), black_box(&sample.value), wo)
@@ -625,6 +671,7 @@ fn time_put_rocksdb(db: &DB, wo: &WriteOptions, samples: &[OpSample]) -> Duratio
     })
 }
 
+#[cfg(feature = "comparators")]
 fn time_mixed_rocksdb(db: &DB, wo: &WriteOptions, samples: &[OpSample]) -> Duration {
     time_samples_indexed(samples, |i, sample| {
         if i & 1 == 0 {
@@ -636,6 +683,7 @@ fn time_mixed_rocksdb(db: &DB, wo: &WriteOptions, samples: &[OpSample]) -> Durat
     })
 }
 
+#[cfg(feature = "comparators")]
 fn time_get_sqlite(conn: &Connection, samples: &[OpSample]) -> Duration {
     let mut stmt = conn
         .prepare("SELECT v FROM kv WHERE k = ?")
@@ -648,6 +696,7 @@ fn time_get_sqlite(conn: &Connection, samples: &[OpSample]) -> Duration {
     })
 }
 
+#[cfg(feature = "comparators")]
 fn time_put_sqlite(conn: &Connection, samples: &[OpSample]) -> Duration {
     let mut stmt = conn
         .prepare("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)")
@@ -658,6 +707,7 @@ fn time_put_sqlite(conn: &Connection, samples: &[OpSample]) -> Duration {
     })
 }
 
+#[cfg(feature = "comparators")]
 fn time_mixed_sqlite(conn: &Connection, samples: &[OpSample]) -> Duration {
     let mut get_stmt = conn
         .prepare("SELECT v FROM kv WHERE k = ?")
@@ -679,12 +729,14 @@ fn time_mixed_sqlite(conn: &Connection, samples: &[OpSample]) -> Duration {
     })
 }
 
+#[cfg(feature = "comparators")]
 fn time_get_sled(db: &SledDb, samples: &[OpSample]) -> Duration {
     time_samples(samples, |sample| {
         black_box(db.get(black_box(&sample.key)).expect("sled get"));
     })
 }
 
+#[cfg(feature = "comparators")]
 fn time_put_sled(db: &SledDb, samples: &[OpSample]) -> Duration {
     time_samples(samples, |sample| {
         db.insert(black_box(&sample.key), black_box(sample.value.as_slice()))
@@ -692,6 +744,7 @@ fn time_put_sled(db: &SledDb, samples: &[OpSample]) -> Duration {
     })
 }
 
+#[cfg(feature = "comparators")]
 fn time_mixed_sled(db: &SledDb, samples: &[OpSample]) -> Duration {
     time_samples_indexed(samples, |i, sample| {
         if i & 1 == 0 {
@@ -770,6 +823,7 @@ fn holt_list_dir(tree: &Tree, prefix: &[u8], delim: u8, take: usize) -> usize {
     seen
 }
 
+#[cfg(feature = "comparators")]
 fn rocksdb_list_plain(db: &DB, prefix: &[u8], take: usize) -> usize {
     let mut seen = 0usize;
     let mut iter = db.raw_iterator();
@@ -788,6 +842,7 @@ fn rocksdb_list_plain(db: &DB, prefix: &[u8], take: usize) -> usize {
     seen
 }
 
+#[cfg(feature = "comparators")]
 fn rocksdb_list_dir(db: &DB, prefix: &[u8], delim: u8, take: usize) -> usize {
     let mut seen = 0usize;
     let mut iter = db.raw_iterator();
@@ -811,6 +866,7 @@ fn rocksdb_list_dir(db: &DB, prefix: &[u8], delim: u8, take: usize) -> usize {
     seen
 }
 
+#[cfg(feature = "comparators")]
 fn sqlite_list_plain(conn: &Connection, prefix: &[u8], upper: &[u8], take: usize) -> usize {
     let mut stmt = conn
         .prepare_cached("SELECT k FROM kv WHERE k >= ? AND k < ? ORDER BY k LIMIT ?")
@@ -828,6 +884,7 @@ fn sqlite_list_plain(conn: &Connection, prefix: &[u8], upper: &[u8], take: usize
     seen
 }
 
+#[cfg(feature = "comparators")]
 fn sqlite_list_dir(
     conn: &Connection,
     prefix: &[u8],
@@ -864,6 +921,7 @@ fn sqlite_list_dir(
     seen
 }
 
+#[cfg(feature = "comparators")]
 fn sled_list_plain(db: &SledDb, prefix: &[u8], take: usize) -> usize {
     let mut seen = 0usize;
     for item in db.scan_prefix(prefix) {
@@ -876,6 +934,7 @@ fn sled_list_plain(db: &SledDb, prefix: &[u8], take: usize) -> usize {
     seen
 }
 
+#[cfg(feature = "comparators")]
 fn sled_list_dir(db: &SledDb, prefix: &[u8], delim: u8, take: usize) -> usize {
     let mut seen = 0usize;
     let mut cursor = prefix.to_vec();
@@ -900,16 +959,19 @@ fn sled_list_dir(db: &SledDb, prefix: &[u8], delim: u8, take: usize) -> usize {
     seen
 }
 
+#[cfg(feature = "comparators")]
 fn delimiter_successor(key: &[u8], prefix_len: usize, delim: u8) -> Option<Vec<u8>> {
     let rest = &key[prefix_len..];
     let idx = rest.iter().position(|b| *b == delim)?;
     Some(key_successor(&key[..=prefix_len + idx]))
 }
 
+#[cfg(feature = "comparators")]
 fn prefix_upper(prefix: &[u8]) -> Vec<u8> {
     key_successor(prefix)
 }
 
+#[cfg(feature = "comparators")]
 fn key_successor(key: &[u8]) -> Vec<u8> {
     let mut upper = key.to_vec();
     let last = upper.last_mut().expect("key must be non-empty");
@@ -917,6 +979,7 @@ fn key_successor(key: &[u8]) -> Vec<u8> {
     upper
 }
 
+#[cfg(feature = "comparators")]
 fn make_rocksdb(dir: &TempDir) -> DB {
     let mut opts = Options::default();
     opts.create_if_missing(true);
@@ -926,6 +989,7 @@ fn make_rocksdb(dir: &TempDir) -> DB {
     DB::open(&opts, dir.path()).expect("rocksdb open")
 }
 
+#[cfg(feature = "comparators")]
 fn rocksdb_write_opts() -> WriteOptions {
     let mut wo = WriteOptions::default();
     wo.disable_wal(false);
@@ -933,6 +997,7 @@ fn rocksdb_write_opts() -> WriteOptions {
     wo
 }
 
+#[cfg(feature = "comparators")]
 fn make_sqlite_persistent(dir: &TempDir) -> Connection {
     let conn = Connection::open(dir.path().join("sqlite.db")).expect("sqlite open");
     conn.execute_batch(
@@ -946,6 +1011,7 @@ fn make_sqlite_persistent(dir: &TempDir) -> Connection {
     conn
 }
 
+#[cfg(feature = "comparators")]
 fn make_sled_persistent(dir: &TempDir) -> SledDb {
     sled::Config::new()
         .path(dir.path())

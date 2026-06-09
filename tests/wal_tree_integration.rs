@@ -1350,10 +1350,20 @@ fn cold_sidecar_serves_checkpointed_child_blob_after_reopen() {
         before.bm_point_full_blob_reads,
         after.bm_point_full_blob_reads,
     );
+    assert!(
+        after.bm_cold_lookup_hits > before.bm_cold_lookup_hits,
+        "cold sidecar should serve the target leaf"
+    );
+    let before_miss = after;
     assert!(tree
-        .get(b"cold/bucket/table/missing/object")
+        .get(b"cold/bucket/table/part-0999/missing")
         .unwrap()
         .is_none());
+    let after_miss = tree.stats().unwrap();
+    assert!(
+        after_miss.bm_cold_lookup_negatives > before_miss.bm_cold_lookup_negatives,
+        "cold sidecar should prove a missing key without loading the child blob"
+    );
 }
 
 #[test]

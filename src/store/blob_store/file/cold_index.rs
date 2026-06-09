@@ -1,5 +1,7 @@
 use crate::api::errors::{Error, Result};
-use crate::engine::{lookup_cold_summary, summarize_blob_for_cold_index, ColdBlobSummary};
+use crate::engine::{
+    summarize_blob_for_cold_index, ColdBlobSummary, ColdCrossing, ColdLeaf, SearchKey,
+};
 use crate::layout::BlobGuid;
 use crate::store::{BlobFrameRef, ColdBlobLookup};
 use std::collections::HashMap;
@@ -8,7 +10,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 const COLD_MAGIC: [u8; 4] = *b"HCI1";
 const COLD_HEADER_SIZE: usize = 12;
@@ -20,7 +22,7 @@ const COLD_MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug)]
 pub(super) struct ColdIndex {
     file: Mutex<File>,
-    directory: RwLock<HashMap<BlobGuid, ColdIndexMeta>>,
+    directory: RwLock<HashMap<BlobGuid, Arc<ColdIndexEntry>>>,
     dirty: AtomicBool,
 }
 
@@ -30,6 +32,19 @@ struct ColdIndexMeta {
     payload_offset: u64,
     payload_len: u32,
     crc: u32,
+}
+
+#[derive(Debug)]
+struct ColdIndexEntry {
+    meta: ColdIndexMeta,
+    table: Mutex<Option<Arc<ColdLookupTable>>>,
+}
+
+#[derive(Debug)]
+struct ColdLookupTable {
+    leaves: Vec<ColdLeaf>,
+    leaf_index: HashMap<u64, Vec<usize>>,
+    crossings: Vec<ColdCrossing>,
 }
 
 impl ColdIndex {
@@ -59,10 +74,14 @@ impl ColdIndex {
         };
         let payload = encode_set(guid, generation, &summary)?;
         let meta = self.append_payload(&payload)?;
-        self.directory
-            .write()
-            .unwrap()
-            .insert(guid, ColdIndexMeta { generation, ..meta });
+        let table = Arc::new(ColdLookupTable::from_summary(summary));
+        self.directory.write().unwrap().insert(
+            guid,
+            Arc::new(ColdIndexEntry::with_table(
+                ColdIndexMeta { generation, ..meta },
+                table,
+            )),
+        );
         Ok(())
     }
 
@@ -80,27 +99,21 @@ impl ColdIndex {
         key: &[u8],
         depth: usize,
     ) -> Result<ColdBlobLookup> {
-        let meta = {
+        let entry = {
             let directory = self.directory.read().unwrap();
-            let Some(meta) = directory.get(&guid).copied() else {
+            let Some(entry) = directory.get(&guid).cloned() else {
                 return Ok(ColdBlobLookup::Unknown);
             };
-            if meta.generation != generation {
+            if entry.meta.generation != generation {
                 return Ok(ColdBlobLookup::Unknown);
             }
-            meta
+            entry
         };
 
-        let mut payload = vec![0u8; meta.payload_len as usize];
-        {
-            let file = self.file.lock().unwrap();
-            file.read_exact_at(&mut payload, meta.payload_offset)?;
-        }
-        if crc32fast::hash(&payload) != meta.crc {
+        let Some(table) = entry.lookup_table(&self.file, guid)? else {
             return Ok(ColdBlobLookup::Unknown);
-        }
-        let summary = decode_set_payload(&payload, guid, generation)?;
-        Ok(lookup_cold_summary(&summary, key, depth))
+        };
+        Ok(table.lookup(key, depth))
     }
 
     pub(super) fn flush(&self) -> Result<()> {
@@ -141,7 +154,109 @@ impl ColdIndex {
     }
 }
 
-fn replay(path: &PathBuf) -> Result<(HashMap<BlobGuid, ColdIndexMeta>, u64)> {
+impl ColdIndexEntry {
+    fn new(meta: ColdIndexMeta) -> Self {
+        Self {
+            meta,
+            table: Mutex::new(None),
+        }
+    }
+
+    fn with_table(meta: ColdIndexMeta, table: Arc<ColdLookupTable>) -> Self {
+        Self {
+            meta,
+            table: Mutex::new(Some(table)),
+        }
+    }
+
+    fn lookup_table(
+        &self,
+        file: &Mutex<File>,
+        guid: BlobGuid,
+    ) -> Result<Option<Arc<ColdLookupTable>>> {
+        let mut table = self.table.lock().unwrap();
+        if let Some(table) = table.as_ref() {
+            return Ok(Some(Arc::clone(table)));
+        }
+
+        let mut payload = vec![0u8; self.meta.payload_len as usize];
+        {
+            let file = file.lock().unwrap();
+            file.read_exact_at(&mut payload, self.meta.payload_offset)?;
+        }
+        if crc32fast::hash(&payload) != self.meta.crc {
+            return Ok(None);
+        }
+        let Ok(summary) = decode_set_payload(&payload, guid, self.meta.generation) else {
+            return Ok(None);
+        };
+        let loaded = Arc::new(ColdLookupTable::from_summary(summary));
+        *table = Some(Arc::clone(&loaded));
+        Ok(Some(loaded))
+    }
+}
+
+impl ColdLookupTable {
+    fn from_summary(summary: ColdBlobSummary) -> Self {
+        let mut leaf_index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(summary.leaves.len());
+        for (idx, leaf) in summary.leaves.iter().enumerate() {
+            leaf_index.entry(key_hash(&leaf.key)).or_default().push(idx);
+        }
+        Self {
+            leaves: summary.leaves,
+            leaf_index,
+            crossings: summary.crossings,
+        }
+    }
+
+    fn lookup(&self, key: &[u8], depth: usize) -> ColdBlobLookup {
+        if let Some(candidates) = self.leaf_index.get(&key_hash(key)) {
+            for idx in candidates {
+                let leaf = &self.leaves[*idx];
+                if leaf.key == key {
+                    return match &leaf.value {
+                        Some(value) => ColdBlobLookup::Found {
+                            value: value.clone(),
+                            seq: leaf.seq,
+                        },
+                        None => ColdBlobLookup::Unknown,
+                    };
+                }
+            }
+        }
+
+        let search = SearchKey::user(key);
+        let mut best: Option<&ColdCrossing> = None;
+        for crossing in &self.crossings {
+            if search.range_eq(depth, &crossing.prefix) {
+                match best {
+                    Some(existing) if existing.prefix.len() >= crossing.prefix.len() => {}
+                    _ => best = Some(crossing),
+                }
+            }
+        }
+
+        if let Some(crossing) = best {
+            return ColdBlobLookup::Crossing {
+                child_guid: crossing.child_guid,
+                child_depth: depth + crossing.prefix.len(),
+            };
+        }
+
+        ColdBlobLookup::NotFound
+    }
+}
+
+fn key_hash(key: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in key {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+fn replay(path: &PathBuf) -> Result<(HashMap<BlobGuid, Arc<ColdIndexEntry>>, u64)> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((HashMap::new(), 0)),
@@ -186,12 +301,12 @@ fn replay(path: &PathBuf) -> Result<(HashMap<BlobGuid, ColdIndexMeta>, u64)> {
                 };
                 directory.insert(
                     guid,
-                    ColdIndexMeta {
+                    Arc::new(ColdIndexEntry::new(ColdIndexMeta {
                         generation,
                         payload_offset,
                         payload_len,
                         crc,
-                    },
+                    })),
                 );
             }
             Some(COLD_TY_DELETE) => {
