@@ -116,9 +116,15 @@ const REGISTERED_BUFFER_MAX_SLOTS: usize = 32;
 const MANIFEST_MAGIC: [u8; 8] = *b"ARTSNMNF";
 /// Manifest format version. Bumped on any breaking change.
 ///
-/// A v1 file is refused on load — the on-disk format is pre-1.0 and
-/// not migrated.
-const MANIFEST_VERSION: u16 = 2;
+/// Older-version files are refused on load — the on-disk format is
+/// not migrated. v3 introduced the flattened single-encoding leaf
+/// (one contiguous `[16B header][key][value]` node). v4 switches node
+/// addressing from 1-based slot indices to body byte offsets: child
+/// fields (`children[N]`, `Prefix.child`, `header.root`) now store a
+/// biased `byte_offset/8` instead of a slot, and the Leaf header was
+/// reordered to carry a self-describing `node_type @ +1` byte. Both
+/// change the on-blob byte layout, so v3 files are refused on load.
+const MANIFEST_VERSION: u16 = 4;
 /// Per-record magic for `manifest.log`.
 const MANIFEST_LOG_MAGIC: [u8; 4] = *b"MLG1";
 const MANIFEST_LOG_TY_SET: u8 = 1;
@@ -859,7 +865,7 @@ impl Manifest {
         let version = u16::from_le_bytes([hdr[8], hdr[9]]);
         if version != MANIFEST_VERSION {
             return Err(Error::node_corrupt(
-                "FileBlobStore::Manifest::version (v1 manifests are not migrated)",
+                "FileBlobStore::Manifest::version (older manifests are not migrated)",
             ));
         }
         let count = u32::from_le_bytes([hdr[10], hdr[11], hdr[12], hdr[13]]) as usize;

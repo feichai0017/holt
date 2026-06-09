@@ -100,9 +100,9 @@ pub enum EraseCondition {
 /// Return-value carried up an `insert_at` recursion.
 #[derive(Debug)]
 pub(super) struct InsertReturn {
-    /// What slot the parent should now point at — may be the same
-    /// as the input slot or may be a freshly-allocated promotion.
-    pub(super) slot_after: u16,
+    /// Byte offset the parent should now point at — may be the same
+    /// as the input node's offset or a freshly-allocated promotion.
+    pub(super) off_after: u32,
     /// `true` iff bytes changed in the blob.
     pub(super) mutated: bool,
 }
@@ -110,15 +110,15 @@ pub(super) struct InsertReturn {
 /// What an erase descent tells its parent to do.
 #[derive(Debug)]
 pub(super) enum EraseSignal {
-    /// Slot stays as-is — nothing to rewire above.
+    /// Node stays as-is — nothing to rewire above.
     Unchanged,
-    /// The subtree at this slot disappeared entirely. Parent should
+    /// The subtree at this node disappeared entirely. Parent should
     /// drop the corresponding child entry and (if it now has 0
-    /// remaining children) free itself in turn.
+    /// remaining children) collapse itself in turn.
     SubtreeGone,
     /// The subtree shrank to a single node. Parent should rewrite
-    /// its child pointer to the carried slot.
-    Replaced(u16),
+    /// its child pointer to the carried byte offset.
+    Replaced(u32),
 }
 
 #[derive(Debug)]
@@ -137,15 +137,15 @@ pub(super) enum VictimEdgeKind {
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Victim {
-    /// Slot of the parent node that points at the victim.
-    pub(super) parent_slot: u16,
+    /// Byte offset of the parent node that points at the victim.
+    pub(super) parent_off: u32,
     /// What kind of edge it is.
     pub(super) kind: VictimEdgeKind,
     /// The byte routing to the victim in the parent (irrelevant
     /// for `Prefix` edges).
     pub(super) byte: u8,
-    /// Slot of the victim subtree's root.
-    pub(super) victim_slot: u16,
+    /// Byte offset of the victim subtree's root.
+    pub(super) victim_off: u32,
     /// `true` iff the victim is reached via `header.root_slot`
     /// rather than via a regular parent node — used to dispatch
     /// the parent rewrite path.

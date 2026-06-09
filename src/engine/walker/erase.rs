@@ -2,26 +2,29 @@
 //! dispatch + per-NodeType arms + collapse-on-lone-child rewiring.
 
 use crate::api::errors::{is_blob_store_not_found, Error, Result};
-use crate::layout::{BlobNode, NodeType, BLOB_MAX_INLINE};
+use crate::layout::{BlobNode, Leaf, NodeType, BLOB_MAX_INLINE};
+use std::mem::offset_of;
 use std::sync::Arc;
 
 use super::cast;
 use super::cow::{child_is_snapshot_shared, fork_child_if_shared};
 use super::lookup::lookup_at;
 use super::readers::{
-    ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48, read_prefix,
+    child_offset, ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48,
+    read_prefix,
 };
 use super::route::{pin_route_parent, validate_route_edge};
 use super::types::{EraseCondition, EraseOutcome, EraseReturn, EraseSignal, LookupResult};
 use super::writers::{
     finish_inner_with_sorted, inner_find_child, inner_update_child, set_prefix_child,
     shrink_node16_to_node4, shrink_node256_to_node48, shrink_node48_to_node16, write_prefix_chain,
-    write_struct_to_slot, SHRINK_NODE16_TO_NODE4_AT, SHRINK_NODE256_TO_NODE48_AT,
+    write_struct_at, SHRINK_NODE16_TO_NODE4_AT, SHRINK_NODE256_TO_NODE48_AT,
     SHRINK_NODE48_TO_NODE16_AT,
 };
 use super::SearchKey;
 use crate::engine::{simd, RouteCache};
 use crate::store::BlobWriteGuard;
+use crate::store::{decode_child_off, encode_child_off};
 use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 
 // ---------- public entry points ----------
@@ -32,11 +35,12 @@ use crate::store::{BlobFrame, BlobFrameRef, BufferManager, CachedBlob};
 ///
 /// Updates `header.root_slot` in place.
 #[cfg(test)]
-pub(super) fn erase(frame: &mut BlobFrame<'_>, root_slot: u16, key: &[u8]) -> Result<EraseOutcome> {
-    let r = erase_at(frame, root_slot, key, 0)?;
+pub(super) fn erase(frame: &mut BlobFrame<'_>, root_enc: u16, key: &[u8]) -> Result<EraseOutcome> {
+    let root_off = decode_child_off(root_enc);
+    let r = erase_at(frame, root_off, key, 0)?;
     let root_dirty = r.mutated || !matches!(r.signal, EraseSignal::Unchanged);
-    let new_root = resolve_new_root_after_erase(frame, root_slot, &r.signal)?;
-    frame.header_mut().root_slot = new_root;
+    let new_root = resolve_new_root_after_erase(frame, root_off, &r.signal)?;
+    frame.header_mut().root_slot = encode_child_off(new_root);
     Ok(EraseOutcome {
         root_dirty,
         mutated: r.mutated,
@@ -267,10 +271,10 @@ fn try_erase_from_route(
 struct EraseBlobCrossing {
     child_guid: crate::layout::BlobGuid,
     child_depth: usize,
-    /// Slot of the `BlobNode` in the parent frame that points at this
-    /// child — the edge a copy-on-write fork repoints at the child's
-    /// private fork.
-    parent_slot: u16,
+    /// Byte offset of the `BlobNode` in the parent frame that points
+    /// at this child — the edge a copy-on-write fork repoints at the
+    /// child's private fork.
+    parent_off: u32,
 }
 
 enum EraseStep {
@@ -296,8 +300,8 @@ fn lock_coupled_erase_in_blob(
     *max_cross_blob_depth = (*max_cross_blob_depth).max(depth);
     let step = {
         let mut frame = guard.frame();
-        let root_slot = frame.header().root_slot;
-        erase_at_step(&mut frame, root_slot, key, depth, condition, true)
+        let root_off = decode_child_off(frame.header().root_slot);
+        erase_at_step(&mut frame, root_off, key, depth, condition, true)
             .map_err(|e| e.with_blob_guid(current_guid))?
     };
 
@@ -313,7 +317,7 @@ fn lock_coupled_erase_in_blob(
                 &mut guard,
                 crossing.child_guid,
                 child_guard.as_slice(),
-                crossing.parent_slot,
+                crossing.parent_off,
                 seq,
             )? {
                 drop(child_guard);
@@ -364,11 +368,11 @@ fn lock_coupled_erase_in_blob(
 
     let child_touched = {
         let mut frame = guard.frame();
-        let root_slot = frame.header().root_slot;
+        let root_off = decode_child_off(frame.header().root_slot);
         let child_touched = !matches!(r.signal, EraseSignal::Unchanged) || r.mutated;
         if child_touched {
-            let new_root = resolve_new_root_after_erase(&mut frame, root_slot, &r.signal)?;
-            frame.header_mut().root_slot = new_root;
+            let new_root = resolve_new_root_after_erase(&mut frame, root_off, &r.signal)?;
+            frame.header_mut().root_slot = encode_child_off(new_root);
         }
         child_touched
     };
@@ -389,18 +393,26 @@ fn lock_coupled_erase_in_blob(
 
 fn resolve_new_root_after_erase(
     frame: &mut BlobFrame<'_>,
-    root_slot: u16,
+    root_off: u32,
     signal: &EraseSignal,
-) -> Result<u16> {
+) -> Result<u32> {
     match signal {
-        EraseSignal::Unchanged => Ok(root_slot),
-        EraseSignal::Replaced(s) => Ok(*s),
+        EraseSignal::Unchanged => Ok(root_off),
+        EraseSignal::Replaced(off) => Ok(*off),
         EraseSignal::SubtreeGone => {
             // The whole tree is empty — re-seed the EmptyRoot
             // sentinel so subsequent lookups return NotFound and
-            // subsequent inserts replace the sentinel cleanly.
+            // subsequent inserts replace the sentinel cleanly. Stamp
+            // its self-describing `node_type @ +1` byte so the
+            // offset-addressed reader resolves it as EmptyRoot.
             let out = frame.alloc_node(NodeType::EmptyRoot)?;
-            Ok(out.slot)
+            let off = frame
+                .offset_of_slot(out.slot)
+                .ok_or(Error::node_corrupt("resolve_new_root: sentinel offset"))?;
+            if let Some(body) = frame.bytes_at_mut(off, 8) {
+                body[1] = NodeType::EmptyRoot.as_u8();
+            }
+            Ok(off)
         }
     }
 }
@@ -410,13 +422,13 @@ fn resolve_new_root_after_erase(
 #[cfg(test)]
 pub(super) fn erase_at(
     frame: &mut BlobFrame<'_>,
-    slot: u16,
+    off: u32,
     key: &[u8],
     depth: usize,
 ) -> Result<EraseReturn> {
     match erase_at_step(
         frame,
-        slot,
+        off,
         SearchKey::exact(key),
         depth,
         EraseCondition::Always,
@@ -432,13 +444,13 @@ pub(super) fn erase_at(
 #[allow(clippy::too_many_arguments)] // condition/crossing flags mirror every node arm
 fn erase_at_step(
     frame: &mut BlobFrame<'_>,
-    slot: u16,
+    off: u32,
     key: SearchKey<'_>,
     depth: usize,
     condition: EraseCondition,
     allow_crossing: bool,
 ) -> Result<EraseStep> {
-    let ntype = ntype_of(frame.as_ref(), slot)?;
+    let ntype = ntype_of(frame.as_ref(), off)?;
     match ntype {
         NodeType::Invalid => Err(Error::node_corrupt(
             "walker::erase_at: hit NodeType::Invalid",
@@ -447,16 +459,14 @@ fn erase_at_step(
             signal: EraseSignal::Unchanged,
             mutated: false,
         })),
-        NodeType::Leaf => erase_at_leaf(frame, slot, key, condition).map(EraseStep::Done),
-        NodeType::Prefix => {
-            erase_at_prefix_step(frame, slot, key, depth, condition, allow_crossing)
-        }
+        NodeType::Leaf => erase_at_leaf(frame, off, key, condition).map(EraseStep::Done),
+        NodeType::Prefix => erase_at_prefix_step(frame, off, key, depth, condition, allow_crossing),
         NodeType::Node4 | NodeType::Node16 | NodeType::Node48 | NodeType::Node256 => {
-            erase_at_inner_step(frame, slot, ntype, key, depth, condition, allow_crossing)
+            erase_at_inner_step(frame, off, ntype, key, depth, condition, allow_crossing)
         }
         NodeType::Blob => {
             if allow_crossing {
-                blob_node_erase_step(frame, slot, key, depth)
+                blob_node_erase_step(frame, off, key, depth)
             } else {
                 Err(Error::NotYetImplemented(
                     "walker::erase_at: BlobNode crossing requires BufferManager — use erase_multi",
@@ -468,11 +478,11 @@ fn erase_at_step(
 
 fn blob_node_erase_step(
     frame: &BlobFrame<'_>,
-    slot: u16,
+    off: u32,
     key: SearchKey<'_>,
     depth: usize,
 ) -> Result<EraseStep> {
-    let body = frame.body_of_slot(slot).ok_or(Error::node_corrupt(
+    let body = frame.body_at_offset(off).ok_or(Error::node_corrupt(
         "blob_node_erase_step: BlobNode body resolution failed",
     ))?;
     let bn = *cast::<BlobNode>(body);
@@ -491,14 +501,17 @@ fn blob_node_erase_step(
     Ok(EraseStep::Crossing(EraseBlobCrossing {
         child_guid: bn.child_blob_guid,
         child_depth: depth + plen,
-        parent_slot: slot,
+        parent_off: off,
     }))
 }
 
 /// Soft-delete a leaf in place: flip its `tombstone` byte and bump
 /// the blob's `tombstone_leaf_cnt`. The leaf body stays in its slot
-/// (so the parent never sees the deletion) and the extent bytes
-/// stay allocated until [`super::compact_blob`] rebuilds the blob.
+/// (so the parent never sees the deletion) and its bytes stay
+/// allocated until [`super::compact_blob`] rebuilds the blob.
+///
+/// Only the single `tombstone` byte in the 16-byte header is written
+/// (the rest of the variable-size body is untouched).
 ///
 /// Returns `EraseSignal::Unchanged` so descending callers do not
 /// rewire parents — structural collapse is now a compaction-time
@@ -508,14 +521,14 @@ fn blob_node_erase_step(
 /// no-op and the counter is not double-bumped.
 fn erase_at_leaf(
     frame: &mut BlobFrame<'_>,
-    leaf_slot: u16,
+    leaf_off: u32,
     key: SearchKey<'_>,
     condition: EraseCondition,
 ) -> Result<EraseReturn> {
     // Always read the existing key; the value bytes are not needed
     // for delete.
     let leaf = {
-        let (existing_key, leaf) = read_leaf_key_ref(frame.as_ref(), leaf_slot)?;
+        let (existing_key, leaf) = read_leaf_key_ref(frame.as_ref(), leaf_off)?;
         if !key.eq_slice(existing_key) {
             return Ok(EraseReturn {
                 signal: EraseSignal::Unchanged,
@@ -539,9 +552,14 @@ fn erase_at_leaf(
             });
         }
     }
-    let mut new_leaf = leaf;
-    new_leaf.tombstone = 1;
-    write_struct_to_slot(frame, leaf_slot, &new_leaf)?;
+    // Flip only the tombstone byte in the contiguous body's header;
+    // the key/value bytes that follow are left in place.
+    {
+        let body = frame
+            .body_at_offset_mut(leaf_off)
+            .ok_or(Error::node_corrupt("erase_at_leaf: leaf body"))?;
+        body[offset_of!(Leaf, tombstone)] = 1;
+    }
     let h = frame.header_mut();
     h.tombstone_leaf_cnt = h.tombstone_leaf_cnt.saturating_add(1);
     Ok(EraseReturn {
@@ -550,10 +568,9 @@ fn erase_at_leaf(
     })
 }
 
-#[allow(clippy::too_many_arguments)] // mirrors erase_at_step's call shape
 fn erase_at_prefix_step(
     frame: &mut BlobFrame<'_>,
-    pfx_slot: u16,
+    pfx_off: u32,
     key: SearchKey<'_>,
     depth: usize,
     condition: EraseCondition,
@@ -563,10 +580,10 @@ fn erase_at_prefix_step(
     // hold `&p.bytes[..plen]` across the `frame.*` mutations
     // without needing a `.to_vec()` (mirror of `insert_into_prefix`'s
     // borrow-only descent).
-    let p = read_prefix(frame.as_ref(), pfx_slot)?;
+    let p = read_prefix(frame.as_ref(), pfx_off)?;
     let plen = p.prefix_len as usize;
     let prefix_bytes = &p.bytes[..plen];
-    let child_slot = p.child as u16;
+    let child_off = child_offset(p.child as u16);
 
     if !key.range_eq(depth, prefix_bytes) {
         return Ok(EraseStep::Done(EraseReturn {
@@ -577,7 +594,7 @@ fn erase_at_prefix_step(
 
     let r = erase_at_step(
         frame,
-        child_slot,
+        child_off,
         key,
         depth + plen,
         condition,
@@ -591,15 +608,17 @@ fn erase_at_prefix_step(
             signal: EraseSignal::Unchanged,
             mutated: r.mutated,
         })),
-        EraseSignal::Replaced(new_child) => {
-            set_prefix_child(frame, pfx_slot, u32::from(new_child))?;
+        EraseSignal::Replaced(new_child_off) => {
+            set_prefix_child(frame, pfx_off, new_child_off)?;
             Ok(EraseStep::Done(EraseReturn {
                 signal: EraseSignal::Unchanged,
                 mutated: r.mutated,
             }))
         }
         EraseSignal::SubtreeGone => {
-            frame.free_node(pfx_slot)?;
+            // Abandon-on-free: the Prefix is unreachable once the
+            // parent drops this edge; reclaimed at next compaction.
+            frame.note_abandoned(pfx_off);
             Ok(EraseStep::Done(EraseReturn {
                 signal: EraseSignal::SubtreeGone,
                 mutated: r.mutated,
@@ -611,7 +630,7 @@ fn erase_at_prefix_step(
 #[allow(clippy::too_many_arguments)] // mirrors erase_at_step's call shape
 fn erase_at_inner_step(
     frame: &mut BlobFrame<'_>,
-    inner_slot: u16,
+    inner_off: u32,
     ntype: NodeType,
     key: SearchKey<'_>,
     depth: usize,
@@ -624,14 +643,14 @@ fn erase_at_inner_step(
             mutated: false,
         }));
     };
-    let Some(child) = inner_find_child(frame, inner_slot, ntype, byte)? else {
+    let Some(child_off) = inner_find_child(frame, inner_off, ntype, byte)? else {
         return Ok(EraseStep::Done(EraseReturn {
             signal: EraseSignal::Unchanged,
             mutated: false,
         }));
     };
 
-    let r = erase_at_step(frame, child, key, depth + 1, condition, allow_crossing)?;
+    let r = erase_at_step(frame, child_off, key, depth + 1, condition, allow_crossing)?;
     let EraseStep::Done(r) = r else {
         return Ok(r);
     };
@@ -640,15 +659,15 @@ fn erase_at_inner_step(
             signal: EraseSignal::Unchanged,
             mutated: r.mutated,
         })),
-        EraseSignal::Replaced(new_child) => {
-            inner_update_child(frame, inner_slot, ntype, byte, u32::from(new_child))?;
+        EraseSignal::Replaced(new_child_off) => {
+            inner_update_child(frame, inner_off, ntype, byte, new_child_off)?;
             Ok(EraseStep::Done(EraseReturn {
                 signal: EraseSignal::Unchanged,
                 mutated: r.mutated,
             }))
         }
         EraseSignal::SubtreeGone => {
-            let sig = inner_remove_child_and_collapse(frame, inner_slot, ntype, byte)?;
+            let sig = inner_remove_child_and_collapse(frame, inner_off, ntype, byte)?;
             Ok(EraseStep::Done(EraseReturn {
                 signal: sig,
                 mutated: r.mutated,
@@ -677,13 +696,13 @@ fn erase_at_inner_step(
 #[allow(clippy::too_many_lines)] // intentional — one match over 4 NodeTypes
 fn inner_remove_child_and_collapse(
     frame: &mut BlobFrame<'_>,
-    slot: u16,
+    off: u32,
     ntype: NodeType,
     byte: u8,
 ) -> Result<EraseSignal> {
     match ntype {
         NodeType::Node4 => {
-            let mut n = read_node4(frame.as_ref(), slot)?;
+            let mut n = read_node4(frame.as_ref(), off)?;
             let count = (n.count as usize).min(4);
             let mut idx = None;
             for i in 0..count {
@@ -702,10 +721,10 @@ fn inner_remove_child_and_collapse(
             n.keys[count - 1] = 0;
             n.children[count - 1] = 0;
             n.count -= 1;
-            finish_inner_with_sorted(frame, slot, n.count, &n, n.keys[0], n.children[0])
+            finish_inner_with_sorted(frame, off, n.count, &n, n.keys[0], n.children[0])
         }
         NodeType::Node16 => {
-            let mut n = read_node16(frame.as_ref(), slot)?;
+            let mut n = read_node16(frame.as_ref(), off)?;
             let count = (n.count as usize).min(16);
             let i = simd::node16_find_byte(&n.keys, n.count, byte)
                 .map(usize::from)
@@ -720,18 +739,18 @@ fn inner_remove_child_and_collapse(
             n.children[count - 1] = 0;
             n.count -= 1;
 
-            // Try shrinking to Node4 before the count<=1 paths so
-            // that the freed Node16 slot is the only old slot we
-            // hand back to the free list (the Prefix-wrap below
-            // already does that for count==1).
+            // Try shrinking to Node4 before the count<=1 paths. The old
+            // Node16 is abandoned (abandon-on-free); the Prefix-wrap
+            // below handles count==1.
             if n.count >= 2 && n.count <= SHRINK_NODE16_TO_NODE4_AT {
-                let shrunk = shrink_node16_to_node4(frame, slot, n)?;
+                let shrunk = shrink_node16_to_node4(frame, n)?;
+                frame.note_abandoned(off);
                 return Ok(EraseSignal::Replaced(shrunk));
             }
-            finish_inner_with_sorted(frame, slot, n.count, &n, n.keys[0], n.children[0])
+            finish_inner_with_sorted(frame, off, n.count, &n, n.keys[0], n.children[0])
         }
         NodeType::Node48 => {
-            let mut n = read_node48(frame.as_ref(), slot)?;
+            let mut n = read_node48(frame.as_ref(), off)?;
             let ci = n.index[byte as usize];
             if ci == 0 {
                 return Err(Error::node_corrupt(
@@ -743,30 +762,34 @@ fn inner_remove_child_and_collapse(
             n.count -= 1;
 
             if n.count == 0 {
-                frame.free_node(slot)?;
+                frame.note_abandoned(off); // abandon-on-free
                 return Ok(EraseSignal::SubtreeGone);
             }
             if n.count == 1 {
-                let (surviving_byte, surviving_child) = {
+                let (surviving_byte, surviving_child_enc) = {
                     let b = simd::find_next_nonzero_byte(&n.index, 0).ok_or(
                         Error::node_corrupt("inner_remove_child_and_collapse: empty Node48"),
                     )?;
                     (b as u8, n.children[(n.index[b] as usize) - 1])
                 };
-                frame.free_node(slot)?;
-                let new_slot =
-                    write_prefix_chain(frame, &[surviving_byte], surviving_child as u16)?;
-                return Ok(EraseSignal::Replaced(new_slot));
+                let new_off = write_prefix_chain(
+                    frame,
+                    &[surviving_byte],
+                    child_offset(surviving_child_enc),
+                )?;
+                frame.note_abandoned(off); // abandon-on-free: collapsed Node48
+                return Ok(EraseSignal::Replaced(new_off));
             }
             if n.count <= SHRINK_NODE48_TO_NODE16_AT {
-                let shrunk = shrink_node48_to_node16(frame, slot, n)?;
+                let shrunk = shrink_node48_to_node16(frame, n)?;
+                frame.note_abandoned(off);
                 return Ok(EraseSignal::Replaced(shrunk));
             }
-            write_struct_to_slot(frame, slot, &n)?;
+            write_struct_at(frame, off, &n)?;
             Ok(EraseSignal::Unchanged)
         }
         NodeType::Node256 => {
-            let mut n = read_node256(frame.as_ref(), slot)?;
+            let mut n = read_node256(frame.as_ref(), off)?;
             if n.children[byte as usize] == 0 {
                 return Err(Error::node_corrupt(
                     "inner_remove_child_and_collapse: byte not present (Node256)",
@@ -776,26 +799,30 @@ fn inner_remove_child_and_collapse(
             n.count = n.count.saturating_sub(1);
 
             if n.count == 0 {
-                frame.free_node(slot)?;
+                frame.note_abandoned(off); // abandon-on-free
                 return Ok(EraseSignal::SubtreeGone);
             }
             if n.count == 1 {
-                let (surviving_byte, surviving_child) = {
-                    let b = simd::find_next_nonzero_u32(&n.children, 0).ok_or(
+                let (surviving_byte, surviving_child_enc) = {
+                    let b = simd::find_next_nonzero_u16(&n.children, 0).ok_or(
                         Error::node_corrupt("inner_remove_child_and_collapse: empty Node256"),
                     )?;
                     (b as u8, n.children[b])
                 };
-                frame.free_node(slot)?;
-                let new_slot =
-                    write_prefix_chain(frame, &[surviving_byte], surviving_child as u16)?;
-                return Ok(EraseSignal::Replaced(new_slot));
+                let new_off = write_prefix_chain(
+                    frame,
+                    &[surviving_byte],
+                    child_offset(surviving_child_enc),
+                )?;
+                frame.note_abandoned(off); // abandon-on-free: collapsed Node256
+                return Ok(EraseSignal::Replaced(new_off));
             }
             if n.count <= SHRINK_NODE256_TO_NODE48_AT {
-                let shrunk = shrink_node256_to_node48(frame, slot, n)?;
+                let shrunk = shrink_node256_to_node48(frame, n)?;
+                frame.note_abandoned(off);
                 return Ok(EraseSignal::Replaced(shrunk));
             }
-            write_struct_to_slot(frame, slot, &n)?;
+            write_struct_at(frame, off, &n)?;
             Ok(EraseSignal::Unchanged)
         }
         _ => Err(Error::node_corrupt(

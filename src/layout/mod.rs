@@ -20,7 +20,7 @@ pub use header::{
     set_frame_epoch_high_water, BlobGuid, BlobHeader, DATA_AREA_START, HEADER_SIZE, MAX_SLOTS,
     PAGE_SIZE,
 };
-pub use leaf::{leaf_extent_size, Leaf};
+pub use leaf::{leaf_body_size, Leaf};
 pub use node::{size_of_node, NodeType, SIZE_BY_TYPE};
 pub use nodes::{Node16, Node256, Node4, Node48};
 pub use prefix::{Prefix, PREFIX_MAX_INLINE};
@@ -30,6 +30,9 @@ pub use slot::{SlotEntry, SlotEntryRaw};
 /// constants. If any drift, the compiler refuses to build.
 const _: () = {
     use std::mem::size_of;
+    // `Leaf` is the 16-byte header of a variable-size, self-describing
+    // node; `SIZE_BY_TYPE[0]` is that header size (the full body is
+    // `leaf_body_size(key_len, value_len)`).
     assert!(size_of::<Leaf>() == SIZE_BY_TYPE[0] as usize);
     assert!(size_of::<Prefix>() == SIZE_BY_TYPE[1] as usize);
     assert!(size_of::<BlobNode>() == SIZE_BY_TYPE[2] as usize);
@@ -71,17 +74,19 @@ mod tests {
 
     #[test]
     fn per_node_sizes() {
+        // `Leaf` is the 16-byte header of a variable-size node.
         assert_eq!(size_of::<Leaf>(), 16);
         assert_eq!(size_of::<Prefix>(), 128);
         assert_eq!(size_of::<BlobNode>(), 128);
-        assert_eq!(size_of::<Node4>(), 24);
-        assert_eq!(size_of::<Node16>(), 88);
-        assert_eq!(size_of::<Node48>(), 456);
-        assert_eq!(size_of::<Node256>(), 1032);
+        assert_eq!(size_of::<Node4>(), 16);
+        assert_eq!(size_of::<Node16>(), 56);
+        assert_eq!(size_of::<Node48>(), 360);
+        assert_eq!(size_of::<Node256>(), 520);
     }
 
     #[test]
     fn size_of_node_matches_per_type_struct() {
+        // `Leaf` reports its 16-byte header; the body is variable.
         assert_eq!(size_of_node(NodeType::Leaf) as usize, size_of::<Leaf>());
         assert_eq!(size_of_node(NodeType::Prefix) as usize, size_of::<Prefix>());
         assert_eq!(size_of_node(NodeType::Blob) as usize, size_of::<BlobNode>());
@@ -96,16 +101,15 @@ mod tests {
     }
 
     #[test]
-    fn leaf_extent_size_is_always_aligned_to_8() {
-        // The bump allocator's invariant: all extent allocations
-        // are 8-byte aligned (so subsequent body allocs stay
-        // aligned).
+    fn leaf_body_size_is_always_aligned_to_8() {
+        // The bump allocator's invariant: all leaf allocations are
+        // 8-byte aligned (so subsequent body allocs stay aligned).
         for key_len in 0..32 {
             for value_len in 0..32 {
-                let s = leaf_extent_size(key_len, value_len);
-                assert_eq!(s % 8, 0, "leaf_extent_size({key_len}, {value_len}) = {s}");
-                // And it's the smallest 8-aligned size ≥ 2+key+value.
-                let need = 2 + key_len + value_len;
+                let s = leaf_body_size(key_len, value_len);
+                assert_eq!(s % 8, 0, "leaf_body_size({key_len}, {value_len}) = {s}");
+                // And it's the smallest 8-aligned size ≥ 16+key+value.
+                let need = 16 + key_len + value_len;
                 assert!(s >= need);
                 assert!(s < need + 8);
             }

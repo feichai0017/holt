@@ -22,7 +22,7 @@ use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
 use crate::engine::RangeEntry;
 use crate::journal::codec::BatchEncoder;
-use crate::journal::group_commit::Journal;
+use crate::journal::Journal;
 use crate::layout::BlobGuid;
 use crate::store::blob_store::BlobStore;
 use crate::store::BufferManager;

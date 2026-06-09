@@ -31,9 +31,9 @@ use crate::journal::codec::{
     encoded_erase_record_len, encoded_insert_record_len, encoded_rename_object_record_len,
     BatchEncoder, RECORD_FOOTER_SIZE, RECORD_HEADER_SIZE,
 };
-use crate::journal::group_commit::Journal;
 use crate::journal::reader::replay;
 use crate::journal::wal_op::WalOp;
+use crate::journal::Journal;
 use crate::layout::{BlobGuid, DATA_AREA_START, PAGE_SIZE, ROOT_BLOB_GUID};
 use crate::store::blob_store::{AlignedBlobBuf, BlobStore, FileBlobStore, MemoryBlobStore};
 use crate::store::{

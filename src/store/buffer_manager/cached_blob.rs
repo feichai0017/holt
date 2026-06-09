@@ -104,16 +104,9 @@ impl CachedBlob {
 
     /// Best-effort prefetch for the blob header.
     #[inline]
-    #[cfg(target_arch = "x86_64")]
     pub(crate) fn prefetch_header(&self) {
-        let ptr = unsafe { (&*self.buf.get()).as_ptr() };
+        let ptr = unsafe { (*self.buf.get()).as_ptr() };
         crate::engine::prefetch_read_data(ptr);
-    }
-
-    #[inline]
-    #[cfg(not(target_arch = "x86_64"))]
-    pub(crate) fn prefetch_header(&self) {
-        let _ = self;
     }
 
     /// Wait-free read snapshot. No real lock taken - the caller
@@ -188,7 +181,7 @@ impl<'a> OptimisticGuard<'a> {
         // `validate()` confirms it; corrupt bodies surface as
         // `Error::NodeCorrupt` rather than panics because the
         // layout decoders bounds-check every field.
-        unsafe { (&*self.buf.get()).as_slice() }
+        unsafe { (*self.buf.get()).as_slice() }
     }
 
     /// Returns `true` if no exclusive writer modified the buffer

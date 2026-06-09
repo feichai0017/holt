@@ -28,14 +28,14 @@ use crate::api::atomic::RecordVersion;
 use crate::api::errors::{is_blob_store_not_found, Error, Result};
 use crate::concurrency::Gate;
 use crate::layout::{BlobGuid, BlobNode, Leaf, NodeType, BLOB_MAX_INLINE, PREFIX_MAX_INLINE};
-use crate::store::{BlobFrameRef, BufferManager, CachedBlob};
+use crate::store::{decode_child_off, BlobFrameRef, BufferManager, CachedBlob};
 
 use smallvec::SmallVec;
 
 use super::cast;
 use super::readers::{
-    leaf_extent, leaf_key_extent, ntype_of, read_leaf_key_ref, read_node16, read_node256,
-    read_node4, read_node48, read_prefix,
+    child_offset, leaf_any_key, leaf_extent, leaf_key_extent, ntype_of, read_node16, read_node256,
+    read_node4, read_node48, read_prefix, resolve_typed,
 };
 use crate::engine::simd;
 
@@ -736,7 +736,8 @@ struct Frame {
     /// Pin keeps the blob in BM cache for the frame's lifetime.
     pin: Arc<CachedBlob>,
     blob_guid: BlobGuid,
-    slot: u16,
+    /// Byte offset of this frame's node body (v4 offset addressing).
+    off: u32,
     ntype: NodeType,
     /// Blob content version captured while this frame was pushed.
     /// Any mismatch means a writer has rewritten this blob and the
@@ -782,30 +783,31 @@ impl InlinePrefix {
 
 fn project_range_leaf(
     frame: BlobFrameRef<'_>,
-    slot: u16,
+    off: u32,
     prefix: &[u8],
     lower_bound: Option<&LowerBound>,
     delimiter: Option<u8>,
     projection: RangeProjection,
     emit_buf: &mut Vec<u8>,
 ) -> Result<LeafAction> {
-    let body = frame
-        .body_of_slot(slot)
-        .ok_or(Error::node_corrupt("project_range_leaf: body"))?;
-    let leaf = *cast::<Leaf>(body);
-    if leaf.tombstone != 0 {
-        return Ok(LeafAction::Skip);
-    }
-
-    let (stored_key, record_value) = match projection {
+    let (_ntype, body) = resolve_typed(frame, off)?;
+    // A leaf is one contiguous, self-describing node:
+    // `[16B header][key][value]`. Decode the 16-byte header, then read
+    // key (and, for record projections, value) from the same body.
+    let leaf = *cast::<Leaf>(&body[..std::mem::size_of::<Leaf>()]);
+    let (stored_key, record_value): (&[u8], Option<&[u8]>) = match projection {
         RangeProjection::Records => {
-            let (key, value) = leaf_extent(frame, &leaf)?;
-            (key, Some(value))
+            let (k, v) = leaf_extent(frame, off)?;
+            (k, Some(v))
         }
         RangeProjection::KeysOnly | RangeProjection::KeyRefs => {
-            (leaf_key_extent(frame, &leaf)?, None)
+            (leaf_key_extent(frame, off)?, None)
         }
     };
+    let (tombstone, seq) = (leaf.tombstone, leaf.seq);
+    if tombstone != 0 {
+        return Ok(LeafAction::Skip);
+    }
     let user_key = if stored_key.last() == Some(&0) {
         &stored_key[..stored_key.len() - 1]
     } else {
@@ -837,11 +839,11 @@ fn project_range_leaf(
         emit_buf.clear();
         emit_buf.extend_from_slice(user_key);
         return Ok(LeafAction::KeyRef {
-            version: RecordVersion::new(leaf.seq),
+            version: RecordVersion::new(seq),
         });
     }
     let key = user_key.to_vec();
-    let version = RecordVersion::new(leaf.seq);
+    let version = RecordVersion::new(seq);
     Ok(LeafAction::Key {
         key,
         value: record_value.map(<[u8]>::to_vec),
@@ -1122,17 +1124,17 @@ impl RangeIter {
 
         // Seed the stack with the root blob's root slot.
         let root_pin = Arc::clone(&self.root_pin);
-        let (root_slot, root_ntype, root_version) = {
+        let (root_off, root_ntype, root_version) = {
             let guard = root_pin.read();
             let version = root_pin.content_version();
             let frame = BlobFrameRef::wrap(guard.as_slice());
-            let slot = frame.header().root_slot;
-            (slot, ntype_of(frame, slot)?, version)
+            let off = decode_child_off(frame.header().root_slot);
+            (off, ntype_of(frame, off)?, version)
         };
         self.stack.push(Frame {
             pin: root_pin,
             blob_guid: self.root_guid,
-            slot: root_slot,
+            off: root_off,
             ntype: root_ntype,
             version: root_version,
             next: 0,
@@ -1308,7 +1310,7 @@ impl RangeIter {
                                 return Ok(InitResult::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
-                            let (stored_key, _leaf) = read_leaf_key_ref(frame, top.slot)?;
+                            let stored_key = leaf_any_key(frame, top.off)?;
                             let user_key: &[u8] = if stored_key.last() == Some(&0) {
                                 &stored_key[..stored_key.len() - 1]
                             } else {
@@ -1333,7 +1335,7 @@ impl RangeIter {
                     }
                     let top_pin = self.stack[idx].pin.clone();
                     let top_blob_guid = self.stack[idx].blob_guid;
-                    let (child_slot, child_ntype, p_bytes, version) = {
+                    let (child_off, child_ntype, p_bytes, version) = {
                         let top = &self.stack[idx];
                         let guard = top_pin.read();
                         let version = top_pin.content_version();
@@ -1341,12 +1343,12 @@ impl RangeIter {
                             return Ok(InitResult::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
-                        let p = read_prefix(frame, top.slot)?;
+                        let p = read_prefix(frame, top.off)?;
                         let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
-                        let child_slot = p.child as u16;
+                        let child_off = child_offset(p.child as u16);
                         (
-                            child_slot,
-                            ntype_of(frame, child_slot)?,
+                            child_off,
+                            ntype_of(frame, child_off)?,
                             InlinePrefix::from_slice(&p.bytes[..plen]),
                             version,
                         )
@@ -1368,7 +1370,7 @@ impl RangeIter {
                             self.push_within_blob(
                                 top_pin,
                                 top_blob_guid,
-                                child_slot,
+                                child_off,
                                 child_ntype,
                                 version,
                                 p_bytes.as_slice(),
@@ -1391,7 +1393,7 @@ impl RangeIter {
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
                         let body = frame
-                            .body_of_slot(top.slot)
+                            .body_at_offset(top.off)
                             .ok_or(Error::node_corrupt("range::seek: BlobNode body resolution"))?;
                         let b = cast::<BlobNode>(body);
                         let plen = (b.prefix_len as usize).min(BLOB_MAX_INLINE);
@@ -1446,12 +1448,12 @@ impl RangeIter {
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
                         let result =
-                            next_inner_child_ge(frame, top.slot, top_ntype, top.next, min_byte)?;
+                            next_inner_child_ge(frame, top.off, top_ntype, top.next, min_byte)?;
                         match result {
-                            Some((byte, child_slot, next_cursor)) => Some((
+                            Some((byte, child_off, next_cursor)) => Some((
                                 byte,
-                                child_slot,
-                                ntype_of(frame, child_slot)?,
+                                child_off,
+                                ntype_of(frame, child_off)?,
                                 next_cursor,
                                 version,
                             )),
@@ -1460,13 +1462,13 @@ impl RangeIter {
                     };
                     match result {
                         None => self.pop_frame(),
-                        Some((byte, child_slot, child_ntype, next_cursor, version)) => {
+                        Some((byte, child_off, child_ntype, next_cursor, version)) => {
                             self.stack[idx].next = next_cursor;
                             self.curr_key.push(byte);
                             self.stack.push(Frame {
                                 pin: top_pin,
                                 blob_guid: top_blob_guid,
-                                slot: child_slot,
+                                off: child_off,
                                 ntype: child_ntype,
                                 version,
                                 next: 0,
@@ -1512,7 +1514,7 @@ impl RangeIter {
                             // iteration isn't emitted.
                             project_range_leaf(
                                 frame,
-                                top.slot,
+                                top.off,
                                 &self.prefix,
                                 self.lower_bound.as_ref(),
                                 self.delimiter,
@@ -1634,7 +1636,7 @@ impl RangeIter {
                     if self.stack[idx].next == 0 {
                         let top_pin = self.stack[idx].pin.clone();
                         let top_blob_guid = self.stack[idx].blob_guid;
-                        let (child_slot, child_ntype, p_bytes, version, no_tombstones) = {
+                        let (child_off, child_ntype, p_bytes, version, no_tombstones) = {
                             let top = &self.stack[idx];
                             let guard = top_pin.read();
                             let version = top_pin.content_version();
@@ -1642,12 +1644,12 @@ impl RangeIter {
                                 return Ok(RangeAdvance::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
-                            let p = read_prefix(frame, top.slot)?;
+                            let p = read_prefix(frame, top.off)?;
                             let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
-                            let child_slot = p.child as u16;
+                            let child_off = child_offset(p.child as u16);
                             (
-                                child_slot,
-                                ntype_of(frame, child_slot)?,
+                                child_off,
+                                ntype_of(frame, child_off)?,
                                 InlinePrefix::from_slice(&p.bytes[..plen]),
                                 version,
                                 frame.header().tombstone_leaf_cnt == 0,
@@ -1670,7 +1672,7 @@ impl RangeIter {
                         self.push_within_blob(
                             top_pin,
                             top_blob_guid,
-                            child_slot,
+                            child_off,
                             child_ntype,
                             version,
                             p_bytes.as_slice(),
@@ -1690,7 +1692,7 @@ impl RangeIter {
                                 return Ok(RangeAdvance::Restart);
                             }
                             let frame = BlobFrameRef::wrap(guard.as_slice());
-                            let body = frame.body_of_slot(top.slot).ok_or(Error::node_corrupt(
+                            let body = frame.body_at_offset(top.off).ok_or(Error::node_corrupt(
                                 "range::advance: BlobNode body resolution",
                             ))?;
                             let b = cast::<BlobNode>(body);
@@ -1708,10 +1710,10 @@ impl RangeIter {
                         let child_can_rollup = {
                             let guard = child_pin.read();
                             let frame = BlobFrameRef::wrap(guard.as_slice());
-                            let root_slot = frame.header().root_slot;
+                            let root_off = decode_child_off(frame.header().root_slot);
                             frame.header().tombstone_leaf_cnt == 0
                                 && !matches!(
-                                    ntype_of(frame, root_slot)?,
+                                    ntype_of(frame, root_off)?,
                                     NodeType::EmptyRoot | NodeType::Invalid
                                 )
                         };
@@ -1742,27 +1744,44 @@ impl RangeIter {
                             return Ok(RangeAdvance::Restart);
                         }
                         let frame = BlobFrameRef::wrap(guard.as_slice());
-                        let result = next_inner_child_from(frame, top.slot, top_ntype, top.next)?;
+                        let result = next_inner_child_from(frame, top.off, top_ntype, top.next)?;
                         match result {
-                            Some((byte, child_slot, next_cursor)) => Some((
-                                byte,
-                                child_slot,
-                                ntype_of(frame, child_slot)?,
-                                next_cursor,
-                                version,
-                            )),
+                            Some((byte, child_off, next_cursor)) => {
+                                // Scan-ahead prefetch: the child we
+                                // descend into now emits a whole
+                                // subtree of leaves before the iterator
+                                // reaches the next sibling, so warm
+                                // that sibling's body now — its load
+                                // overlaps the entire current-subtree
+                                // traversal. Best-effort: a peek error
+                                // just skips the hint.
+                                if let Some((_, sib_off, _)) =
+                                    next_inner_child_from(frame, top.off, top_ntype, next_cursor)
+                                        .ok()
+                                        .flatten()
+                                {
+                                    frame.prefetch_at(sib_off);
+                                }
+                                Some((
+                                    byte,
+                                    child_off,
+                                    ntype_of(frame, child_off)?,
+                                    next_cursor,
+                                    version,
+                                ))
+                            }
                             None => None,
                         }
                     };
                     match result {
                         None => self.pop_frame(),
-                        Some((byte, child_slot, child_ntype, next_cursor, version)) => {
+                        Some((byte, child_off, child_ntype, next_cursor, version)) => {
                             self.stack[idx].next = next_cursor;
                             self.curr_key.push(byte);
                             self.stack.push(Frame {
                                 pin: top_pin,
                                 blob_guid: top_blob_guid,
-                                slot: child_slot,
+                                off: child_off,
                                 ntype: child_ntype,
                                 version,
                                 next: 0,
@@ -1779,7 +1798,7 @@ impl RangeIter {
         &mut self,
         pin: Arc<CachedBlob>,
         blob_guid: BlobGuid,
-        child_slot: u16,
+        child_off: u32,
         child_ntype: NodeType,
         version: u64,
         prefix_bytes: &[u8],
@@ -1788,7 +1807,7 @@ impl RangeIter {
         self.stack.push(Frame {
             pin,
             blob_guid,
-            slot: child_slot,
+            off: child_off,
             ntype: child_ntype,
             version,
             next: 0,
@@ -1819,18 +1838,18 @@ impl RangeIter {
         child_guid: BlobGuid,
         prefix_bytes: &[u8],
     ) -> Result<()> {
-        let (child_slot, child_ntype, child_version) = {
+        let (child_off, child_ntype, child_version) = {
             let guard = child_pin.read();
             let version = child_pin.content_version();
             let frame = BlobFrameRef::wrap(guard.as_slice());
-            let child_slot = frame.header().root_slot;
-            (child_slot, ntype_of(frame, child_slot)?, version)
+            let child_off = decode_child_off(frame.header().root_slot);
+            (child_off, ntype_of(frame, child_off)?, version)
         };
         self.curr_key.extend_from_slice(prefix_bytes);
         self.stack.push(Frame {
             pin: child_pin,
             blob_guid: child_guid,
-            slot: child_slot,
+            off: child_off,
             ntype: child_ntype,
             version: child_version,
             next: 0,
@@ -1918,43 +1937,52 @@ fn segment_seek_relation(path: &[u8], segment: &[u8], target: &[u8]) -> SegmentR
     }
 }
 
-/// Given the inner node at `slot` and a cursor `from`, return the
-/// next `(byte, child_slot, cursor_after)` whose branch byte is at
-/// least `min_byte` when present. `None` means "the minimum child".
+/// Given the inner node at byte offset `off` and a cursor `from`,
+/// return the next `(byte, child_off, cursor_after)` whose branch byte
+/// is at least `min_byte` when present. `None` means "the minimum
+/// child". `child_off` is the child body's absolute byte offset.
 fn next_inner_child_ge(
     frame: BlobFrameRef<'_>,
-    slot: u16,
+    off: u32,
     ntype: NodeType,
     from: u16,
     min_byte: Option<u8>,
-) -> Result<Option<(u8, u16, u16)>> {
+) -> Result<Option<(u8, u32, u16)>> {
     match ntype {
         NodeType::Node4 => {
-            let n = read_node4(frame, slot)?;
+            let n = read_node4(frame, off)?;
             let count = (n.count as usize).min(4);
             let start = (from as usize).min(count);
             let min = min_byte.unwrap_or(0);
             for i in start..count {
                 if n.keys[i] >= min {
-                    return Ok(Some((n.keys[i], n.children[i] as u16, (i + 1) as u16)));
+                    return Ok(Some((
+                        n.keys[i],
+                        child_offset(n.children[i]),
+                        (i + 1) as u16,
+                    )));
                 }
             }
             Ok(None)
         }
         NodeType::Node16 => {
-            let n = read_node16(frame, slot)?;
+            let n = read_node16(frame, off)?;
             let count = (n.count as usize).min(16);
             let start = (from as usize).min(count);
             let min = min_byte.unwrap_or(0);
             for i in start..count {
                 if n.keys[i] >= min {
-                    return Ok(Some((n.keys[i], n.children[i] as u16, (i + 1) as u16)));
+                    return Ok(Some((
+                        n.keys[i],
+                        child_offset(n.children[i]),
+                        (i + 1) as u16,
+                    )));
                 }
             }
             Ok(None)
         }
         NodeType::Node48 => {
-            let n = read_node48(frame, slot)?;
+            let n = read_node48(frame, off)?;
             let min = min_byte.map_or(0, usize::from);
             let start = (from as usize).max(min).min(256);
             let Some(b) = simd::find_next_nonzero_byte(&n.index, start) else {
@@ -1967,17 +1995,20 @@ fn next_inner_child_ge(
                     "range::next_inner_child_ge: Node48 index out of range",
                 ));
             }
-            Ok(Some((b as u8, n.children[ci] as u16, (b + 1) as u16)))
+            Ok(Some((
+                b as u8,
+                child_offset(n.children[ci]),
+                (b + 1) as u16,
+            )))
         }
         NodeType::Node256 => {
-            let n = read_node256(frame, slot)?;
+            let n = read_node256(frame, off)?;
             let min = min_byte.map_or(0, usize::from);
             let start = (from as usize).max(min).min(256);
-            let Some(b) = simd::find_next_nonzero_u32(&n.children, start) else {
+            let Some(b) = simd::find_next_nonzero_u16(&n.children, start) else {
                 return Ok(None);
             };
-            let s = n.children[b];
-            Ok(Some((b as u8, s as u16, (b + 1) as u16)))
+            Ok(Some((b as u8, child_offset(n.children[b]), (b + 1) as u16)))
         }
         _ => Err(Error::node_corrupt(
             "range::next_inner_child_ge: not an inner node",
@@ -1985,37 +2016,46 @@ fn next_inner_child_ge(
     }
 }
 
-/// Given the inner node at `slot` and a cursor `from`, return the
-/// next `(byte, child_slot, cursor_after)` if any. For `Node4` /
-/// `Node16`, `from` is a key index; for `Node48` / `Node256`, it's
-/// the next byte to consider (0..=256, where 256 means "no more").
+/// Given the inner node at byte offset `off` and a cursor `from`,
+/// return the next `(byte, child_off, cursor_after)` if any. For
+/// `Node4` / `Node16`, `from` is a key index; for `Node48` /
+/// `Node256`, it's the next byte to consider (0..=256, where 256 means
+/// "no more"). `child_off` is the child body's absolute byte offset.
 fn next_inner_child_from(
     frame: BlobFrameRef<'_>,
-    slot: u16,
+    off: u32,
     ntype: NodeType,
     from: u16,
-) -> Result<Option<(u8, u16, u16)>> {
+) -> Result<Option<(u8, u32, u16)>> {
     match ntype {
         NodeType::Node4 => {
-            let n = read_node4(frame, slot)?;
+            let n = read_node4(frame, off)?;
             let count = (n.count as usize).min(4);
             let i = from as usize;
             if i >= count {
                 return Ok(None);
             }
-            Ok(Some((n.keys[i], n.children[i] as u16, (i + 1) as u16)))
+            Ok(Some((
+                n.keys[i],
+                child_offset(n.children[i]),
+                (i + 1) as u16,
+            )))
         }
         NodeType::Node16 => {
-            let n = read_node16(frame, slot)?;
+            let n = read_node16(frame, off)?;
             let count = (n.count as usize).min(16);
             let i = from as usize;
             if i >= count {
                 return Ok(None);
             }
-            Ok(Some((n.keys[i], n.children[i] as u16, (i + 1) as u16)))
+            Ok(Some((
+                n.keys[i],
+                child_offset(n.children[i]),
+                (i + 1) as u16,
+            )))
         }
         NodeType::Node48 => {
-            let n = read_node48(frame, slot)?;
+            let n = read_node48(frame, off)?;
             let start = (from as usize).min(256);
             // SIMD-scan the 256-byte index for the next non-zero
             // entry; saves ≈40 ns vs the scalar 256-iter loop on a
@@ -2030,18 +2070,21 @@ fn next_inner_child_from(
                     "range::next_inner_child: Node48 index out of range",
                 ));
             }
-            Ok(Some((b as u8, n.children[ci] as u16, (b + 1) as u16)))
+            Ok(Some((
+                b as u8,
+                child_offset(n.children[ci]),
+                (b + 1) as u16,
+            )))
         }
         NodeType::Node256 => {
-            let n = read_node256(frame, slot)?;
+            let n = read_node256(frame, off)?;
             let start = (from as usize).min(256);
-            // SIMD-scan the 256-`u32` children array for the next
-            // populated slot index.
-            let Some(b) = simd::find_next_nonzero_u32(&n.children, start) else {
+            // SIMD-scan the 256-`u16` children array for the next
+            // populated child.
+            let Some(b) = simd::find_next_nonzero_u16(&n.children, start) else {
                 return Ok(None);
             };
-            let s = n.children[b];
-            Ok(Some((b as u8, s as u16, (b + 1) as u16)))
+            Ok(Some((b as u8, child_offset(n.children[b]), (b + 1) as u16)))
         }
         _ => Err(Error::node_corrupt(
             "range::next_inner_child: not an inner node",

@@ -5,20 +5,24 @@
 //!     empty_root sentinel at slot 1)
 //!   - `alloc_node(ntype)`: try free-list first, else bump
 //!   - `free_node(slot)`: push onto per-NodeType LIFO
-//!   - `alloc_extent(size)`: raw bump for Leaf key/value bytes
-//!   - `body_of_slot(slot)`: resolve a slot to its body slice
+//!   - `alloc_leaf(total_aligned)`: variable-size bump for a single
+//!     self-describing leaf node (`[16B header][key][value]`)
+//!   - `body_of_slot(slot)`: resolve a slot to its body slice (for a
+//!     `Leaf` the size is read back from the header — Option B,
+//!     self-describing)
 //!
 //! All operations enforce the on-disk invariants: 8-byte body
 //! alignment, MAX_SLOTS cap, and slot-entry bit-packing.
 
 use crate::layout::{
-    size_of_node, BlobGuid, BlobHeader, NodeType, SlotEntry, SlotEntryRaw, DATA_AREA_START,
-    HEADER_SIZE, MAX_SLOTS, PAGE_SIZE,
+    leaf_body_size, size_of_node, BlobGuid, BlobHeader, Leaf, NodeType, SlotEntry, SlotEntryRaw,
+    DATA_AREA_START, HEADER_SIZE, MAX_SLOTS, PAGE_SIZE,
 };
+use std::mem::size_of;
 
 /// Bytes the bump allocator reserves for spillover's
 /// emergency `BlobNode` install. Walker `alloc_node` (non-Blob) +
-/// `alloc_extent` refuse to consume the last `SPILLOVER_RESERVATION`
+/// `alloc_leaf` refuse to consume the last `SPILLOVER_RESERVATION`
 /// bytes; `alloc_node(NodeType::Blob)` is exempt and may consume
 /// them. Without this, a 99 %-full blob has no room left for the
 /// spillover code path to install its own placeholder BlobNode.
@@ -27,19 +31,127 @@ use crate::layout::{
 /// emits.
 pub const SPILLOVER_RESERVATION: u32 = 128;
 
-/// Errors from `alloc_node` / `alloc_extent`.
+/// `DATA_AREA_START / 8` — the biased origin all child offsets are
+/// measured from. Every node body lives at `byte_offset >=
+/// DATA_AREA_START`, so its `byte_offset / 8` is `>= DATA_BASE_DIV8`.
+const DATA_BASE_DIV8: u32 = DATA_AREA_START / 8;
+
+/// Largest biased child value that can occur — `(PAGE_SIZE -
+/// DATA_AREA_START)/8 + 1`. Asserted `< u16::MAX` so the existing
+/// `[u16; N]` child arrays hold any in-blob offset with headroom.
+const MAX_CHILD_BIAS: u32 = (PAGE_SIZE - DATA_AREA_START) / 8 + 1;
+const _: () = assert!(MAX_CHILD_BIAS < u16::MAX as u32);
+
+/// Encode a node body's absolute `byte_offset` into the biased `u16`
+/// stored in a child field (`children[N]`, `Prefix.child`,
+/// `header.root`).
+///
+/// Encoding is `(byte_offset / 8) - (DATA_AREA_START / 8) + 1`. The
+/// `+1` bias reserves the encoded value `0` as the universal
+/// "no child / null" sentinel (Node48 `index -> children`, Node256
+/// direct slots, 1-based-ness). A real body sits at `byte_offset >=
+/// DATA_AREA_START`, so its encoded value is always `>= 1` — never
+/// collides with the null sentinel even for a body at exactly
+/// `DATA_AREA_START` (which only ever happens for the init EmptyRoot,
+/// never a child target).
+#[inline]
+#[must_use]
+pub fn encode_child_off(byte_offset: u32) -> u16 {
+    debug_assert_eq!(byte_offset % 8, 0, "child body must be 8-byte aligned");
+    debug_assert!(
+        byte_offset >= DATA_AREA_START,
+        "child body offset below data area: {byte_offset:#x}"
+    );
+    debug_assert!(byte_offset < PAGE_SIZE, "child body offset past page");
+    let biased = byte_offset / 8 - DATA_BASE_DIV8 + 1;
+    debug_assert!(
+        biased >= 1,
+        "encoded child offset must never be the 0 sentinel"
+    );
+    debug_assert!(biased <= MAX_CHILD_BIAS);
+    biased as u16
+}
+
+/// Decode a biased child `u16` back to the absolute `byte_offset`.
+/// Inverse of [`encode_child_off`]. The caller must have already
+/// rejected the `0` null sentinel.
+#[inline]
+#[must_use]
+pub fn decode_child_off(encoded: u16) -> u32 {
+    debug_assert_ne!(encoded, 0, "decode_child_off on the 0 null sentinel");
+    (u32::from(encoded) - 1 + DATA_BASE_DIV8) * 8
+}
+
+/// Read a node's `NodeType` from its body at absolute `off`.
+///
+/// Every node body carries its `node_type` discriminant at `+1`
+/// (every inner node, `Prefix`, `BlobNode`, and — post-reorder — the
+/// `Leaf` header; the `EmptyRoot` sentinel's `+1` is stamped in
+/// [`BlobFrame::init`]). This is the offset-addressed replacement for
+/// the slot-table `node_type` lookup. Returns `None` if `off + 2`
+/// runs past the buffer or the byte doesn't decode to a `NodeType`.
+#[inline]
+#[must_use]
+pub fn ntype_at_offset(buf: &[u8], off: usize) -> Option<NodeType> {
+    let tag_off = off.checked_add(1)?;
+    if tag_off >= buf.len() {
+        return None;
+    }
+    NodeType::from_raw(buf[tag_off])
+}
+
+/// Free-list size class for `ntype` — the index into
+/// [`BlobHeader::free_list_head`](crate::layout::BlobHeader). Every
+/// type maps to its own `ntype - 1` slot. (Leaf nodes are now
+/// variable-size and self-describing; a freed leaf slot is reclaimed
+/// by compaction exactly as its bytes were when leaves used separate
+/// extents, so it parks on its own class-0 list.)
+const fn free_list_class(ntype: NodeType) -> usize {
+    ntype.as_u8() as usize - 1
+}
+
+/// Resolve the true on-disk body length of a `Leaf` slot whose header
+/// begins at byte `off` in `buf`.
+///
+/// A leaf is a single, contiguous, self-describing node
+/// (`[16B header][key][value]`). Its slot-table entry records only the
+/// header offset; `size_of_node(NodeType::Leaf)` is just the 16-byte
+/// header. To size the whole node we read `key_len`/`value_len` from
+/// the header and return `leaf_body_size(key_len, value_len)` =
+/// `align8(16 + key_len + value_len)` — this is the ONE shared helper
+/// used by all three `body_of_slot` implementations (Option B,
+/// self-describing). Returns `None` if the 16-byte header or the sized
+/// body would run past the buffer.
+fn leaf_body_len_at(buf: &[u8], off: usize) -> Option<usize> {
+    let hdr_end = off.checked_add(size_of::<Leaf>())?;
+    if hdr_end > buf.len() {
+        return None;
+    }
+    // SAFETY-equivalent: read the two length fields directly from the
+    // header bytes (value_len @ +2, key_len @ +4) without forming a
+    // misaligned reference. Little-endian, matching `#[repr(C)]`.
+    let value_len = u32::from(u16::from_le_bytes([buf[off + 2], buf[off + 3]]));
+    let key_len = u32::from(u16::from_le_bytes([buf[off + 4], buf[off + 5]]));
+    let total = leaf_body_size(key_len, value_len) as usize;
+    if off.checked_add(total)? > buf.len() {
+        return None;
+    }
+    Some(total)
+}
+
+/// Errors from `alloc_node` / `alloc_leaf`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AllocError {
     /// `num_slots` reached `MAX_SLOTS` — no more slot indices.
     OutOfSlots,
     /// Data area can't fit the requested size.
     OutOfSpace {
-        /// Bytes the caller requested (8-byte aligned for extents).
+        /// Bytes the caller requested (8-byte aligned for leaves).
         need: u32,
         /// Bytes actually free in the data area.
         avail: u32,
     },
-    /// `alloc_node(NodeType::Invalid)` or `alloc_extent(0)`.
+    /// `alloc_node(NodeType::Invalid)` or `alloc_leaf(0)`.
     InvalidRequest,
 }
 
@@ -93,13 +205,6 @@ pub struct AllocOutcome {
     pub slot: u16,
 }
 
-/// Outcome of a raw-extent alloc (for Leaf key/value bytes).
-#[derive(Debug, Clone, Copy)]
-pub struct ExtentAllocOutcome {
-    /// Byte offset of the extent within the blob.
-    pub byte_offset: u32,
-}
-
 /// Read-only typed view over a `PAGE_SIZE`-byte buffer.
 ///
 /// `BlobFrameRef` is `Copy` — pass it by value. Walker `lookup` /
@@ -136,45 +241,51 @@ impl<'a> BlobFrameRef<'a> {
         unsafe { &*self.buf.as_ptr().cast::<BlobHeader>() }
     }
 
-    /// Read a 1-based slot table entry. `None` if out of range.
+    /// Resolve a node's `NodeType` directly from its body at absolute
+    /// `byte_offset` — the offset-addressed replacement for
+    /// `slot_entry(slot).node_type()`. See [`ntype_at_offset`].
+    #[inline]
     #[must_use]
-    pub fn slot_entry(&self, slot: u16) -> Option<SlotEntry> {
-        let h = self.header();
-        if slot == 0 || slot > h.num_slots {
-            return None;
-        }
-        let off = HEADER_SIZE as usize + (slot as usize - 1) * 4;
-        let raw_bytes = &self.buf[off..off + 4];
-        let raw = u32::from_le_bytes([raw_bytes[0], raw_bytes[1], raw_bytes[2], raw_bytes[3]]);
-        Some(SlotEntryRaw(raw).decode())
+    pub fn ntype_at(&self, byte_offset: u32) -> Option<NodeType> {
+        ntype_at_offset(self.buf, byte_offset as usize)
     }
 
-    /// Resolve a slot to a const view of its body bytes.
+    /// Resolve a node body at absolute `byte_offset` to a const slice.
+    ///
+    /// The offset-addressed twin of [`Self::body_of_slot`]: it reads the
+    /// `NodeType` from `body[off + 1]` (no slot lookup) and sizes the
+    /// body — a `Leaf` via its self-describing header, everything else
+    /// via `size_of_node`. Returns `None` on an out-of-range offset or
+    /// an undecodable / `Invalid` type tag.
     #[must_use]
-    pub fn body_of_slot(&self, slot: u16) -> Option<&'a [u8]> {
-        let e = self.slot_entry(slot)?;
-        let ntype = e.node_type()?;
+    pub fn body_at_offset(&self, byte_offset: u32) -> Option<&'a [u8]> {
+        let off = byte_offset as usize;
+        let ntype = ntype_at_offset(self.buf, off)?;
         if ntype == NodeType::Invalid {
             return None;
         }
-        let off = e.byte_offset() as usize;
-        let size = size_of_node(ntype) as usize;
-        if off + size > self.buf.len() {
-            return None;
-        }
-        Some(&self.buf[off..off + size])
-    }
-
-    /// Raw byte view at an arbitrary offset (Leaf extents).
-    #[must_use]
-    pub fn bytes_at(&self, offset: u32, len: u32) -> Option<&'a [u8]> {
-        let o = offset as usize;
-        let l = len as usize;
-        let end = o.checked_add(l)?;
+        let size = if ntype == NodeType::Leaf {
+            leaf_body_len_at(self.buf, off)?
+        } else {
+            size_of_node(ntype) as usize
+        };
+        let end = off.checked_add(size)?;
         if end > self.buf.len() {
             return None;
         }
-        Some(&self.buf[o..end])
+        Some(&self.buf[off..end])
+    }
+
+    /// Best-effort prefetch of the node body at absolute `byte_offset`.
+    /// Offset-addressed twin of [`Self::prefetch_node`]; never faults.
+    #[inline]
+    pub fn prefetch_at(&self, byte_offset: u32) {
+        let off = byte_offset as usize;
+        if off < self.buf.len() {
+            // SAFETY: `off < buf.len()`, so the pointer is in-bounds;
+            // a prefetch hint reads nothing and cannot fault.
+            crate::engine::prefetch_read_data(unsafe { self.buf.as_ptr().add(off) });
+        }
     }
 }
 
@@ -239,9 +350,18 @@ impl<'a> BlobFrame<'a> {
         // Allocate the empty-tree root sentinel.
         let out = frame.alloc_node(NodeType::EmptyRoot)?;
         debug_assert_eq!(out.slot, 1);
-        // Body is already zero (we memset the whole buffer above);
-        // record it as the tree's root.
-        frame.header_mut().root_slot = out.slot;
+        // The 8-byte body is all-zero from the memset above; stamp its
+        // self-describing `node_type @ +1` byte so an offset-addressed
+        // reader resolves it as `EmptyRoot` (the only node whose body
+        // isn't otherwise written with a `node_type` byte). Then record
+        // its encoded body offset as the tree root.
+        let root_off = frame
+            .offset_of_slot(out.slot)
+            .expect("freshly allocated sentinel has a slot offset");
+        if let Some(body) = frame.bytes_at_mut(root_off, 8) {
+            body[1] = NodeType::EmptyRoot.as_u8();
+        }
+        frame.header_mut().root_slot = encode_child_off(root_off);
         Ok(frame)
     }
 
@@ -288,6 +408,13 @@ impl<'a> BlobFrame<'a> {
     }
 
     /// Resolve a slot to a const view of its body bytes.
+    ///
+    /// For a `Leaf` the body is variable-size and self-describing:
+    /// its length is read back from the 16-byte header via
+    /// [`leaf_body_len_at`]. Every other type uses its fixed
+    /// `size_of_node`. v4 addresses nodes by offset
+    /// ([`Self::body_at_offset`]); this slot reader survives for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn body_of_slot(&self, slot: u16) -> Option<&[u8]> {
         let e = self.slot_entry(slot)?;
@@ -296,26 +423,92 @@ impl<'a> BlobFrame<'a> {
             return None;
         }
         let off = e.byte_offset() as usize;
-        let size = size_of_node(ntype) as usize;
+        let size = if ntype == NodeType::Leaf {
+            leaf_body_len_at(self.buf, off)?
+        } else {
+            size_of_node(ntype) as usize
+        };
         if off + size > self.buf.len() {
             return None;
         }
         Some(&self.buf[off..off + size])
     }
 
-    /// Mutable view of a slot's body bytes.
-    pub fn body_of_slot_mut(&mut self, slot: u16) -> Option<&mut [u8]> {
-        let e = self.slot_entry(slot)?;
-        let ntype = e.node_type()?;
+    /// Resolve a node's `NodeType` directly from its body at absolute
+    /// `byte_offset` — offset-addressed twin of
+    /// `slot_entry(slot).node_type()`.
+    #[inline]
+    #[must_use]
+    pub fn ntype_at(&self, byte_offset: u32) -> Option<NodeType> {
+        ntype_at_offset(self.buf, byte_offset as usize)
+    }
+
+    /// Resolve a node body at absolute `byte_offset` to a const slice.
+    /// Offset-addressed twin of [`Self::body_of_slot`].
+    #[must_use]
+    pub fn body_at_offset(&self, byte_offset: u32) -> Option<&[u8]> {
+        let off = byte_offset as usize;
+        let ntype = ntype_at_offset(self.buf, off)?;
         if ntype == NodeType::Invalid {
             return None;
         }
-        let off = e.byte_offset() as usize;
-        let size = size_of_node(ntype) as usize;
-        if off + size > self.buf.len() {
+        let size = if ntype == NodeType::Leaf {
+            leaf_body_len_at(self.buf, off)?
+        } else {
+            size_of_node(ntype) as usize
+        };
+        let end = off.checked_add(size)?;
+        if end > self.buf.len() {
             return None;
         }
-        Some(&mut self.buf[off..off + size])
+        Some(&self.buf[off..end])
+    }
+
+    /// Mutable node body at absolute `byte_offset`. Offset-addressed
+    /// twin of [`Self::body_of_slot_mut`].
+    pub fn body_at_offset_mut(&mut self, byte_offset: u32) -> Option<&mut [u8]> {
+        let off = byte_offset as usize;
+        let ntype = ntype_at_offset(self.buf, off)?;
+        if ntype == NodeType::Invalid {
+            return None;
+        }
+        let size = if ntype == NodeType::Leaf {
+            leaf_body_len_at(self.buf, off)?
+        } else {
+            size_of_node(ntype) as usize
+        };
+        let end = off.checked_add(size)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        Some(&mut self.buf[off..end])
+    }
+
+    /// Byte offset of the body registered in slot `slot`, if any.
+    /// Used by the allocator-facing call sites that still allocate a
+    /// slot for bookkeeping but address the body by offset.
+    #[must_use]
+    pub fn offset_of_slot(&self, slot: u16) -> Option<u32> {
+        self.slot_entry(slot).map(SlotEntry::byte_offset)
+    }
+
+    /// Record that the node body at `byte_offset` has been abandoned
+    /// (made unreachable by a structural op). Bumps `header.dead_bytes`
+    /// by the body's size so [`crate::engine::walker::blob_needs_compaction`]
+    /// can trigger a rebuild before the blob bloats. Best-effort: an
+    /// unresolvable offset is silently ignored (the bytes are still
+    /// reclaimed at the next compaction regardless of the counter).
+    pub fn note_abandoned(&mut self, byte_offset: u32) {
+        let size = {
+            let off = byte_offset as usize;
+            match ntype_at_offset(self.buf, off) {
+                Some(NodeType::Leaf) => leaf_body_len_at(self.buf, off).unwrap_or(0) as u32,
+                Some(nt) if nt != NodeType::Invalid => size_of_node(nt),
+                _ => 0,
+            }
+        };
+        let h = self.header_mut();
+        h.dead_bytes = h.dead_bytes.saturating_add(size);
     }
 
     /// Allocate a node of the given NodeType.
@@ -347,7 +540,7 @@ impl<'a> BlobFrame<'a> {
             return Err(AllocError::InvalidRequest);
         }
         let size = size_of_node(ntype);
-        let ntype_idx = (ntype.as_u8() - 1) as usize;
+        let ntype_idx = free_list_class(ntype);
 
         // Try same-type free list first.
         let free_head = self.header().free_list_head[ntype_idx];
@@ -427,6 +620,16 @@ impl<'a> BlobFrame<'a> {
     /// remain in place (they'll be overwritten on the next alloc
     /// that reuses this slot).
     ///
+    /// **v4 abandon-on-free**: the walker no longer calls `free_node` —
+    /// structural ops (node grow/shrink/collapse, leaf realloc, prefix
+    /// split, EmptyRoot replacement) abandon the old node instead
+    /// (leaving it unreachable, reclaimed at the next compaction) and
+    /// bump `header.dead_bytes`. The per-NodeType free lists are
+    /// therefore no longer populated on the hot path; `alloc_node`'s
+    /// free-list-reuse branches are dormant (the bump path always
+    /// fires). This method is retained for tests / diagnostics and any
+    /// future explicit-reclaim path.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn free_node(&mut self, slot: u16) -> Result<(), FreeError> {
         let e = self.slot_entry(slot).ok_or(FreeError::InvalidSlot(slot))?;
         let ntype = e.node_type().ok_or(FreeError::TypeMismatch {
@@ -440,6 +643,7 @@ impl<'a> BlobFrame<'a> {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn free_node_inner(&mut self, slot: u16) -> Result<(), FreeError> {
         let e = self.slot_entry(slot).ok_or(FreeError::InvalidSlot(slot))?;
         let ntype = e.node_type().ok_or(FreeError::TypeMismatch {
@@ -452,7 +656,7 @@ impl<'a> BlobFrame<'a> {
                 tag: e.ntype_or_next_free,
             });
         }
-        let ntype_idx = (ntype.as_u8() - 1) as usize;
+        let ntype_idx = free_list_class(ntype);
         let old_head = self.header().free_list_head[ntype_idx];
         let off = e.byte_offset();
         self.write_slot_entry(slot, SlotEntry::freed(old_head, off));
@@ -460,50 +664,65 @@ impl<'a> BlobFrame<'a> {
         Ok(())
     }
 
-    /// Bump-allocate a raw byte extent (NOT a node — does not
-    /// touch the slot table). Used for Leaf key/value bytes.
-    /// Increments `space_used` by the 8-byte-aligned size.
-    pub fn alloc_extent(&mut self, size: u32) -> Result<ExtentAllocOutcome, AllocError> {
-        if size == 0 {
+    /// Bump-allocate a single variable-size leaf node and register it
+    /// in the slot table as `NodeType::Leaf`.
+    ///
+    /// `total_aligned` is the full, 8-byte-aligned body size of the
+    /// self-describing leaf (`[16B header][key][value]`), as computed
+    /// by [`crate::layout::leaf_body_size`]. Mirrors the bump branch
+    /// of [`Self::alloc_node`] but with a runtime size.
+    ///
+    /// CRITICAL: like the old extent allocator, this honours the
+    /// [`SPILLOVER_RESERVATION`] — leaves are the dominant non-Blob
+    /// bump-area consumer, and a 99 %-full data area is exactly where
+    /// spillover needs to install its emergency `BlobNode`. Only
+    /// `alloc_node(NodeType::Blob)` may consume the last
+    /// `SPILLOVER_RESERVATION` bytes. `gap_space` is bumped by the
+    /// allocated size, consistent with `alloc_node`.
+    pub fn alloc_leaf(&mut self, total_aligned: u32) -> Result<AllocOutcome, AllocError> {
+        if total_aligned == 0 {
             return Err(AllocError::InvalidRequest);
         }
-        let aligned = (size + 7) & !7;
+        debug_assert_eq!(total_aligned & 7, 0, "alloc_leaf size must be 8-aligned");
         let h = self.header();
-        // Honour the spillover reservation (see [`SPILLOVER_RESERVATION`]):
-        // leaf extents are the dominant bump-area consumer, and a 99 %-
-        // full extent area is exactly where spillover needs to install
-        // its emergency BlobNode.
+        if h.num_slots >= MAX_SLOTS as u16 {
+            return Err(AllocError::OutOfSlots);
+        }
+        // Leaves are non-Blob: refuse the last SPILLOVER_RESERVATION
+        // bytes of the data area (copied from the old `alloc_extent`
+        // avail computation).
         let avail = PAGE_SIZE
             .saturating_sub(h.space_used)
             .saturating_sub(SPILLOVER_RESERVATION);
-        if avail < aligned {
+        if avail < total_aligned {
             return Err(AllocError::OutOfSpace {
-                need: aligned,
+                need: total_aligned,
                 avail,
             });
         }
-        let off = h.space_used;
-        self.header_mut().space_used += aligned;
-        Ok(ExtentAllocOutcome { byte_offset: off })
+        let body_off = h.space_used;
+        debug_assert!(body_off >= DATA_AREA_START);
+        debug_assert!(body_off + total_aligned <= PAGE_SIZE);
+
+        let new_slot = h.num_slots + 1; // 1-based
+        self.write_slot_entry(new_slot, SlotEntry::live(NodeType::Leaf, body_off));
+        let h = self.header_mut();
+        h.num_slots += 1;
+        h.space_used += total_aligned;
+        h.gap_space = h.gap_space.wrapping_add(total_aligned);
+
+        Ok(AllocOutcome { slot: new_slot })
     }
 
-    /// Raw byte view at an arbitrary offset.
+    /// Mutable raw byte view at an arbitrary offset.
     ///
-    /// Used to read Leaf extents (key/value bytes) which live in
-    /// the data area but are not registered in the slot table.
-    /// Returns `None` if `offset + len` would run past `PAGE_SIZE`.
-    #[must_use]
-    pub fn bytes_at(&self, offset: u32, len: u32) -> Option<&[u8]> {
-        let o = offset as usize;
-        let l = len as usize;
-        let end = o.checked_add(l)?;
-        if end > self.buf.len() {
-            return None;
-        }
-        Some(&self.buf[o..end])
-    }
-
-    /// Mutable view at an arbitrary offset.
+    /// Used by the leaf write path to populate a freshly-allocated
+    /// leaf body (`[16B header][key][value]`) *before* its header is
+    /// written. While the header's `key_len`/`value_len` are still
+    /// zero, `body_of_slot` would size the leaf as the bare 16-byte
+    /// header, so the writer must address the allocated region by its
+    /// byte offset instead. Returns `None` if `offset + len` would run
+    /// past `PAGE_SIZE`.
     pub fn bytes_at_mut(&mut self, offset: u32, len: u32) -> Option<&mut [u8]> {
         let o = offset as usize;
         let l = len as usize;
@@ -530,17 +749,26 @@ mod tests {
         let h = frame.header();
         assert_eq!(h.blob_guid, [0xAB; 16]);
         assert_eq!(h.num_slots, 1);
+        // `root_slot` now stores the encoded root offset; the sentinel
+        // sits at DATA_AREA_START, which encodes to 1.
+        assert_eq!(h.root_slot, encode_child_off(DATA_AREA_START));
         assert_eq!(h.root_slot, 1);
         // After allocating the 8-byte sentinel, space_used is
         // DATA_AREA_START + 8.
         assert_eq!(h.space_used, DATA_AREA_START + 8);
 
-        // The root slot is tagged empty_root and its body is all zero.
+        // The sentinel is self-describing via its `node_type @ +1`
+        // byte and resolves to EmptyRoot by offset (v4 addressing) and
+        // by slot (bookkeeping).
+        let root_off = decode_child_off(h.root_slot);
+        assert_eq!(frame.ntype_at(root_off), Some(NodeType::EmptyRoot));
         let e = frame.slot_entry(1).unwrap();
         assert_eq!(e.node_type(), Some(NodeType::EmptyRoot));
         let body = frame.body_of_slot(1).unwrap();
         assert_eq!(body.len(), 8);
-        assert!(body.iter().all(|b| *b == 0));
+        // Only the node_type byte at +1 is set; the rest stay zero.
+        assert_eq!(body[1], NodeType::EmptyRoot.as_u8());
+        assert!(body.iter().enumerate().all(|(i, b)| i == 1 || *b == 0));
     }
 
     #[test]
@@ -550,7 +778,7 @@ mod tests {
         let space_before = frame.header().space_used;
         let out = frame.alloc_node(NodeType::Node4).unwrap();
         assert_eq!(out.slot, 2);
-        assert_eq!(frame.header().space_used, space_before + 24);
+        assert_eq!(frame.header().space_used, space_before + 16);
         assert_eq!(frame.header().num_slots, 2);
 
         // The slot entry decodes back to Node4 with the right offset.
@@ -563,15 +791,19 @@ mod tests {
     fn free_then_realloc_reuses_slot() {
         let mut buf = fresh();
         let mut frame = BlobFrame::init(&mut buf, [0; 16]).unwrap();
-        let a = frame.alloc_node(NodeType::Leaf).unwrap();
-        let b = frame.alloc_node(NodeType::Leaf).unwrap();
-        let c = frame.alloc_node(NodeType::Leaf).unwrap();
+        // Leaves are variable-size, self-describing nodes allocated
+        // via `alloc_leaf`; freed leaf slots park on their own
+        // class-0 free list and are reclaimed by compaction. A freed
+        // slot index is still reused LIFO by `alloc_node(Leaf)`.
+        let a = frame.alloc_leaf(24).unwrap();
+        let b = frame.alloc_leaf(24).unwrap();
+        let c = frame.alloc_leaf(24).unwrap();
         assert_eq!(a.slot, 2);
         assert_eq!(b.slot, 3);
         assert_eq!(c.slot, 4);
 
         frame.free_node(b.slot).unwrap();
-        // Re-alloc — should pop slot 3 (LIFO).
+        // Re-alloc — should pop slot 3 (LIFO) off the Leaf free list.
         let r = frame.alloc_node(NodeType::Leaf).unwrap();
         assert_eq!(r.slot, 3);
     }
@@ -599,31 +831,59 @@ mod tests {
     }
 
     #[test]
-    fn alloc_extent_does_not_touch_slot_table() {
+    fn alloc_leaf_registers_slot_and_is_self_describing() {
+        use crate::layout::{leaf_body_size, Leaf};
         let mut buf = fresh();
         let mut frame = BlobFrame::init(&mut buf, [0; 16]).unwrap();
         let space_before = frame.header().space_used;
         let slots_before = frame.header().num_slots;
-        let e = frame.alloc_extent(13).unwrap();
-        // 13 → padded to 16.
-        assert_eq!(e.byte_offset, space_before);
-        assert_eq!(frame.header().space_used, space_before + 16);
-        // Slot table untouched.
-        assert_eq!(frame.header().num_slots, slots_before);
+
+        // A leaf with a 5-byte key + 7-byte value: total = align8(28) = 32.
+        let total = leaf_body_size(5, 7);
+        assert_eq!(total, 32);
+        let out = frame.alloc_leaf(total).unwrap();
+        assert_eq!(out.slot, slots_before + 1);
+        assert_eq!(frame.header().num_slots, slots_before + 1);
+        assert_eq!(frame.header().space_used, space_before + total);
+
+        let e = frame.slot_entry(out.slot).unwrap();
+        assert_eq!(e.node_type(), Some(NodeType::Leaf));
+        assert_eq!(e.byte_offset(), space_before);
+        let body_off = e.byte_offset();
+
+        // Before the header is written it is all-zero, so the leaf is
+        // self-described as the bare 16-byte header.
+        assert_eq!(frame.body_of_slot(out.slot).unwrap().len(), 16);
+
+        // Write the header via the raw byte offset, then confirm
+        // body_of_slot now resolves the full variable size.
+        let leaf = Leaf::live(5, 7, 99, 0xAB);
+        {
+            let body = frame.bytes_at_mut(body_off, total).unwrap();
+            assert_eq!(body.len(), total as usize);
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::from_ref::<Leaf>(&leaf).cast::<u8>(),
+                    std::mem::size_of::<Leaf>(),
+                )
+            };
+            body[..16].copy_from_slice(bytes);
+        }
+        assert_eq!(frame.body_of_slot(out.slot).unwrap().len(), total as usize);
     }
 
     #[test]
     fn out_of_space_at_data_area_boundary() {
         let mut buf = fresh();
         let mut frame = BlobFrame::init(&mut buf, [0; 16]).unwrap();
-        // Drain the data area with one giant extent. alloc_extent
-        // respects the SPILLOVER_RESERVATION, so the last 128 bytes
-        // of the data area are off-limits.
+        // Drain the data area with leaves. alloc_leaf respects the
+        // SPILLOVER_RESERVATION, so the last 128 bytes of the data
+        // area are off-limits.
         let remaining = PAGE_SIZE - frame.header().space_used - SPILLOVER_RESERVATION;
-        frame.alloc_extent(remaining - 8).unwrap();
-        frame.alloc_extent(8).unwrap();
+        frame.alloc_leaf(remaining - 8).unwrap();
+        frame.alloc_leaf(8).unwrap();
         assert!(matches!(
-            frame.alloc_extent(8),
+            frame.alloc_leaf(8),
             Err(AllocError::OutOfSpace { .. })
         ));
 

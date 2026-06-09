@@ -3,26 +3,28 @@
 //! and install a `BlobNode` placeholder.
 //!
 //! Also hosts:
-//! - `free_subtree` (recursive slot reclaim after migration)
+//! - `abandon_subtree` (recursive abandon-on-free after migration —
+//!   bumps `dead_bytes`, leaves nodes for the next compaction)
 //! - `fresh_blob_guid` (cheap process-local GUIDs)
 //! - `compact_blob` (in-place repack, re-exported from
 //!   [`super::migrate`])
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{
-    leaf_extent_size, size_of_node, BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType,
+    leaf_body_size, size_of_node, BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType,
     Prefix, DATA_AREA_START, PAGE_SIZE,
 };
-use crate::store::{BlobFrame, BufferManager};
+use crate::store::{decode_child_off, encode_child_off, BlobFrame, BufferManager};
 
 use super::super::simd;
 use super::cast;
 use super::migrate::make_blob_from_node_in;
 use super::readers::{
-    ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48, read_prefix,
+    child_offset, ntype_of, read_leaf_key_ref, read_node16, read_node256, read_node4, read_node48,
+    read_prefix,
 };
 use super::types::{Victim, VictimEdgeKind};
-use super::writers::{inner_update_child, set_prefix_child, write_struct_to_slot};
+use super::writers::{inner_update_child, set_prefix_child, write_struct_at};
 
 // Re-export `compact_blob` so `insert_multi` can reach it via
 // `super::spillover::compact_blob`.
@@ -91,12 +93,12 @@ pub(super) fn spillover_blob(
     bm: &BufferManager,
     frame: &mut BlobFrame<'_>,
     seq: u64,
-) -> Result<u16> {
-    let root_slot = frame.header().root_slot;
-    let victim = pick_victim_subtree(frame, root_slot)?;
+) -> Result<u32> {
+    let root_off = decode_child_off(frame.header().root_slot);
+    let victim = pick_victim_subtree(frame, root_off)?;
 
     let new_guid = fresh_blob_guid();
-    let outcome = make_blob_from_node_in(bm, frame, victim.victim_slot, new_guid)?;
+    let outcome = make_blob_from_node_in(bm, frame, victim.victim_off, new_guid)?;
 
     // Stage the new blob via the unified `mark_dirty → checkpoint
     // round` protocol — the bytes stay in cache until the round
@@ -111,32 +113,31 @@ pub(super) fn spillover_blob(
     // orphan position.
     bm.install_new_blob(new_guid, outcome.buf, seq);
 
-    // Free the migrated subtree's slots in the source blob.
-    free_subtree(frame, victim.victim_slot)?;
+    // Abandon the migrated subtree's nodes in the source blob (they've
+    // been copied to the child); reclaimed at next compaction. Bump
+    // dead-bytes so the source still triggers compaction.
+    abandon_subtree(frame, victim.victim_off)?;
 
     // Allocate a BlobNode pointing at the child blob. The child
     // blob's own header.root_slot is the only entry slot.
     let bn_alloc = frame.alloc_node(NodeType::Blob)?;
+    let bn_off = frame
+        .offset_of_slot(bn_alloc.slot)
+        .ok_or(Error::node_corrupt("spillover: BlobNode offset"))?;
     let bn = BlobNode::new(&[], new_guid);
-    write_struct_to_slot(frame, bn_alloc.slot, &bn)?;
+    write_struct_at(frame, bn_off, &bn)?;
 
     // Wire the parent of the migrated subtree to point at the new
-    // BlobNode instead of the now-freed victim slot.
-    if victim.parent_slot == root_slot && victim.via_header_root {
-        frame.header_mut().root_slot = bn_alloc.slot;
+    // BlobNode instead of the now-abandoned victim subtree.
+    if victim.parent_off == root_off && victim.via_header_root {
+        frame.header_mut().root_slot = encode_child_off(bn_off);
     } else {
         match victim.kind {
             VictimEdgeKind::Prefix => {
-                set_prefix_child(frame, victim.parent_slot, u32::from(bn_alloc.slot))?;
+                set_prefix_child(frame, victim.parent_off, bn_off)?;
             }
             VictimEdgeKind::Inner(parent_ntype) => {
-                inner_update_child(
-                    frame,
-                    victim.parent_slot,
-                    parent_ntype,
-                    victim.byte,
-                    u32::from(bn_alloc.slot),
-                )?;
+                inner_update_child(frame, victim.parent_off, parent_ntype, victim.byte, bn_off)?;
             }
         }
     }
@@ -145,20 +146,48 @@ pub(super) fn spillover_blob(
     tracing::debug!(
         target: "holt::engine::spillover",
         new_child_guid = ?&new_guid[..4],
-        victim_slot = victim.victim_slot,
-        bn_slot = bn_alloc.slot,
+        victim_off = victim.victim_off,
+        bn_off = bn_off,
         "spillover: migrated subtree to fresh child blob",
     );
 
-    Ok(bn_alloc.slot)
+    Ok(bn_off)
 }
 
-fn subtree_footprint(frame: &BlobFrame<'_>, root: u16) -> Result<SubtreeFootprint> {
+/// Memo for per-`pick_victim` subtree footprints, keyed by a node's
+/// body byte offset. The frame is read-only during victim selection,
+/// so each subtree's footprint is constant and can be cached after its
+/// first DFS. This turns the otherwise O(nodes × descent-depth) re-walk
+/// — each candidate edge re-footprints subtrees its ancestors already
+/// walked — into a single O(nodes) pass.
+type FootprintMemo = std::collections::HashMap<u32, SubtreeFootprint>;
+
+fn footprint_memo(frame: &BlobFrame<'_>) -> FootprintMemo {
+    FootprintMemo::with_capacity(frame.header().num_slots as usize + 1)
+}
+
+/// Standalone footprint with a fresh memo — used by tests; the
+/// live victim-selection path shares one memo across all candidate
+/// edges via [`subtree_footprint_memo`].
+#[cfg(test)]
+fn subtree_footprint(frame: &BlobFrame<'_>, root: u32) -> Result<SubtreeFootprint> {
+    let mut memo = footprint_memo(frame);
+    subtree_footprint_memo(frame, root, &mut memo)
+}
+
+fn subtree_footprint_memo(
+    frame: &BlobFrame<'_>,
+    root: u32,
+    memo: &mut FootprintMemo,
+) -> Result<SubtreeFootprint> {
+    if let Some(cached) = memo.get(&root).copied() {
+        return Ok(cached);
+    }
     let ntype = ntype_of(frame.as_ref(), root)?;
     if ntype == NodeType::Invalid {
         return Err(Error::node_corrupt("subtree_footprint: Invalid"));
     }
-    let body = frame.body_of_slot(root).ok_or(Error::node_corrupt(
+    let body = frame.body_at_offset(root).ok_or(Error::node_corrupt(
         "subtree_footprint: body resolution failed",
     ))?;
     let mut out = SubtreeFootprint {
@@ -168,46 +197,69 @@ fn subtree_footprint(frame: &BlobFrame<'_>, root: u16) -> Result<SubtreeFootprin
     match ntype {
         NodeType::Invalid => unreachable!("handled before size_of_node"),
         NodeType::Leaf => {
+            // A leaf is one contiguous, self-describing node
+            // (`[16B header][key][value]`). `size_of_node(Leaf)` only
+            // counts the 16-byte header, so replace `out.bytes` with
+            // the full variable body size — adding it would double-
+            // count the header and skew spillover victim selection.
             let (key, leaf) = read_leaf_key_ref(frame.as_ref(), root)?;
-            out.bytes = out.bytes.saturating_add(leaf_extent_size(
-                key.len() as u32,
-                u32::from(leaf.value_size),
-            ));
+            out.bytes = leaf_body_size(key.len() as u32, u32::from(leaf.value_len));
         }
         NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Prefix => {
             let p = cast::<Prefix>(body);
-            out = out.saturating_add(subtree_footprint(frame, p.child as u16)?);
+            out = out.saturating_add(subtree_footprint_memo(
+                frame,
+                child_offset(p.child as u16),
+                memo,
+            )?);
         }
         NodeType::Node4 => {
             let n = cast::<Node4>(body);
             for i in 0..(n.count as usize).min(4) {
-                out = out.saturating_add(subtree_footprint(frame, n.children[i] as u16)?);
+                out = out.saturating_add(subtree_footprint_memo(
+                    frame,
+                    child_offset(n.children[i]),
+                    memo,
+                )?);
             }
         }
         NodeType::Node16 => {
             let n = cast::<Node16>(body);
             for i in 0..(n.count as usize).min(16) {
-                out = out.saturating_add(subtree_footprint(frame, n.children[i] as u16)?);
+                out = out.saturating_add(subtree_footprint_memo(
+                    frame,
+                    child_offset(n.children[i]),
+                    memo,
+                )?);
             }
         }
         NodeType::Node48 => {
             let n = cast::<Node48>(body);
             let mut i = 0usize;
-            while let Some(next_i) = simd::find_next_nonzero_u32(&n.children, i) {
+            while let Some(next_i) = simd::find_next_nonzero_u16(&n.children, i) {
                 i = next_i + 1;
-                out = out.saturating_add(subtree_footprint(frame, n.children[next_i] as u16)?);
+                out = out.saturating_add(subtree_footprint_memo(
+                    frame,
+                    child_offset(n.children[next_i]),
+                    memo,
+                )?);
             }
         }
         NodeType::Node256 => {
             let n = cast::<Node256>(body);
             let mut i = 0usize;
-            while let Some(next_i) = simd::find_next_nonzero_u32(&n.children, i) {
+            while let Some(next_i) = simd::find_next_nonzero_u16(&n.children, i) {
                 i = next_i + 1;
-                out = out.saturating_add(subtree_footprint(frame, n.children[next_i] as u16)?);
+                out = out.saturating_add(subtree_footprint_memo(
+                    frame,
+                    child_offset(n.children[next_i]),
+                    memo,
+                )?);
             }
         }
     }
+    memo.insert(root, out);
     Ok(out)
 }
 
@@ -236,9 +288,10 @@ impl SubtreeFootprint {
 ///   shaped; cutting a child blob at a component boundary improves
 ///   top-route cache reuse and avoids long low-reuse prefix hops.
 #[allow(clippy::too_many_lines)] // intentional — one match over NodeType arms
-fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim> {
+fn pick_victim_subtree(frame: &BlobFrame<'_>, start_off: u32) -> Result<Victim> {
     let mut best: Option<VictimCandidate> = None;
-    collect_victim_candidates(frame, start_slot, 0, &mut best)?;
+    let mut memo = footprint_memo(frame);
+    collect_victim_candidates(frame, start_off, 0, &mut best, &mut memo)?;
     best.map(|candidate| candidate.victim)
         .ok_or(Error::NotYetImplemented(
             "spillover: no non-Blob subtree to migrate",
@@ -248,9 +301,10 @@ fn pick_victim_subtree(frame: &BlobFrame<'_>, start_slot: u16) -> Result<Victim>
 #[allow(clippy::too_many_lines)] // one match over NodeType arms
 fn collect_victim_candidates(
     frame: &BlobFrame<'_>,
-    current: u16,
+    current: u32,
     depth: usize,
     best: &mut Option<VictimCandidate>,
+    memo: &mut FootprintMemo,
 ) -> Result<()> {
     let ntype = ntype_of(frame.as_ref(), current)?;
     match ntype {
@@ -261,15 +315,16 @@ fn collect_victim_candidates(
                 visit_child_edge(
                     frame,
                     Victim {
-                        parent_slot: current,
+                        parent_off: current,
                         kind: VictimEdgeKind::Inner(NodeType::Node4),
                         byte: n.keys[i],
-                        victim_slot: n.children[i] as u16,
+                        victim_off: child_offset(n.children[i]),
                         via_header_root: false,
                     },
                     boundary_quality_for_byte(n.keys[i]),
                     child_depth,
                     best,
+                    memo,
                 )?;
             }
         }
@@ -280,15 +335,16 @@ fn collect_victim_candidates(
                 visit_child_edge(
                     frame,
                     Victim {
-                        parent_slot: current,
+                        parent_off: current,
                         kind: VictimEdgeKind::Inner(NodeType::Node16),
                         byte: n.keys[i],
-                        victim_slot: n.children[i] as u16,
+                        victim_off: child_offset(n.children[i]),
                         via_header_root: false,
                     },
                     boundary_quality_for_byte(n.keys[i]),
                     child_depth,
                     best,
+                    memo,
                 )?;
             }
         }
@@ -308,37 +364,39 @@ fn collect_victim_candidates(
                 visit_child_edge(
                     frame,
                     Victim {
-                        parent_slot: current,
+                        parent_off: current,
                         kind: VictimEdgeKind::Inner(NodeType::Node48),
                         byte: next_b as u8,
-                        victim_slot: n.children[ci] as u16,
+                        victim_off: child_offset(n.children[ci]),
                         via_header_root: false,
                     },
                     boundary_quality_for_byte(next_b as u8),
                     child_depth,
                     best,
+                    memo,
                 )?;
             }
         }
         NodeType::Node256 => {
             let n = read_node256(frame.as_ref(), current)?;
             let mut b = 0usize;
-            while let Some(next_b) = simd::find_next_nonzero_u32(&n.children, b) {
+            while let Some(next_b) = simd::find_next_nonzero_u16(&n.children, b) {
                 b = next_b + 1;
                 let child = n.children[next_b];
                 let child_depth = depth + 1;
                 visit_child_edge(
                     frame,
                     Victim {
-                        parent_slot: current,
+                        parent_off: current,
                         kind: VictimEdgeKind::Inner(NodeType::Node256),
                         byte: next_b as u8,
-                        victim_slot: child as u16,
+                        victim_off: child_offset(child),
                         via_header_root: false,
                     },
                     boundary_quality_for_byte(next_b as u8),
                     child_depth,
                     best,
+                    memo,
                 )?;
             }
         }
@@ -350,15 +408,16 @@ fn collect_victim_candidates(
             visit_child_edge(
                 frame,
                 Victim {
-                    parent_slot: current,
+                    parent_off: current,
                     kind: VictimEdgeKind::Prefix,
                     byte: 0,
-                    victim_slot: p.child as u16,
+                    victim_off: child_offset(p.child as u16),
                     via_header_root: false,
                 },
                 boundary_quality_for_prefix(prefix),
                 child_depth,
                 best,
+                memo,
             )?;
         }
         NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
@@ -375,8 +434,9 @@ fn visit_child_edge(
     boundary: BoundaryQuality,
     boundary_depth: usize,
     best: &mut Option<VictimCandidate>,
+    memo: &mut FootprintMemo,
 ) -> Result<()> {
-    let child_ntype = ntype_of(frame.as_ref(), victim.victim_slot)?;
+    let child_ntype = ntype_of(frame.as_ref(), victim.victim_off)?;
     match child_ntype {
         NodeType::Invalid => {
             return Err(Error::node_corrupt("visit_child_edge: Invalid child"));
@@ -385,7 +445,7 @@ fn visit_child_edge(
         _ => {}
     }
 
-    let footprint = subtree_footprint(frame, victim.victim_slot)?;
+    let footprint = subtree_footprint_memo(frame, victim.victim_off, memo)?;
     let candidate = VictimCandidate {
         victim,
         footprint,
@@ -399,7 +459,7 @@ fn visit_child_edge(
         *best = Some(candidate);
     }
     if footprint.bytes > spillover_target_child_bytes() {
-        collect_victim_candidates(frame, victim.victim_slot, boundary_depth, best)?;
+        collect_victim_candidates(frame, victim.victim_off, boundary_depth, best, memo)?;
     }
     Ok(())
 }
@@ -488,58 +548,65 @@ fn candidate_tie(
     candidate.footprint.nodes > current.footprint.nodes
 }
 
-/// Recursively free every slot of the subtree rooted at `root` in
-/// `frame`. Used by spillover to reclaim source-side slot entries
-/// after `make_blob_from_node` has copied them out.
-pub(super) fn free_subtree(frame: &mut BlobFrame<'_>, root: u16) -> Result<()> {
+/// Recursively abandon every node of the subtree rooted at byte offset
+/// `root` in `frame` (abandon-on-free). Used by spillover after
+/// `make_blob_from_node` has copied the subtree out: the source-side
+/// nodes become unreachable and their bytes are reclaimed at the next
+/// compaction. Each node's size is added to `header.dead_bytes` (via
+/// [`BlobFrame::note_abandoned`]) so the source blob still triggers
+/// compaction. A `Blob` victim node is never reached (spillover skips
+/// `Blob` children), so external-blob accounting is unaffected here.
+pub(super) fn abandon_subtree(frame: &mut BlobFrame<'_>, root: u32) -> Result<()> {
     let ntype = ntype_of(frame.as_ref(), root)?;
-    // Snapshot the body bytes before mutating the slot table so the
-    // following `frame.free_node` calls can't invalidate them.
+    // Snapshot the body bytes before bumping dead-bytes so the
+    // recursion reads a stable view.
     let body_copy = frame
-        .body_of_slot(root)
-        .ok_or(Error::node_corrupt("free_subtree: body resolution failed"))?
+        .body_at_offset(root)
+        .ok_or(Error::node_corrupt(
+            "abandon_subtree: body resolution failed",
+        ))?
         .to_vec();
 
     match ntype {
         NodeType::Invalid => {
-            return Err(Error::node_corrupt("free_subtree: Invalid in source"));
+            return Err(Error::node_corrupt("abandon_subtree: Invalid in source"));
         }
         NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob => {}
         NodeType::Prefix => {
             let p = cast::<Prefix>(&body_copy);
-            free_subtree(frame, p.child as u16)?;
+            abandon_subtree(frame, child_offset(p.child as u16))?;
         }
         NodeType::Node4 => {
             let n = cast::<Node4>(&body_copy);
             for i in 0..(n.count as usize).min(4) {
-                free_subtree(frame, n.children[i] as u16)?;
+                abandon_subtree(frame, child_offset(n.children[i]))?;
             }
         }
         NodeType::Node16 => {
             let n = cast::<Node16>(&body_copy);
             for i in 0..(n.count as usize).min(16) {
-                free_subtree(frame, n.children[i] as u16)?;
+                abandon_subtree(frame, child_offset(n.children[i]))?;
             }
         }
         NodeType::Node48 => {
             let n = cast::<Node48>(&body_copy);
             let mut i = 0usize;
-            while let Some(next_i) = simd::find_next_nonzero_u32(&n.children, i) {
+            while let Some(next_i) = simd::find_next_nonzero_u16(&n.children, i) {
                 i = next_i + 1;
-                free_subtree(frame, n.children[next_i] as u16)?;
+                abandon_subtree(frame, child_offset(n.children[next_i]))?;
             }
         }
         NodeType::Node256 => {
             let n = cast::<Node256>(&body_copy);
             let mut i = 0usize;
-            while let Some(next_i) = simd::find_next_nonzero_u32(&n.children, i) {
+            while let Some(next_i) = simd::find_next_nonzero_u16(&n.children, i) {
                 i = next_i + 1;
-                free_subtree(frame, n.children[next_i] as u16)?;
+                abandon_subtree(frame, child_offset(n.children[next_i]))?;
             }
         }
     }
 
-    frame.free_node(root)?;
+    frame.note_abandoned(root);
     Ok(())
 }
 
@@ -659,10 +726,10 @@ mod tests {
     ) -> VictimCandidate {
         VictimCandidate {
             victim: Victim {
-                parent_slot: 0,
+                parent_off: 0,
                 kind: VictimEdgeKind::Prefix,
                 byte: 0,
-                victim_slot: 0,
+                victim_off: 0,
                 via_header_root: false,
             },
             footprint: SubtreeFootprint { nodes, bytes },
@@ -752,8 +819,9 @@ mod tests {
         }
         put(&mut frame, b"b/tiny", b"v", seq);
 
-        let victim = pick_victim_subtree(&frame, frame.header().root_slot).unwrap();
-        let footprint = subtree_footprint(&frame, victim.victim_slot).unwrap();
+        let victim =
+            pick_victim_subtree(&frame, decode_child_off(frame.header().root_slot)).unwrap();
+        let footprint = subtree_footprint(&frame, victim.victim_off).unwrap();
 
         assert!(
             footprint.bytes >= spillover_min_child_bytes(),

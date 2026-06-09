@@ -51,8 +51,17 @@ pub struct BlobHeader {
     pub field_52: u16,
     /// Slot-table high-water mark — new slots allocated at this index.
     pub num_slots: u16,
-    /// Slot index pointing at the tree root. `0` is never valid;
-    /// initial value is 1 (the empty-tree sentinel allocated on init).
+    /// Encoded byte offset of the tree root's node body — the same
+    /// biased child encoding used by `children[N]` / `Prefix.child`
+    /// (see `encode_child_off`): `(byte_offset / 8) -
+    /// (DATA_AREA_START / 8) + 1`. `0` is never valid (it's the null
+    /// sentinel); after init it points at the empty-tree EmptyRoot
+    /// sentinel at `DATA_AREA_START`, which encodes to `1`.
+    ///
+    /// (Historically a 1-based slot index; v4 switched node addressing
+    /// from slots to body offsets so a node hop is a single load. The
+    /// field name is retained for on-disk-offset stability; semantics
+    /// are now "encoded root offset".)
     pub root_slot: u16,
     /// Absolute byte offset of the next free byte in the data area.
     /// Starts at `DATA_AREA_START` (= 0xB000) after init.
@@ -65,7 +74,16 @@ pub struct BlobHeader {
     /// this blob. Bumped at the end of every successful compaction.
     /// Surfaced via [`Tree::stats`](crate::Tree::stats).
     pub compact_times: u32,
-    _pad_64: [u8; 4],
+    /// Bytes of node bodies abandoned (made unreachable) since the
+    /// last compaction. v4 structural ops (node grow/shrink/collapse,
+    /// leaf value-grow realloc, EmptyRoot replacement, prefix split)
+    /// no longer free their old node — they allocate the replacement,
+    /// repoint the parent at it, and leave the old body unreachable
+    /// (abandon-on-free). This counter accumulates that dead weight so
+    /// `blob_needs_compaction` can trigger a rebuild before a churny
+    /// blob bloats. Reset to 0 at the end of every successful
+    /// compaction. (Was reserved padding `_pad_64`; v4 named it.)
+    pub dead_bytes: u32,
     /// Cumulative count of size-table bytes ever allocated for
     /// nodes (used to drive compaction triggers).
     pub gap_space: u32,
@@ -105,6 +123,7 @@ const _: () = assert!(offset_of!(BlobHeader, root_slot) == 0x56);
 const _: () = assert!(offset_of!(BlobHeader, space_used) == 0x58);
 const _: () = assert!(offset_of!(BlobHeader, num_ext_blobs) == 0x5c);
 const _: () = assert!(offset_of!(BlobHeader, compact_times) == 0x60);
+const _: () = assert!(offset_of!(BlobHeader, dead_bytes) == 0x64);
 const _: () = assert!(offset_of!(BlobHeader, gap_space) == 0x68);
 const _: () = assert!(offset_of!(BlobHeader, tombstone_leaf_cnt) == 0x6c);
 const _: () = assert!(offset_of!(BlobHeader, free_list_head) == 0x70);

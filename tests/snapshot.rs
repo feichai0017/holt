@@ -56,7 +56,7 @@ fn snapshot_reads_across_blob_boundaries() {
         .open_with_blob_store(store.clone())
         .unwrap();
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let value = vec![0xAB_u8; 200];
     for i in 0..N {
         tree.put(format!("k{i:08}").as_bytes(), &value).unwrap();
@@ -128,7 +128,7 @@ fn snapshot_isolates_cross_blob_writes() {
         .open_with_blob_store(store.clone())
         .unwrap();
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let orig = vec![0xAB_u8; 200];
     for i in 0..N {
         tree.put(format!("k{i:08}").as_bytes(), &orig).unwrap();
@@ -203,7 +203,7 @@ fn nested_cross_blob_snapshots_each_isolated() {
         .open_with_blob_store(store.clone())
         .unwrap();
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let v1 = vec![0x01_u8; 200];
     let v2 = vec![0x02_u8; 200];
     let v3 = vec![0x03_u8; 200];
@@ -324,7 +324,7 @@ fn retire_reclaims_forked_frames() {
         .open_with_blob_store(store.clone())
         .unwrap();
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let orig = vec![0xAB_u8; 200];
     for i in 0..N {
         tree.put(format!("k{i:08}").as_bytes(), &orig).unwrap();
@@ -377,7 +377,7 @@ fn overlapping_snapshots_reclaim_after_last_retires() {
         .open_with_blob_store(store.clone())
         .unwrap();
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let v = vec![0xAB_u8; 200];
     for i in 0..N {
         tree.put(format!("k{i:08}").as_bytes(), &v).unwrap();
@@ -427,7 +427,7 @@ fn snapshot_correct_after_reopen() {
         c
     };
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let v1 = vec![0x01_u8; 200];
     let v2 = vec![0x02_u8; 200];
     let v3 = vec![0x03_u8; 200];
@@ -495,7 +495,7 @@ fn gc_reclaims_crash_leaked_snapshot_frames() {
         c
     };
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let v = vec![0xAB_u8; 200];
 
     // Session 1: snapshot + fork, checkpoint so the forks/orphans/snapshot
@@ -553,7 +553,7 @@ fn db_gc_reclaims_leak_and_preserves_all_trees() {
         c
     };
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let v = vec![0xAB_u8; 200];
 
     // Session 1: two trees; snapshot + fork + crash on t1.

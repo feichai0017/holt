@@ -617,13 +617,18 @@ mod tests {
         {
             let mut frame = BlobFrame::init(buf.as_mut_slice(), parent).unwrap();
             let out = frame.alloc_node(NodeType::Blob).unwrap();
+            let off = frame.offset_of_slot(out.slot).unwrap();
             let node = BlobNode::new(&[], child);
-            let body = frame.body_of_slot_mut(out.slot).unwrap();
+            // Write the BlobNode body by raw offset (its `node_type` byte
+            // isn't set yet, so `body_at_offset_mut` can't resolve it).
+            let body = frame
+                .bytes_at_mut(off, size_of::<BlobNode>() as u32)
+                .unwrap();
             let bytes = unsafe {
                 std::slice::from_raw_parts(std::ptr::from_ref(&node).cast(), size_of::<BlobNode>())
             };
             body.copy_from_slice(bytes);
-            frame.header_mut().root_slot = out.slot;
+            frame.header_mut().root_slot = crate::store::encode_child_off(off);
         }
         buf
     }

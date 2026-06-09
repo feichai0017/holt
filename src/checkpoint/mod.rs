@@ -83,7 +83,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::concurrency::{CommitGate, Gate};
-use crate::journal::group_commit::Journal;
+use crate::journal::Journal;
 use crate::store::BufferManager;
 
 use self::io::IoTask;

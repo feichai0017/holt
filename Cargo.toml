@@ -1,6 +1,6 @@
 [package]
 name = "holt"
-version = "0.5.4"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.82"
 autobenches = false
@@ -19,7 +19,7 @@ members = [".", "crates/holt-ffi"]
 exclude = ["benches", "fuzz", "tools/soak", "verified"]
 
 [dependencies]
-# Bounded channels for the background checkpointer threads.
+# Control channels for the journal flusher and background checkpointer threads.
 crossbeam-channel = "0.5"
 # Sharded blob cache map for the BufferManager.
 dashmap = "6"
@@ -41,6 +41,11 @@ rand = "0.10"
 tempfile = "3"
 proptest = { version = "1", default-features = false, features = ["std", "fork", "timeout"] }
 
+# Model-checker for the WAL ring's lock-free reserve/publish/advance protocol.
+# Only compiled under `--cfg loom` (a separate test pass), never in normal builds.
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
 [features]
 default = ["io-uring"]
 # Linux-only file-store fast path. Non-Linux builds ignore it.
@@ -57,6 +62,10 @@ opt-level = 3
 
 [profile.bench]
 inherits = "release"
+
+[[example]]
+name = "wal_crash_soak"
+path = "examples/wal_crash_soak.rs"
 
 [[example]]
 name = "basic_kv"

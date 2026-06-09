@@ -14,6 +14,7 @@ mod blob_frame;
 pub(crate) mod blob_store;
 mod buffer_manager;
 
+pub(crate) use blob_frame::{decode_child_off, encode_child_off};
 pub use blob_frame::{AllocError, BlobFrame, BlobFrameRef, FreeError};
 pub(crate) use buffer_manager::{
     BlobWriteGuard, DirtySnapshotEntry, WriteThroughEntry, WriteThroughStatus, STRUCTURAL_SEQ,

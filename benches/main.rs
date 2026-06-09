@@ -508,6 +508,11 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
             });
         });
 
+        // Drop the holt Tree (joins its checkpointer) BEFORE its TempDir
+        // drops at scope end, and BEFORE the other engines' benches so its
+        // background threads don't perturb their timings.
+        drop(holt);
+
         let (db, _dir) = make_rocksdb();
         let wo = rocksdb_write_opts_persistent();
         for (k, v) in pairs {
@@ -566,6 +571,11 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
                 holt.put(black_box(k), black_box(v)).unwrap();
             });
         });
+
+        // Drop the holt Tree (joins its checkpointer) BEFORE its TempDir
+        // drops at scope end, and BEFORE the other engines' benches so its
+        // background threads don't perturb their timings.
+        drop(holt);
 
         let (db, _dir) = make_rocksdb();
         let wo = rocksdb_write_opts_persistent();
@@ -632,6 +642,11 @@ fn bench_scenario_persistent(c: &mut Criterion, name: &str, pairs: &[(Vec<u8>, V
                 }
             });
         });
+
+        // Drop the holt Tree (joins its checkpointer) BEFORE its TempDir
+        // drops at scope end, and BEFORE the other engines' benches so its
+        // background threads don't perturb their timings.
+        drop(holt);
 
         let (db, _dir) = make_rocksdb();
         let wo = rocksdb_write_opts_persistent();
@@ -1084,6 +1099,11 @@ fn bench_list_plain_persistent(
             black_box(out);
         });
     });
+
+    // Drop the holt Tree (joins its checkpointer) BEFORE its TempDir
+    // drops at scope end, and BEFORE the other engines' benches so its
+    // background threads don't perturb their timings.
+    drop(holt);
 
     let (db, _dir) = make_rocksdb();
     let wo = rocksdb_write_opts_persistent();

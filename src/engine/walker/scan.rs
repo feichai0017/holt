@@ -12,7 +12,7 @@ use crate::api::errors::{Error, Result};
 use crate::layout::{
     BlobGuid, BlobNode, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
 };
-use crate::store::{BlobFrameRef, BufferManager};
+use crate::store::{decode_child_off, BlobFrameRef, BufferManager};
 
 use super::super::simd;
 use super::cast;
@@ -51,7 +51,11 @@ pub fn collect_blob_guids(bm: &BufferManager, root_guid: BlobGuid) -> Result<Vec
 /// Return every `BlobNode` child referenced inside a single blob frame.
 pub(crate) fn collect_blob_children_from_frame(frame: BlobFrameRef<'_>) -> Result<Vec<BlobGuid>> {
     let mut found = Vec::new();
-    scan_subtree(frame, frame.header().root_slot, &mut found)?;
+    scan_subtree(
+        frame,
+        decode_child_off(frame.header().root_slot),
+        &mut found,
+    )?;
     Ok(found)
 }
 
@@ -97,8 +101,8 @@ fn collect_blob_topology_inner(
         {
             let guard = pin.read();
             let frame = BlobFrameRef::wrap(guard.as_slice());
-            let root_slot = frame.header().root_slot;
-            scan_subtree(frame, root_slot, &mut found)?;
+            let root_off = decode_child_off(frame.header().root_slot);
+            scan_subtree(frame, root_off, &mut found)?;
         }
         for child_guid in found {
             let child = BlobTopologyEntry {
@@ -112,8 +116,8 @@ fn collect_blob_topology_inner(
     Ok(all)
 }
 
-fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> Result<()> {
-    let (ntype, body) = resolve_typed(frame, slot)?;
+fn scan_subtree(frame: BlobFrameRef<'_>, off: u32, out: &mut Vec<BlobGuid>) -> Result<()> {
+    let (ntype, body) = resolve_typed(frame, off)?;
     match ntype {
         NodeType::Invalid => Err(Error::node_corrupt(
             "walker::scan::scan_subtree: hit NodeType::Invalid",
@@ -121,13 +125,13 @@ fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> 
         NodeType::EmptyRoot | NodeType::Leaf => Ok(()),
         NodeType::Prefix => {
             let p = cast::<Prefix>(body);
-            scan_subtree(frame, p.child as u16, out)
+            scan_subtree(frame, decode_child_off(p.child as u16), out)
         }
         NodeType::Node4 => {
             let n = cast::<Node4>(body);
             let count = (n.count as usize).min(4);
             for i in 0..count {
-                scan_subtree(frame, n.children[i] as u16, out)?;
+                scan_subtree(frame, decode_child_off(n.children[i]), out)?;
             }
             Ok(())
         }
@@ -135,7 +139,7 @@ fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> 
             let n = cast::<Node16>(body);
             let count = (n.count as usize).min(16);
             for i in 0..count {
-                scan_subtree(frame, n.children[i] as u16, out)?;
+                scan_subtree(frame, decode_child_off(n.children[i]), out)?;
             }
             Ok(())
         }
@@ -151,16 +155,16 @@ fn scan_subtree(frame: BlobFrameRef<'_>, slot: u16, out: &mut Vec<BlobGuid>) -> 
                         "walker::scan::scan_subtree: Node48 index out of range",
                     ));
                 }
-                scan_subtree(frame, n.children[ci] as u16, out)?;
+                scan_subtree(frame, decode_child_off(n.children[ci]), out)?;
             }
             Ok(())
         }
         NodeType::Node256 => {
             let n = cast::<Node256>(body);
             let mut byte = 0usize;
-            while let Some(next_byte) = simd::find_next_nonzero_u32(&n.children, byte) {
+            while let Some(next_byte) = simd::find_next_nonzero_u16(&n.children, byte) {
                 byte = next_byte + 1;
-                scan_subtree(frame, n.children[next_byte] as u16, out)?;
+                scan_subtree(frame, decode_child_off(n.children[next_byte]), out)?;
             }
             Ok(())
         }

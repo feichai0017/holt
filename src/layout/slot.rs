@@ -44,6 +44,11 @@ impl SlotEntry {
 
     /// Build a slot entry tagging this slot as on the free list,
     /// pointing at `next_free_slot` (1-based; 0 = list end).
+    ///
+    /// v4 abandon-on-free: the walker no longer frees nodes onto the
+    /// per-NodeType free lists (see [`crate::store::BlobFrame`]
+    /// `free_node`), so this is exercised only by tests now.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn freed(next_free_slot: u16, byte_offset: u32) -> Self {
         debug_assert_eq!(byte_offset % 8, 0);
@@ -64,7 +69,10 @@ impl SlotEntry {
     /// Interpret the tag as a `NodeType` (for live slots).
     /// Returns `None` if the tag is outside the NodeType range
     /// (which would happen for freed slots whose next-free chain
-    /// index is ≥ 9).
+    /// index is ≥ 9). v4 reads NodeType from the node body's
+    /// `node_type @ +1` byte ([`crate::store`] `ntype_at_offset`); the
+    /// slot tag survives for allocation bookkeeping and tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn node_type(self) -> Option<NodeType> {
         NodeType::from_raw(self.ntype_or_next_free as u8)

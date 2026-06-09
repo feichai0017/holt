@@ -722,14 +722,17 @@ fn auto_spillover_creates_child_blob_when_root_blob_fills() {
     //
     // We pick a workload size that triggers at least one spillover
     // but doesn't push past the `MAX_SPILLOVER_ATTEMPTS` per-call
-    // budget. ~2000 keys × ~250 B per leaf = ~500 KB → ~50 KB has
-    // to spill out via splitBlob.
+    // budget. ~5000 keys × ~230 B per leaf is well past the ~468 KB
+    // single-blob data area, so it must spill via splitBlob. (Inner
+    // nodes use u16 children and pack denser than the old u32
+    // layout, so a larger key count is needed to still force a
+    // multi-blob tree.)
     let store: Arc<dyn BlobStore> = Arc::new(MemoryBlobStore::new());
     let tree = TreeBuilder::new("ignored")
         .open_with_blob_store(store.clone())
         .unwrap();
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let value = vec![0xAB; 200];
     for i in 0..N {
         let k = format!("k{i:08}").into_bytes();
@@ -773,7 +776,7 @@ fn concurrent_reads_across_multi_blob_tree_via_buffer_manager() {
             .unwrap(),
     );
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let value = vec![0x66; 200];
     for i in 0..N {
         tree.put(format!("k{i:08}").as_bytes(), &value).unwrap();
@@ -907,7 +910,7 @@ fn multi_blob_delete_round_trip() {
         .open_with_blob_store(store.clone())
         .unwrap();
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let value = vec![0x42; 200];
     for i in 0..N {
         tree.put(format!("k{i:08}").as_bytes(), &value).unwrap();
@@ -964,7 +967,7 @@ fn multi_blob_rename_round_trip() {
         .open_with_blob_store(store.clone())
         .unwrap();
 
-    const N: u32 = 2000;
+    const N: u32 = 5000;
     let value_a = vec![0x99; 200];
     let value_b = vec![0xAA; 200];
     for i in 0..N {
