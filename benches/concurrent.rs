@@ -23,7 +23,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use holt::{Tree, TreeConfig};
+use holt::{Tree, TreeConfig, DB as HoltDb};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 use rocksdb::{Options, WriteBatch, WriteOptions, DB};
 use tempfile::TempDir;
@@ -243,12 +243,139 @@ fn main() {
     if cfg.selected("rocksdb") {
         run_rocksdb(&cfg, &samples);
     }
+
+    // No-merge multi-root isolation experiment (HOLT_SHARD_N=1,8,16).
+    // Opens N independent Trees over ONE DB: each Tree has its own root
+    // blob (splits the root-latch cache line N ways) but they SHARE the
+    // DB's next_seq AtomicU64 + BufferManager + journal. Comparing N=1 vs
+    // N=8/16 isolates root-latch contention from next_seq contention
+    // WITHOUT any cross-shard merge/scan logic or production-code change.
+    let shard_counts = env_list("HOLT_SHARD_N", "", |s| {
+        s.parse::<usize>().expect("HOLT_SHARD_N entries must be usize")
+    });
+    for n in shard_counts {
+        assert!(n >= 1, "HOLT_SHARD_N entries must be >= 1");
+        run_holt_sharded(&cfg, &samples, n);
+    }
+}
+
+/// FNV-1a route hash; N is expected to be small (1, 8, 16).
+fn shard_of(key: &[u8], n_shards: usize) -> usize {
+    if n_shards <= 1 {
+        return 0;
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in key {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (h % n_shards as u64) as usize
+}
+
+fn run_holt_sharded(cfg: &Config, samples: &[Arc<[OpSample]>], n_shards: usize) {
+    let dir = TempDir::new().expect("holt-sharded tempdir");
+    let mut tree_cfg = TreeConfig::new(dir.path());
+    tree_cfg.durability = holt::Durability::Wal { sync: false };
+    tree_cfg.buffer_pool_size = cfg.buffer_pool_size;
+    let db = HoltDb::open(tree_cfg).expect("holt-sharded db open");
+    let mut trees = Vec::with_capacity(n_shards);
+    for i in 0..n_shards {
+        trees.push(
+            db.open_or_create_tree(&format!("shard-{i}"))
+                .expect("holt-sharded create shard tree"),
+        );
+    }
+
+    progress("holt-sharded", "preload", 0, cfg.n_keys);
+    for i in 0..cfg.n_keys {
+        let key = cfg.workload.key(i, cfg.n_keys);
+        let s = shard_of(&key, n_shards);
+        trees[s]
+            .put(&key, &cfg.workload.value(i, 0))
+            .expect("holt-sharded preload put");
+        if should_progress(i + 1, cfg.n_keys) {
+            progress("holt-sharded", "preload", i + 1, cfg.n_keys);
+        }
+    }
+
+    let label = format!("holt-sh{n_shards}");
+    print_holt_shape(&format!("{label}/shard0"), &trees[0]);
+    let trees = Arc::new(trees);
+    for op in &cfg.ops {
+        for threads in &cfg.thread_counts {
+            let result =
+                run_holt_sharded_threads(trees.clone(), cfg, samples, *op, *threads, n_shards);
+            report(&label, op.name(), *threads, cfg.ops_per_thread, &result);
+        }
+    }
+    drop(trees);
+    drop(db);
+    drop(dir);
+}
+
+fn run_holt_sharded_threads(
+    trees: Arc<Vec<Tree>>,
+    cfg: &Config,
+    samples: &[Arc<[OpSample]>],
+    op: BenchOp,
+    threads: usize,
+    n_shards: usize,
+) -> RunResult {
+    let _ = cfg;
+    let barrier = Arc::new(Barrier::new(threads + 1));
+    let mut handles = Vec::with_capacity(threads);
+    for tid in 0..threads {
+        let trees = trees.clone();
+        let barrier = barrier.clone();
+        let samples = Arc::clone(&samples[tid]);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            time_thread(samples, |_i, sample| {
+                let tree = &trees[shard_of(&sample.key, n_shards)];
+                match op {
+                    BenchOp::Get => {
+                        black_box(tree.get(black_box(&sample.key)).expect("holt-sharded get"));
+                    }
+                    BenchOp::Put => {
+                        tree.put(black_box(&sample.key), black_box(&sample.value))
+                            .expect("holt-sharded put");
+                    }
+                    _ => panic!("holt sharded experiment supports get/put only"),
+                }
+            })
+        }));
+    }
+    let start = Instant::now();
+    barrier.wait();
+    let mut latency_ns = Vec::new();
+    for handle in handles {
+        latency_ns.extend(handle.join().expect("holt-sharded worker panicked"));
+    }
+    RunResult {
+        elapsed: start.elapsed(),
+        latency_ns,
+    }
 }
 
 fn run_holt(cfg: &Config, samples: &[Arc<[OpSample]>]) {
     let dir = TempDir::new().expect("holt tempdir");
-    let mut tree_cfg = TreeConfig::new(dir.path());
-    tree_cfg.durability = holt::Durability::Wal { sync: false };
+    // HOLT_STORAGE=memory => Storage::Memory, which attaches NO journal
+    // (wal_path is None), so the put hot path skips commit_gate +
+    // journal.submit + all journal atomics. Comparing file+WAL vs memory
+    // isolates the journal/group-commit path from the rest of the write
+    // critical section (gates + next_seq) for concurrency diagnosis.
+    let memory = env::var("HOLT_STORAGE")
+        .map(|s| s == "memory" || s == "mem")
+        .unwrap_or(false);
+    let mut tree_cfg = if memory {
+        let mut c = TreeConfig::memory();
+        c.memory_flush_on_write = false;
+        c
+    } else {
+        let mut c = TreeConfig::new(dir.path());
+        c.durability = holt::Durability::Wal { sync: false };
+        c
+    };
     tree_cfg.buffer_pool_size = cfg.buffer_pool_size;
     let tree = Arc::new(Tree::open(tree_cfg).expect("holt open"));
     preload_holt(&tree, cfg.workload, cfg.n_keys);

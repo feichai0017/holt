@@ -126,32 +126,99 @@ hops (post-R1) and subtree locality. That is the product story.
    optimistic attempt when the target node is full / a split is likely)
    or solving the real bottleneck below.
 
-   **The real bottleneck is broader than intermediate-blob latching.**
-   The baseline *already* scales negatively (0.453 → 0.287 from 4→16
-   threads) with an exploding tail (p99 55µs → 286µs). Removing
-   intermediate-blob exclusive latches did not help because the
-   serialization survivors are (a) the **root/upper-blob exclusive latch**
-   — a growing tree mutates upper levels constantly as splits propagate,
-   and the root is on every descent — and (b) the **serialized WAL
-   group-commit**. Beating RocksDB on *concurrent* write would require
-   fine-grained or latch-free upper-level concurrency (ROWEX-style), which
-   is a large, high-risk project — not a focused session. Until then,
-   holt's write story is honest: **single-thread durable write is at
-   parity with RocksDB; concurrent write loses** (RocksDB's LSM absorbs
-   concurrent writes into a per-thread memtable/WAL far better). holt's
-   durable edge is **reads (2.2–2.44×), scans (~parity), and cold-miss**,
-   not write concurrency.
+## Write-concurrency bottleneck: ISOLATED to the WAL group-commit path
+
+The negative concurrent-write scaling (4t 0.453 → 16t 0.287 Mops/s, p99
+55µs → 286µs) was diagnosed with two zero-/low-risk experiments instead of
+guessing — and the answer overturns the earlier speculation (it is NOT the
+root latch, and it does NOT need a ROWEX rewrite).
+
+**Profile-by-stats (zero code).** A 16t `objstore put` run's `holt_shape`
+line shows: tree `max_depth=2`, and during the measured overwrite phase
+`route_hits +800000 / route_misses +0` → **100% route-cache hit, 0%
+Phase-3 root-exclusive fallback**. `spillovers` flat (no tree growth, no
+`Crossing`). So every put takes the Phase-1 fast path: a *shared* `.read()`
+latch on the (single, depth-2) root + an exclusive `.write()` on the child.
+
+**No-merge multi-root A/B (bench-only, `HOLT_SHARD_N`).** Open N independent
+`Tree`s over ONE `DB` (each its own root blob, but sharing the DB's
+`next_seq` + BufferManager + journal), route puts by `hash(key)%N`, point
+ops only — no cross-shard merge. This splits the root latch N ways while
+holding everything else constant:
+
+   | config        | 1t | 4t | 8t | 16t |
+   |---------------|----|----|----|-----|
+   | sh1  (1 root) | 0.116 | 0.458 | 0.321 | **0.290** |
+   | sh8  (8 roots)| 0.036*| 0.420 | 0.323 | **0.289** |
+   | sh16 (16 roots, depth-1 ⇒ all root-*exclusive*) | 0.396 | 0.341 | 0.345 | **0.307** |
+
+   At 16t every config converges to ~0.29–0.31 regardless of root count
+   (+6% from 16× the roots). **The root latch — shared OR exclusive — is
+   NOT the bottleneck**, so `prefix-sharded-forest` would not have helped.
+   (`*`sh8 1t=0.036 is a one-off p99=688µs checkpoint spike.)
+
+**Memory-mode A/B (bench-only, `HOLT_STORAGE=memory`).** `Storage::Memory`
+attaches **no journal** (`wal_path`=None), so the put takes the else-branch
+— same ART mutation, same `maintenance_gate`/`mutation_gate`/`endpoint_locks`/
+`next_seq`/`mark_dirty`, but **no `commit_gate` + no `journal.submit`**:
+
+   | threads | memory (no journal) | WAL mode | p99 mem | p99 WAL |
+   |--------:|--------------------:|---------:|--------:|--------:|
+   | 1  | 1.328 | 0.105 | 11µs | 13µs |
+   | 4  | 3.768 | 0.453 | 9µs  | 55µs |
+   | 8  | 4.567 | 0.316 | 7µs  | 145µs |
+   | 16 | **5.782** | 0.287 | 9µs | 286µs |
+
+   Removing the journal makes concurrent writes **scale near-linearly to
+   5.78 Mops/s at 16t (20× the WAL-mode 0.287), with flat p99**. The ART
+   write path + all three gates + `next_seq` + `mark_dirty` are all still
+   present and scale fine.
+
+**Conclusion (measured, not guessed).** The concurrent-write ceiling is
+the **WAL group-commit plumbing**, nothing else: per-put `Vec` record
+encode + crossbeam channel `send` to a single bounded channel + a single
+worker thread draining it (the 286µs p99 = foreground blocked on a full
+channel behind the saturated worker). `commit_gate.enter_writer()` is ruled
+out — it is `gate.enter_shared()`, the same primitive `mutation_gate`/
+`maintenance_gate` use, and those scale. **This overturns the "concede
+writes, it's structural" verdict**: holt's *structure* scales (5.78 Mops/s
+@ 16t ≈ 9× RocksDB's durable 0.62). Only the WAL plumbing doesn't — and
+that is fixable without touching read/scan/cold locality.
+
+**Recommended fix — lock-free shared WAL ring (single ordered log).**
+Replace the per-record `Vec` + channel + single-encoder-worker with a
+shared ring buffer: each writer reserves a byte range via one atomic
+`fetch_add` on the tail, memcpies its encoded record into the reservation
+**in parallel**, and publishes; a single flusher writes committed
+contiguous prefixes (and fsyncs on the sync path). This keeps ONE ordered
+log — so the global `next_seq`/trim-watermark/single-pass-replay invariants
+are preserved (unlike the rejected multi-lane `wal-commit-sharding`, which
+breaks the I2 trim watermark and silently corrupts cross-lane Rename/Batch)
+— while moving the encode off the worker and letting 16 threads append
+concurrently. Plausible payoff: durable concurrent write from 0.29 toward
+the memory-mode 5.78 ceiling, i.e. **beating** RocksDB on concurrent write,
+not merely matching it. Concurrency-/durability-critical: own focused
+session with concurrent_stress + checkpoint_failpoint + SIGKILL crash-soak.
+
+Until that lands, the honest write story: single-thread durable write is at
+parity with RocksDB; concurrent durable write loses **purely on WAL
+plumbing**, not on the data structure. Reads (2.2–2.44×), scans (~parity),
+and cold-miss remain holt's durable edge.
 
 ## Suggested next work (each its own focused session)
 
-- ~~**Optimistic write descent**~~ — **DONE & REJECTED** (see diagnosis
-  above): implemented, proven correct on both arches, but a clean A/B
-  showed a 53–70% concurrent-write *regression* because the growing-tree
-  workload bails to pessimistic too often. Patch parked in
-  `docs/experiments/`. The remaining concurrent-write bottleneck is the
-  root/upper-blob exclusive latch + serialized WAL group-commit, which
-  needs latch-free upper-level concurrency (ROWEX-style) — a large
-  project, not a focused session.
+- **Lock-free shared WAL ring** — THE concurrent-write fix, isolated by
+  measurement (see "Write-concurrency bottleneck" above). The ceiling is
+  the WAL group-commit plumbing (per-record `Vec`+channel+single worker),
+  not the tree: memory-mode hits 5.78 Mops/s @ 16t vs WAL-mode 0.29.
+  Replace it with an atomic-tail-reserved shared ring (parallel memcpy,
+  single flusher, ONE ordered log → trim/replay invariants preserved).
+  Plausibly *beats* RocksDB on concurrent durable write. Own focused
+  session: crash-soak + checkpoint_failpoint critical.
+- ~~**Optimistic write descent**~~ / ~~**prefix-sharded-forest**~~ — both
+  **RULED OUT by measurement**: the root latch (shared or exclusive) is
+  not the bottleneck (no-merge multi-root A/B: 16 roots ≈ 1 root at 16t),
+  so neither helps. Optimistic-descent patch parked in `docs/experiments/`.
 - **R2 — BlobNode prefix Bloom** — a per-edge Bloom (a Bloom *extent* in
   the parent, sized ~10 bits/key, not inline) so a negative lookup whose
   key matches a crossing's path prefix is answered without pinning +
