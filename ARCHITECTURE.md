@@ -232,9 +232,15 @@ it stopped; real mid-file corruption surfaces as
 
 `BufferManager` wraps any `BlobStore` and itself implements
 `BlobStore` (drop-in for the write path). Backed by a sharded
-`DashMap<BlobGuid, Arc<CachedBlob>>` so concurrent `pin` /
-`get_cached` on different blobs hit different shards instead of
-contending on a single mutex.
+`DashMap<BlobGuid, Arc<CachedBlob>, GuidBuildHasher>` so concurrent
+`pin` / `get_cached` on different blobs hit different shards instead
+of contending on a single mutex. The map is keyed with a cheap
+custom hasher (`guid_hash::GuidBuildHasher`) rather than the default
+SipHash13: a `BlobGuid` is already 16 high-entropy bytes, so a
+two-lane multiply + splitmix avalanche distributes as well at ~2.5×
+the speed. Since a multi-blob lookup pays one cache hash per
+`BlobNode` crossing, this measurably shrinks the per-crossing cost
+(see below).
 
 It tracks "newer than store" state in dirty state plus deferred
 delete state:
@@ -262,6 +268,47 @@ Observability paths (`Tree::stats`, metrics scrapes) use
 `pin_silent` / `get_cached_silent` so a scrape does not bump
 cache hit/miss counters or refresh the LRU tick — the call
 must not inflate the very counters it's about to report.
+
+### Crossing cost — why no pointer swizzling
+
+A LeanStore-style optimization would *swizzle* the `BlobNode`
+crossing: cache the resolved `Arc<CachedBlob>` (or a raw pointer)
+on the parent edge so a crossing skips the `BufferManager::pin`
+(the `DashMap` lookup + `Arc` clone). We measured the ceiling
+before committing to that complexity, on a ~20k-key object-store
+metadata tree (7 blobs, depth-1 forest, ~0.94 pins per lookup):
+
+- A crossing's removable work is exactly one `pin`. Everything
+  else on the path — the child `HybridLatch` acquire, the
+  `header.root_slot` re-read, the optimistic `validate` — is
+  irreducible.
+- The full-swizzle **ceiling is ~9–16 %** of a multi-blob point
+  read (machine-dependent; higher on a faster box where the fixed
+  pin is a larger share). That is an *upper bound* — a real swizzle
+  must add back parent + child `content_version` validation, and
+  it pays nothing on single-blob reads.
+- Against that, swizzling adds a large correctness surface unique
+  to this buffer manager: there is **no per-slot generation**, so a
+  cached pointer cannot tell "same blob, unchanged" from "evicted
+  and reloaded into a fresh `CachedBlob` (version reset to 0)" — a
+  classic ABA. `install_new_blob` can also replace a GUID's slot
+  while an old `Arc` is still pinned (split-brain), and CoW fork /
+  pending-delete each invalidate a cached edge. The only safe form
+  retains the `Arc` (so `strong_count > 1` blocks eviction), which
+  pins blobs in memory and fights the cache.
+
+So instead of swizzling we took the part of `pin` that is *purely*
+cost with no correctness surface — the cache hash — and made it
+cheap (`GuidBuildHasher`, above). That recovered a large fraction
+of the same ceiling (the real `pin` dropped ~37 %, a multi-blob
+get ~9 % on x86) with zero new invariants, and it benefits every
+`pin` (writes, scans, range) rather than only the hot read path.
+Crucially, lowering the pin cost also *shrinks* the swizzle
+ceiling itself, making the high-risk path even less worthwhile.
+Holt already has the coarse, safe analogue of swizzling — the
+parent-validated `route_cache` — which collapses a deep walk to a
+single prefix-anchor edge for hot prefixes without caching raw
+pointers.
 
 ### Checkpoint — 7-phase protocol
 
