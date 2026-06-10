@@ -56,6 +56,19 @@ impl BlobStore for MemoryBlobStore {
         Ok(())
     }
 
+    fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
+        let g = self.inner.read().unwrap();
+        let src = g.get(&guid).ok_or_else(|| {
+            Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("blob {:02x?} not found", &guid[..4]),
+            ))
+        })?;
+        let start = byte_offset as usize;
+        dst.copy_from_slice(&src.as_slice()[start..start + dst.len()]);
+        Ok(())
+    }
+
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let mut g = self.inner.write().unwrap();
         g.insert(guid, src.clone());

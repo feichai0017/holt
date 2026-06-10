@@ -791,6 +791,20 @@ impl BlobStore for FileBlobStore {
         Ok(())
     }
 
+    /// Positional ranged read for page-granular cold lookups. `byte_offset`,
+    /// `dst.len()`, and `dst`'s base must be 4 KB-aligned (whole pages) so the
+    /// `O_DIRECT` / `F_NOCACHE` read is accepted; the buffer-manager paging
+    /// layer guarantees this. Goes straight through `read_exact_at` (a plain
+    /// positional `pread`) rather than the 512 KB-tuned `io_uring` ring.
+    fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        debug_assert_eq!(byte_offset % 4096, 0, "ranged read offset must be 4 KB-aligned");
+        debug_assert_eq!(dst.len() % 4096, 0, "ranged read length must be a 4 KB multiple");
+        let offset = self.offset_of(guid)? + byte_offset;
+        self.data_file.read_exact_at(dst, offset)?;
+        Ok(())
+    }
+
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
         let _io = self.data_io_lock.lock().unwrap();
         let entry = self.assign_write_entry(guid);
@@ -1805,6 +1819,61 @@ mod tests {
             let mut dst = AlignedBlobBuf::zeroed();
             b.read_blob(*g, &mut dst).unwrap();
             assert_eq!(dst.as_slice()[100], i as u8);
+        }
+    }
+}
+
+#[cfg(test)]
+mod range_read_test {
+    use super::*;
+    use crate::store::blob_store::{AlignedBlobBuf, BlobStore};
+    use crate::{Tree, TreeConfig};
+
+    // Page-granular reads (the cold-read I/O optimization) must reconstruct
+    // every real blob byte-for-byte vs the whole-frame read — on both the
+    // O_DIRECT (Linux) and F_NOCACHE (macOS) paths.
+    #[test]
+    fn page_reads_reconstruct_each_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut cfg = TreeConfig::new(dir.path());
+            cfg.durability = crate::Durability::Wal { sync: false };
+            let tree = Tree::open(cfg).unwrap();
+            for i in 0..50_000u32 {
+                let key = format!("bucket-{:02}/obj-{i:08}", i % 16);
+                tree.put(key.as_bytes(), &[(i & 0xff) as u8; 40]).unwrap();
+            }
+            tree.checkpoint().unwrap();
+        }
+        let store = FileBlobStore::open(dir.path()).unwrap();
+        let guids = store.list_blobs().unwrap();
+        assert!(guids.len() > 1, "expected spillover into multiple blobs");
+
+        let frame_pages = (PAGE_SIZE / 4096) as usize;
+        let mut whole = AlignedBlobBuf::zeroed();
+        let mut paged = AlignedBlobBuf::zeroed();
+        for g in &guids {
+            store.read_blob(*g, &mut whole).unwrap();
+            for p in 0..frame_pages {
+                let off = (p * 4096) as u64;
+                let dst = &mut paged.as_mut_slice()[p * 4096..(p + 1) * 4096];
+                store.read_blob_range(*g, off, dst).unwrap();
+            }
+            assert_eq!(
+                whole.as_slice(),
+                paged.as_slice(),
+                "page reads must reconstruct blob {:02x?}",
+                &g[..4]
+            );
+            // A multi-page ranged read matches the same window of the frame.
+            let mut window = AlignedBlobBuf::zeroed();
+            store
+                .read_blob_range(*g, 4096 * 5, &mut window.as_mut_slice()[..4096 * 3])
+                .unwrap();
+            assert_eq!(
+                &window.as_slice()[..4096 * 3],
+                &whole.as_slice()[4096 * 5..4096 * 8]
+            );
         }
     }
 }

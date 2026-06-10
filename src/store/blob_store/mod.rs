@@ -79,6 +79,26 @@ pub trait BlobStore: Send + Sync {
     /// Read blob `guid` into `dst`. `dst.len() == PAGE_SIZE`.
     fn read_blob(&self, guid: BlobGuid, dst: &mut AlignedBlobBuf) -> Result<()>;
 
+    /// Read `dst.len()` bytes starting at `byte_offset` within blob `guid`.
+    ///
+    /// Enables page-granular cold reads: a point lookup can fetch only the
+    /// 4 KB pages its descent touches (measured ~18 KB mean) instead of
+    /// pinning the whole 512 KB frame (~27× less cold I/O). For `O_DIRECT`
+    /// backends the caller keeps `byte_offset`, `dst.len()`, and `dst`'s base
+    /// 4 KB-aligned (whole-page reads); the read-whole default below imposes
+    /// no such requirement.
+    ///
+    /// The default reads the entire frame and copies the sub-range — correct
+    /// for any store but with no I/O saving. `FileBlobStore` /
+    /// `MemoryBlobStore` override it with a genuine ranged read.
+    fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
+        let mut full = self.alloc_blob_buf_zeroed();
+        self.read_blob(guid, &mut full)?;
+        let start = byte_offset as usize;
+        dst.copy_from_slice(&full.as_slice()[start..start + dst.len()]);
+        Ok(())
+    }
+
     /// Write `src` as blob `guid`. `src.len() == PAGE_SIZE`.
     ///
     /// Returns once the write has been *submitted* to the medium.
