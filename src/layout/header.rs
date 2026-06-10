@@ -112,7 +112,52 @@ pub struct BlobHeader {
     _pad_90: [u8; 0x10],
     /// 128-bit blob identifier.
     pub blob_guid: BlobGuid,
-    _pad_b0: [u8; (HEADER_SIZE as usize) - 0xb0],
+    /// Page-granular cold-read routing region (see
+    /// `docs/design/cold-read-oracle.md`). When a blob is compacted into the
+    /// routing layout, every internal node is clustered into
+    /// `[routing_off, routing_off + routing_len)` and leaves are page-aligned
+    /// at/after `leaf_region_start`, so a cold lookup reads the small routing
+    /// region + one leaf page instead of pinning the whole 512 KB frame.
+    ///
+    /// `routing_len == 0` means **not in routing layout** → read the whole
+    /// frame. This is the safe default for every blob written before this
+    /// field existed (`BlobFrameMut::init` zeroes the whole frame) and for
+    /// every blob not yet rewritten by the routing-aware compactor.
+    pub routing_off: u32,
+    pub routing_len: u32,
+    pub leaf_region_start: u32,
+    _pad_bc: [u8; (HEADER_SIZE as usize) - 0xbc],
+}
+
+/// The cold-read routing region recorded in a [`BlobHeader`].
+///
+/// Stage 1 lands the reader; the cold routed-read path (stage 3,
+/// `cold_read_routed`) is its first production consumer.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoutingRegion {
+    /// Byte offset of the contiguous internal-node region within the frame.
+    pub off: u32,
+    /// Byte length of the routing region.
+    pub len: u32,
+    /// First byte offset of the page-aligned leaf region. A child offset
+    /// `>= leaf_region_start` is a leaf (read via a targeted page read);
+    /// below it is an internal node inside the routing region.
+    pub leaf_region_start: u32,
+}
+
+impl BlobHeader {
+    /// The cold-read routing region, or `None` if this blob is in the legacy
+    /// whole-frame layout (descend over the entire 512 KB frame).
+    #[allow(dead_code)] // first consumer is stage 3 (cold_read_routed)
+    #[must_use]
+    pub fn routing_region(&self) -> Option<RoutingRegion> {
+        (self.routing_len != 0).then_some(RoutingRegion {
+            off: self.routing_off,
+            len: self.routing_len,
+            leaf_region_start: self.leaf_region_start,
+        })
+    }
 }
 
 // Pin every field offset at compile time. Drift breaks the build.
@@ -130,6 +175,9 @@ const _: () = assert!(offset_of!(BlobHeader, free_list_head) == 0x70);
 const _: () = assert!(offset_of!(BlobHeader, created_epoch) == 0x80);
 const _: () = assert!(offset_of!(BlobHeader, epoch_high_water) == 0x88);
 const _: () = assert!(offset_of!(BlobHeader, blob_guid) == 0xa0);
+const _: () = assert!(offset_of!(BlobHeader, routing_off) == 0xb0);
+const _: () = assert!(offset_of!(BlobHeader, routing_len) == 0xb4);
+const _: () = assert!(offset_of!(BlobHeader, leaf_region_start) == 0xb8);
 
 /// Byte offset of [`BlobHeader::created_epoch`] within a frame buffer.
 pub const CREATED_EPOCH_OFFSET: usize = offset_of!(BlobHeader, created_epoch);
@@ -235,5 +283,34 @@ mod tests {
         assert_eq!(HEADER_SIZE, 4096);
         assert_eq!(MAX_SLOTS, 10_240);
         assert_eq!(DATA_AREA_START, 0xB000);
+    }
+
+    #[test]
+    fn zeroed_header_is_legacy_layout() {
+        // The cold-read routing fields live in former pad, which
+        // `BlobFrameMut::init` zeroes — so every pre-existing blob, and every
+        // blob not yet rewritten by the routing-aware compactor, reports the
+        // legacy whole-frame layout and is read by pinning the full frame.
+        let header: BlobHeader = unsafe { core::mem::zeroed() };
+        assert_eq!(header.routing_off, 0);
+        assert_eq!(header.routing_len, 0);
+        assert_eq!(header.leaf_region_start, 0);
+        assert_eq!(header.routing_region(), None);
+
+        // A routing-laid-out blob reports its region.
+        let routed = BlobHeader {
+            routing_len: 0x40,
+            routing_off: DATA_AREA_START,
+            leaf_region_start: DATA_AREA_START + 0x40,
+            ..header
+        };
+        assert_eq!(
+            routed.routing_region(),
+            Some(RoutingRegion {
+                off: DATA_AREA_START,
+                len: 0x40,
+                leaf_region_start: DATA_AREA_START + 0x40,
+            })
+        );
     }
 }
