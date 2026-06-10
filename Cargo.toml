@@ -14,6 +14,15 @@ documentation = "https://docs.rs/holt"
 keywords = ["art", "radix-tree", "metadata", "storage", "embedded"]
 categories = ["database-implementations", "data-structures", "filesystem"]
 
+[package.metadata.docs.rs]
+all-features = true
+default-target = "x86_64-unknown-linux-gnu"
+targets = [
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+]
+
 [workspace]
 members = [".", "crates/holt-ffi"]
 exclude = ["benches", "fuzz", "tools/soak", "verified"]
