@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use holt::{KeyRangeEntry, RangeEntry, Tree, TreeConfig};
 use rand::{rngs::StdRng, RngCore, SeedableRng};
 #[cfg(feature = "comparators")]
-use rocksdb::{Options, WriteBatch, WriteOptions, DB};
+use rocksdb::{BlockBasedOptions, Cache, Options, WriteBatch, WriteOptions, DB};
 #[cfg(feature = "comparators")]
 use rusqlite::{params, Connection, OptionalExtension};
 #[cfg(feature = "comparators")]
@@ -150,6 +150,7 @@ struct StressConfig {
     wal_sync: bool,
     reopen_after_preload: bool,
     compact_after_preload: bool,
+    rocksdb_direct: bool,
     engines: Vec<String>,
     ops: Vec<String>,
 }
@@ -196,6 +197,16 @@ impl StressConfig {
                 .as_deref()
                 .map(|s| parse_bool_env("HOLT_STRESS_COMPACT_AFTER_PRELOAD", s))
                 .unwrap_or(false),
+            // Fair-comparison mode: make rocksdb ALSO bypass the OS page
+            // cache (direct reads) and cap its block cache to holt's BM
+            // size, so neither engine gets free RAM the other doesn't.
+            // Without this, rocksdb's buffered I/O keeps the whole dataset
+            // warm in the OS page cache while holt (O_DIRECT, 32 MB BM)
+            // hits disk — an apples-to-oranges cold-read comparison.
+            rocksdb_direct: env::var("HOLT_STRESS_ROCKSDB_DIRECT")
+                .as_deref()
+                .map(|s| parse_bool_env("HOLT_STRESS_ROCKSDB_DIRECT", s))
+                .unwrap_or(false),
             engines,
             ops,
         }
@@ -235,8 +246,8 @@ fn main() {
         cfg.ops.join(","),
     );
     println!(
-        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={},compact_after_preload={}",
-        cfg.wal_sync, cfg.reopen_after_preload, cfg.compact_after_preload
+        "profile=single_thread,warm_service,persistent_wal,wal_sync={},checkpoint=enabled,reopen_after_preload={},compact_after_preload={},rocksdb_direct={}",
+        cfg.wal_sync, cfg.reopen_after_preload, cfg.compact_after_preload, cfg.rocksdb_direct
     );
 
     let samples = make_samples(cfg.workload, cfg.n_keys, cfg.point_ops);
@@ -353,12 +364,12 @@ fn run_holt(cfg: &StressConfig, samples: &[OpSample]) {
 #[cfg(feature = "comparators")]
 fn run_rocksdb(cfg: &StressConfig, samples: &[OpSample]) {
     let rocksdb_dir = TempDir::new().expect("rocksdb tempdir");
-    let mut db = make_rocksdb(&rocksdb_dir);
+    let mut db = make_rocksdb(&rocksdb_dir, cfg);
     preload_rocksdb(&db, cfg.workload, cfg.n_keys);
     if cfg.reopen_after_preload {
         db.flush().expect("rocksdb preload flush before reopen");
         drop(db);
-        db = make_rocksdb(&rocksdb_dir);
+        db = make_rocksdb(&rocksdb_dir, cfg);
     }
     let wo = rocksdb_write_opts();
 
@@ -1022,12 +1033,27 @@ fn key_successor(key: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(feature = "comparators")]
-fn make_rocksdb(dir: &TempDir) -> DB {
+fn make_rocksdb(dir: &TempDir, cfg: &StressConfig) -> DB {
     let mut opts = Options::default();
     opts.create_if_missing(true);
     opts.set_write_buffer_size(256 * 1024 * 1024);
     opts.set_max_write_buffer_number(4);
     opts.set_compression_type(rocksdb::DBCompressionType::None);
+    if cfg.rocksdb_direct {
+        // Fair cold-read comparison: bypass the OS page cache (as holt
+        // does with O_DIRECT/F_NOCACHE) and bound the block cache to
+        // holt's buffer-pool size, so both engines read cold from the
+        // device at matched memory instead of rocksdb serving the whole
+        // dataset from the OS page cache.
+        opts.set_use_direct_reads(true);
+        opts.set_use_direct_io_for_flush_and_compaction(true);
+        const BLOB_FRAME_BYTES: usize = 512 * 1024; // holt's PAGE_SIZE
+        let mut bbt = BlockBasedOptions::default();
+        bbt.set_block_cache(&Cache::new_lru_cache(
+            cfg.buffer_pool_size * BLOB_FRAME_BYTES,
+        ));
+        opts.set_block_based_table_factory(&bbt);
+    }
     DB::open(&opts, dir.path()).expect("rocksdb open")
 }
 
