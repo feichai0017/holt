@@ -186,15 +186,36 @@ Correctness/compile on **mac (aarch64)** (lib + clippy + integration +
 batched-read and WAL/checkpoint wins only manifest there; the mac runs prove the
 byte reduction and correctness, not the latency.
 
-## Implementation order
+## Implementation status (2026-06-11)
 
-1. **io-optimization design doc** (this file).
-2. **(a)** batched cold read + kill 512 KB zeroing — headline P1, mac-verifiable.
-3. **(b)** zero-risk cheap wins — `io_queue_capacity`, event-driven `needs_flush`,
-   WAL-truncate-fsync coalesce.
-4. **(c)** per-blob bloom 6.0–6.2.
-5. **(d)** WAL/checkpoint io_uring rewrite — largest, most durability-sensitive;
-   adversarially verified before commit.
+Reprioritized after two findings during implementation:
 
-Each step: full gate (lib + clippy + integration + crash-soak) and a commit;
-durability-sensitive changes get an adversarial review first.
+- **(c) per-blob bloom 6.0–6.2 — DONE** (commits: 6.0 data structure, 6.1/6.2
+  on-disk build + cold-read query + the stage-4 de-route fix). This is the
+  strongest cold-read IO lever (eliminates the leaf round-trip for negatives) and
+  it is fully mac-verifiable: gated by 307 lib + 40 integration tests, clippy, and
+  a 30-round SIGKILL crash-soak.
+- **(a) batched cold read — DEPRIORITIZED.** The cold read's three reads
+  (header → routing → leaf) are a strict *data-dependency chain* (each read's
+  offset/length comes from the previous read's bytes), so they cannot be batched
+  into one submission — the audit's "3→1 SQE batch" is not achievable. With the
+  stage-4 routing cache a cold read is already at its safe floor of 2 round-trips
+  (header-for-validation + leaf), and the 512 KB scratch zero is ~0.3 % of a
+  ~500 µs disk-bound read (noise). Revisit only if an ubuntu profile shows a real
+  cold-read syscall bottleneck after the bloom.
+- **(b) cheap wins — mostly non-wins / ubuntu-territory.** `needs_flush()` is
+  three atomic loads, not a 1–5 ms cost (the cost is the `fdatasync` it gates,
+  which is **required** — skipping it breaks W2D); making it "event-driven" buys
+  nothing. `io_queue_capacity` and the WAL-truncate-fsync coalesce only pay off on
+  Linux io_uring/SSD and touch the per-epoch W2D ordering, so they are not
+  mac-verifiable and bumping them blind violates the ROADMAP's profile-driven
+  rule.
+- **(d) WAL/checkpoint io_uring — UBUNTU.** Largest, most durability-sensitive;
+  perf only manifests on Linux, and it needs real-I/O crash validation.
+
+**Boundary:** the safe, high-value, mac-verifiable IO optimization (routing
+engagement via B/C + the per-blob bloom) is landed. The remaining write-path /
+io_uring tuning is **ubuntu-territory** — implement + measure + crash-soak it on
+the Linux box where both the benefit and the durability behavior are real. Each
+such step still gets a full gate + a commit, and durability-sensitive changes get
+an adversarial review first.
