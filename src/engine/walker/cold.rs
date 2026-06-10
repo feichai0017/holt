@@ -254,7 +254,13 @@ mod page_ceiling {
     const PAGE: u32 = 4096;
 
     fn objkey(i: usize) -> Vec<u8> {
-        format!("bucket-{:02}/path-{:04}/sub/obj-{:08}", i % 32, (i / 64) % 4096, i).into_bytes()
+        format!(
+            "bucket-{:02}/path-{:04}/sub/obj-{:08}",
+            i % 32,
+            (i / 64) % 4096,
+            i
+        )
+        .into_bytes()
     }
 
     #[derive(Default)]
@@ -272,7 +278,8 @@ mod page_ceiling {
             NodeType::Leaf => {
                 let leaf = *cast::<Leaf>(&body[..size_of::<Leaf>()]);
                 if leaf.tombstone == 0 {
-                    let total = size_of::<Leaf>() as u32 + leaf.key_len as u32 + leaf.value_len as u32;
+                    let total =
+                        size_of::<Leaf>() as u32 + leaf.key_len as u32 + leaf.value_len as u32;
                     // Distinct 4 KB pages: header (root_slot lives there) + every
                     // node on the root→leaf path + the bytes the leaf+value span.
                     let mut pages: BTreeSet<u32> = path.iter().map(|o| o / PAGE).collect();
@@ -331,6 +338,7 @@ mod page_ceiling {
 
     #[test]
     #[ignore = "analysis tool; run explicitly with --ignored --nocapture"]
+    #[allow(clippy::cast_precision_loss)]
     fn cold_read_page_touch_ceiling() {
         let dir = tempfile::tempdir().unwrap();
         let n_keys = 300_000usize;
@@ -340,7 +348,8 @@ mod page_ceiling {
             cfg.durability = crate::Durability::Wal { sync: false };
             let tree = Tree::open(cfg).unwrap();
             for i in 0..n_keys {
-                tree.put(&objkey(i), &vec![(i & 0xff) as u8; value_len]).unwrap();
+                tree.put(&objkey(i), &vec![(i & 0xff) as u8; value_len])
+                    .unwrap();
             }
             tree.checkpoint().unwrap();
         }
@@ -369,8 +378,15 @@ mod page_ceiling {
                 p95 = *pages;
             }
         }
-        eprintln!("\n=== COLD-READ PAGE-TOUCH CEILING (objstore, {n_keys} keys, val={value_len}B) ===");
-        eprintln!("blobs={} leaves={} crossings={}", guids.len(), acc.leaves, acc.crossings);
+        eprintln!(
+            "\n=== COLD-READ PAGE-TOUCH CEILING (objstore, {n_keys} keys, val={value_len}B) ==="
+        );
+        eprintln!(
+            "blobs={} leaves={} crossings={}",
+            guids.len(),
+            acc.leaves,
+            acc.crossings
+        );
         eprintln!("distinct 4KB pages touched per point lookup:");
         for (pages, cnt) in &acc.hist {
             eprintln!(

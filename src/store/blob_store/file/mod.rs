@@ -798,8 +798,16 @@ impl BlobStore for FileBlobStore {
     /// positional `pread`) rather than the 512 KB-tuned `io_uring` ring.
     fn read_blob_range(&self, guid: BlobGuid, byte_offset: u64, dst: &mut [u8]) -> Result<()> {
         use std::os::unix::fs::FileExt;
-        debug_assert_eq!(byte_offset % 4096, 0, "ranged read offset must be 4 KB-aligned");
-        debug_assert_eq!(dst.len() % 4096, 0, "ranged read length must be a 4 KB multiple");
+        debug_assert_eq!(
+            byte_offset % 4096,
+            0,
+            "ranged read offset must be 4 KB-aligned"
+        );
+        debug_assert_eq!(
+            dst.len() % 4096,
+            0,
+            "ranged read length must be a 4 KB multiple"
+        );
         let offset = self.offset_of(guid)? + byte_offset;
         self.data_file.read_exact_at(dst, offset)?;
         Ok(())
