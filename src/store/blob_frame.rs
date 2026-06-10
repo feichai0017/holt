@@ -42,6 +42,26 @@ const DATA_BASE_DIV8: u32 = DATA_AREA_START / 8;
 const MAX_CHILD_BIAS: u32 = (PAGE_SIZE - DATA_AREA_START) / 8 + 1;
 const _: () = assert!(MAX_CHILD_BIAS < u16::MAX as u32);
 
+/// 4 KB OS page granularity — distinct from [`PAGE_SIZE`], which is the
+/// 512 KB blob frame. A cold read fetches leaves a page at a time, so
+/// the routing-aware compactor (`compact_blob`) page-aligns the leaf
+/// region to this boundary.
+pub const PAGE_4K: u32 = 0x1000;
+// DATA_AREA_START is itself a 4 KB multiple, so routing_off needs no
+// rounding — only the leaf region start does.
+const _: () = assert!(DATA_AREA_START % PAGE_4K == 0);
+
+/// Round `off` up to the next [`PAGE_4K`] boundary.
+///
+/// Used by the routing compactor to place `leaf_region_start` on a page
+/// boundary. `off` is always a small in-frame offset (well under
+/// `PAGE_SIZE`), so `off + (PAGE_4K - 1)` cannot overflow.
+#[inline]
+#[must_use]
+pub const fn page_align_up(off: u32) -> u32 {
+    (off + (PAGE_4K - 1)) & !(PAGE_4K - 1)
+}
+
 /// Encode a node body's absolute `byte_offset` into the biased `u16`
 /// stored in a child field (`children[N]`, `Prefix.child`,
 /// `header.root`).
@@ -711,6 +731,61 @@ impl<'a> BlobFrame<'a> {
         h.space_used += total_aligned;
         h.gap_space = h.gap_space.wrapping_add(total_aligned);
 
+        Ok(AllocOutcome { slot: new_slot })
+    }
+
+    /// Place a leaf body at the caller-supplied `body_off` and register
+    /// its slot, **without** advancing `header.space_used`.
+    ///
+    /// This is the leaf-arena allocator for the routing-aware compaction
+    /// build (`compact_blob`): internal nodes keep bumping `space_used`
+    /// (the routing arena, growing up from `DATA_AREA_START`) while
+    /// leaves are placed at a separate page-aligned cursor the caller
+    /// owns. The caller stamps `space_used` to the final leaf-cursor
+    /// high-water at finalize, so subsequent in-place `alloc_leaf`
+    /// appends land above the leaf arena.
+    ///
+    /// Mirrors [`Self::alloc_leaf`]'s bump branch except the body offset
+    /// is supplied and `space_used` is left untouched. The free-list
+    /// reuse branch is intentionally omitted: a freshly `init`-ed
+    /// compaction destination has empty free lists, and reusing a
+    /// routing-arena slot for a leaf would break arena segregation.
+    pub fn alloc_leaf_at(
+        &mut self,
+        body_off: u32,
+        total_aligned: u32,
+    ) -> Result<AllocOutcome, AllocError> {
+        if total_aligned == 0 {
+            return Err(AllocError::InvalidRequest);
+        }
+        debug_assert_eq!(total_aligned & 7, 0, "alloc_leaf_at size must be 8-aligned");
+        debug_assert!(
+            body_off >= DATA_AREA_START,
+            "alloc_leaf_at body_off below data area: {body_off:#x}"
+        );
+        debug_assert_eq!(body_off & 7, 0, "alloc_leaf_at body_off must be 8-aligned: {body_off:#x}");
+        let h = self.header();
+        if h.num_slots >= MAX_SLOTS as u16 {
+            return Err(AllocError::OutOfSlots);
+        }
+        // The leaf arena lives just below PAGE_SIZE; reserve the
+        // spillover tail exactly as `alloc_leaf` does (leaves are
+        // non-Blob). Phrased to avoid `body_off + total_aligned`
+        // overflow.
+        let ceiling = PAGE_SIZE - SPILLOVER_RESERVATION;
+        if body_off > ceiling || total_aligned > ceiling - body_off {
+            return Err(AllocError::OutOfSpace {
+                need: total_aligned,
+                avail: ceiling.saturating_sub(body_off),
+            });
+        }
+        let new_slot = h.num_slots + 1; // 1-based
+        self.write_slot_entry(new_slot, SlotEntry::live(NodeType::Leaf, body_off));
+        let h = self.header_mut();
+        h.num_slots += 1;
+        h.gap_space = h.gap_space.wrapping_add(total_aligned);
+        // NB: `space_used` intentionally NOT advanced — the caller owns
+        // the leaf cursor and stamps the final high-water at finalize.
         Ok(AllocOutcome { slot: new_slot })
     }
 

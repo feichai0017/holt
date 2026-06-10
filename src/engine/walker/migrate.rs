@@ -19,11 +19,14 @@
 
 use crate::api::errors::{Error, Result};
 use crate::layout::{
-    BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix, BLOB_MAX_INLINE,
-    DATA_AREA_START, MAX_SLOTS, PAGE_SIZE, PREFIX_MAX_INLINE,
+    size_of_node, BlobGuid, BlobNode, Leaf, Node16, Node256, Node4, Node48, NodeType, Prefix,
+    BLOB_MAX_INLINE, DATA_AREA_START, MAX_SLOTS, PAGE_SIZE, PREFIX_MAX_INLINE,
 };
 use crate::store::blob_store::AlignedBlobBuf;
-use crate::store::{decode_child_off, encode_child_off, BlobFrame, BlobFrameRef, BufferManager};
+use crate::store::{
+    decode_child_off, encode_child_off, page_align_up, BlobFrame, BlobFrameRef, BufferManager,
+    PAGE_4K, SPILLOVER_RESERVATION,
+};
 
 use super::cast;
 use super::readers::child_offset;
@@ -89,8 +92,13 @@ fn make_blob_from_node_with_buf(
     let cloned_root_off;
     {
         let mut new_frame = BlobFrame::init(buf.as_mut_slice(), new_guid)?;
-        cloned_root_off = clone_subtree(src_frame, &mut new_frame, src_off, false)?
-            .expect("preserve mode never returns None");
+        // Spillover builds a fresh legacy blob (routed = false); the
+        // dummy cursor is unused. Freshly-spilled blobs are born legacy
+        // and get the routing layout at their first compaction.
+        let mut leaf_cursor = 0u32;
+        cloned_root_off =
+            clone_subtree(src_frame, &mut new_frame, src_off, false, false, &mut leaf_cursor)?
+                .expect("preserve mode never returns None");
         // The EmptyRoot sentinel `BlobFrame::init` seeded at
         // DATA_AREA_START is now unreachable (the cloned root sits
         // after it); abandon-on-free leaves its 8 bytes to be reclaimed
@@ -137,8 +145,13 @@ pub fn blob_needs_compaction(frame: BlobFrameRef<'_>) -> bool {
 ///
 /// Post-conditions on the rebuilt blob:
 ///
-/// - Contiguous packed data area (every byte in
-///   `DATA_AREA_START .. space_used` is live).
+/// - Packed data area. In the legacy layout every byte in
+///   `DATA_AREA_START .. space_used` is live. In the routing layout
+///   (`routing_len != 0`), internal nodes occupy
+///   `[routing_off, routing_off + routing_len)` and leaves are
+///   page-aligned at `[leaf_region_start, space_used)`; the gap between
+///   `routing_off + routing_len` and `leaf_region_start` is an expected
+///   dead page-alignment span (≤ one 4 KB page), NOT reclaimable churn.
 /// - Empty free lists (no leftover stale slot entries).
 /// - `tombstone_leaf_cnt = 0` (every survivor is by definition live).
 /// - `compact_times` bumped by one.
@@ -163,26 +176,81 @@ pub fn compact_blob(buf: &mut AlignedBlobBuf) -> Result<()> {
         (h.blob_guid, decode_child_off(h.root_slot), h.compact_times)
     };
 
-    let mut new_buf = buf.zeroed_like();
-    {
-        let mut new_frame = BlobFrame::init(new_buf.as_mut_slice(), blob_guid)?;
+    // Pass 0: measure the live subtree so the page-aligned leaf region
+    // is fixed BEFORE the clone. With `leaf_region_start` known up
+    // front, the clone places each leaf at its final offset and the
+    // post-order back-patch in `clone_*` is unchanged. `None` ⇒ keep
+    // the legacy whole-frame layout (degenerate tree, or it doesn't fit
+    // the two-arena layout). See `docs/design/cold-read-oracle.md`.
+    let routed_lrs = {
         let old_frame = BlobFrame::wrap(buf.as_mut_slice());
-        let cloned = clone_subtree(&old_frame, &mut new_frame, old_root_off, true)?;
-        let entry_off = match cloned {
-            Some(off) => off,
-            None => {
-                // Every leaf below the old root was tombstoned — the
-                // new tree is empty. The EmptyRoot sentinel `init`
-                // already seeded at DATA_AREA_START (encoded root 1) is
-                // the new root; reuse it.
-                decode_child_off(1)
+        routing_geometry(routing_budget(&old_frame, old_root_off)?)
+    };
+
+    let mut new_buf = buf.zeroed_like();
+    let mut lrs_opt = routed_lrs;
+    loop {
+        let overran = {
+            let mut new_frame = BlobFrame::init(new_buf.as_mut_slice(), blob_guid)?;
+            let old_frame = BlobFrame::wrap(buf.as_mut_slice());
+            let mut leaf_cursor = lrs_opt.unwrap_or(0);
+            let cloned = clone_subtree(
+                &old_frame,
+                &mut new_frame,
+                old_root_off,
+                true,
+                lrs_opt.is_some(),
+                &mut leaf_cursor,
+            )?;
+            let entry_off = match cloned {
+                Some(off) => off,
+                None => {
+                    // Every leaf below the old root was tombstoned — the
+                    // new tree is empty. The EmptyRoot sentinel `init`
+                    // already seeded at DATA_AREA_START (encoded root 1)
+                    // is the new root; reuse it.
+                    decode_child_off(1)
+                }
+            };
+
+            // Release-safe guard: in a routed build internal nodes bump
+            // `space_used` (the routing arena). If it crossed
+            // `leaf_region_start`, pass-0 under-counted (a budget/clone
+            // drift bug) and the internals overlap the leaves just
+            // written — the image is unusable. Fall back to a legacy
+            // rebuild rather than persist corruption.
+            let overran = lrs_opt.is_some_and(|lrs| new_frame.header().space_used > lrs);
+            if !overran {
+                let internal_end = new_frame.header().space_used;
+                let h = new_frame.header_mut();
+                h.root_slot = encode_child_off(entry_off);
+                h.tombstone_leaf_cnt = 0;
+                h.dead_bytes = 0;
+                h.compact_times = old_compact_times.saturating_add(1);
+                if let Some(lrs) = lrs_opt {
+                    // `routing_len` is the ACTUAL post-collapse internal
+                    // byte count (not the budget, not incl. the
+                    // alignment gap). `space_used` becomes the leaf-arena
+                    // high-water so later in-place appends land above the
+                    // live leaves.
+                    h.routing_off = DATA_AREA_START;
+                    h.routing_len = internal_end - DATA_AREA_START;
+                    h.leaf_region_start = lrs;
+                    h.space_used = leaf_cursor;
+                }
             }
+            overran
         };
-        let h = new_frame.header_mut();
-        h.root_slot = encode_child_off(entry_off);
-        h.tombstone_leaf_cnt = 0;
-        h.dead_bytes = 0;
-        h.compact_times = old_compact_times.saturating_add(1);
+        if !overran {
+            break;
+        }
+        debug_assert!(
+            false,
+            "compact_blob: routing budget under-counted the internal arena; \
+             falling back to legacy layout",
+        );
+        new_buf = buf.zeroed_like();
+        lrs_opt = None;
     }
 
     buf.as_mut_slice().copy_from_slice(new_buf.as_slice());
@@ -290,8 +358,18 @@ pub fn merge_blob(
         let mut child_guard = child_pin.write();
         let child_frame = child_guard.frame();
         let child_root_off = decode_child_off(child_frame.header().root_slot);
-        clone_subtree(&child_frame, parent_frame, child_root_off, false)?
-            .expect("preserve mode never returns None")
+        // Preserve-mode legacy build into the existing parent (routed =
+        // false); the dummy cursor is unused.
+        let mut leaf_cursor = 0u32;
+        clone_subtree(
+            &child_frame,
+            parent_frame,
+            child_root_off,
+            false,
+            false,
+            &mut leaf_cursor,
+        )?
+        .expect("preserve mode never returns None")
     };
 
     let inlined_root = if prefix_bytes.is_empty() {
@@ -307,6 +385,12 @@ pub fn merge_blob(
     {
         let h = parent_frame.header_mut();
         h.num_ext_blobs = h.num_ext_blobs.saturating_sub(1);
+        // A merge appends the cloned subtree's internals + leaves via the
+        // single `space_used` cursor, so any prior routing layout on the
+        // parent is now stale (internals would sit above a stale
+        // `leaf_region_start`). Demote to legacy/full-pin; the next
+        // compaction re-routes the parent.
+        h.routing_len = 0;
     }
     // Hand the now-orphaned child blob to the deferred-delete
     // protocol. An inline `bm.delete_blob` here would push the
@@ -337,6 +421,188 @@ fn read_blob_node(frame: &BlobFrame<'_>, off: u32) -> Result<BlobNode> {
     Ok(*cast::<BlobNode>(body))
 }
 
+// ---------- routing-region pass-0 (measure) ----------
+
+/// Byte size [`pack_inner_node`] emits for a surviving-child count.
+/// `None` ⇒ the branch is dropped (0 survivors).
+///
+/// This is the authoritative tier table; `pack_inner_node` and
+/// [`routing_budget`] MUST agree with it (a `debug_assert` in
+/// `pack_inner_node` and the `routing == full` proptest gate bind
+/// them). NOTE the 1-survivor tier emits a `Prefix` (128 B) — *larger*
+/// than a source `Node4` (16 B) / `Node16` (56 B) — so the routing
+/// budget must use THIS size, never the source node's, or it
+/// under-counts and an internal node would land past the leaf region.
+fn packed_inner_size(survivors: usize) -> Option<u32> {
+    match survivors {
+        0 => None,
+        1 => Some(size_of_node(NodeType::Prefix)),
+        2..=4 => Some(size_of_node(NodeType::Node4)),
+        5..=16 => Some(size_of_node(NodeType::Node16)),
+        17..=48 => Some(size_of_node(NodeType::Node48)),
+        _ => Some(size_of_node(NodeType::Node256)),
+    }
+}
+
+/// Exact internal + surviving-leaf byte totals a filter-mode
+/// [`clone_subtree`] will emit for a subtree.
+struct BudgetNode {
+    /// Bytes the internal nodes (routing arena) will occupy — exact,
+    /// via [`packed_inner_size`] so it tracks `pack_inner_node`'s tier
+    /// collapse rather than the source node sizes.
+    routing_bytes: u32,
+    /// Bytes the surviving leaves will occupy.
+    leaf_bytes: u32,
+}
+
+/// Read-only **pass 0** of the routing-aware compaction: measure the
+/// live subtree at `src_off` so [`compact_blob`] can fix the
+/// page-aligned `leaf_region_start` BEFORE the real clone. With the
+/// leaf region fixed up front, the clone places each leaf at its final
+/// offset, so the post-order back-patch in `clone_*` stays unchanged
+/// (no placeholder, no relocation pass). See
+/// `docs/design/cold-read-oracle.md`.
+///
+/// Mirrors filter-mode `clone_subtree` arm-for-arm and
+/// `pack_inner_node`'s tier collapse, so the totals are EXACT. Returns
+/// `None` when the whole subtree filters away (matches `clone_subtree`
+/// returning `None`). `EmptyRoot` reports 0 routing bytes so the caller
+/// keeps the empty / bare-leaf-root degenerate cases in the legacy
+/// layout.
+///
+/// **Keep in lockstep with `clone_subtree` (below) and
+/// `pack_inner_node`.**
+fn routing_budget(src: &BlobFrame<'_>, src_off: u32) -> Result<Option<BudgetNode>> {
+    let ntype = src
+        .ntype_at(src_off)
+        .ok_or(Error::node_corrupt("routing_budget: undecodable src ntype"))?;
+    let body = src.body_at_offset(src_off).ok_or(Error::node_corrupt(
+        "routing_budget: src body resolution failed",
+    ))?;
+
+    match ntype {
+        NodeType::Invalid => Err(Error::node_corrupt(
+            "routing_budget: NodeType::Invalid in source",
+        )),
+        // EmptyRoot is only ever the root of an empty tree; report 0
+        // routing bytes so the caller steers it to the legacy layout.
+        NodeType::EmptyRoot => Ok(Some(BudgetNode {
+            routing_bytes: 0,
+            leaf_bytes: 0,
+        })),
+        NodeType::Leaf => {
+            let leaf = *cast::<Leaf>(&body[..std::mem::size_of::<Leaf>()]);
+            if leaf.tombstone != 0 {
+                return Ok(None);
+            }
+            Ok(Some(BudgetNode {
+                routing_bytes: 0,
+                leaf_bytes: body.len() as u32,
+            }))
+        }
+        NodeType::Prefix => {
+            let p = *cast::<Prefix>(body);
+            Ok(routing_budget(src, child_offset(p.child as u16))?.map(|c| BudgetNode {
+                routing_bytes: size_of_node(NodeType::Prefix) + c.routing_bytes,
+                leaf_bytes: c.leaf_bytes,
+            }))
+        }
+        NodeType::Blob => Ok(Some(BudgetNode {
+            routing_bytes: size_of_node(NodeType::Blob),
+            leaf_bytes: 0,
+        })),
+        NodeType::Node4 => {
+            let n = *cast::<Node4>(body);
+            let count = (n.count as usize).min(4);
+            budget_inner(src, (0..count).map(|i| child_offset(n.children[i])))
+        }
+        NodeType::Node16 => {
+            let n = *cast::<Node16>(body);
+            let count = (n.count as usize).min(16);
+            budget_inner(src, (0..count).map(|i| child_offset(n.children[i])))
+        }
+        NodeType::Node48 => {
+            let n = *cast::<Node48>(body);
+            budget_inner(
+                src,
+                (0..256usize)
+                    .map(|b| n.index[b])
+                    .filter(|&idx| idx != 0)
+                    .map(|idx| child_offset(n.children[idx as usize - 1])),
+            )
+        }
+        NodeType::Node256 => {
+            let n = *cast::<Node256>(body);
+            budget_inner(
+                src,
+                n.children
+                    .iter()
+                    .filter(|&&c| c != 0)
+                    .map(|&c| child_offset(c)),
+            )
+        }
+    }
+}
+
+/// Sum a filter-mode inner node's surviving children and add the
+/// `pack_inner_node` tier size. Mirrors the inner-node arms of
+/// `clone_subtree` (survivor count) + `pack_inner_node` (tier).
+fn budget_inner(
+    src: &BlobFrame<'_>,
+    child_offs: impl Iterator<Item = u32>,
+) -> Result<Option<BudgetNode>> {
+    let mut survivors = 0usize;
+    let mut routing_bytes = 0u32;
+    let mut leaf_bytes = 0u32;
+    for coff in child_offs {
+        if let Some(c) = routing_budget(src, coff)? {
+            survivors += 1;
+            routing_bytes += c.routing_bytes;
+            leaf_bytes += c.leaf_bytes;
+        }
+    }
+    Ok(packed_inner_size(survivors).map(|self_size| BudgetNode {
+        routing_bytes: routing_bytes + self_size,
+        leaf_bytes,
+    }))
+}
+
+/// Minimum surviving-leaf bytes for a blob to be worth routing.
+///
+/// The routed layout inserts an up-to-`PAGE_4K` page-alignment gap
+/// between the routing arena and the leaf region. For a blob with only
+/// a handful of leaves that gap dominates `space_used` — it would make
+/// a compaction that genuinely reclaimed bytes *look* like growth, and
+/// such tiny blobs barely benefit from page-granular cold reads anyway.
+/// Below this threshold a blob keeps the legacy whole-frame layout.
+/// (The cold-read win for larger blobs is independent of this — it
+/// always replaces a 512 KB frame read with a routing region + one leaf
+/// page.)
+const ROUTE_MIN_LEAF_BYTES: u32 = 2 * PAGE_4K;
+
+/// Turn a pass-0 budget into the page-aligned `leaf_region_start`, or
+/// `None` to keep the blob in the legacy whole-frame layout.
+///
+/// `None` for degenerate trees (no internal nodes — empty or a
+/// bare-leaf root), for blobs below [`ROUTE_MIN_LEAF_BYTES`], and for
+/// blobs that would not fit the page-aligned two-arena layout (the
+/// up-to-4 KB alignment gap can push a near-full blob over; falling
+/// back to legacy is always correct). `routing_len == 0` is then the
+/// sole "not routed" sentinel.
+fn routing_geometry(budget: Option<BudgetNode>) -> Option<u32> {
+    let b = budget?;
+    if b.routing_bytes == 0 {
+        return None; // empty / bare-leaf root → legacy
+    }
+    if b.leaf_bytes < ROUTE_MIN_LEAF_BYTES {
+        return None; // too small to amortize the page-alignment gap
+    }
+    let lrs = page_align_up(DATA_AREA_START + b.routing_bytes);
+    let fits = u64::from(lrs) + u64::from(b.leaf_bytes) + u64::from(SPILLOVER_RESERVATION)
+        <= u64::from(PAGE_SIZE);
+    fits.then_some(lrs)
+}
+
 // ---------- clone primitives ----------
 
 /// Recursively clone the subtree at `src_slot` into `dst`.
@@ -350,11 +616,21 @@ fn read_blob_node(frame: &BlobFrame<'_>, off: u32) -> Result<BlobNode> {
 /// live leaves — caller decides what to substitute (typically
 /// `EmptyRoot` at the root, or just "drop this branch" further
 /// down).
+/// `routed` + `leaf_cursor` drive the routing-aware (two-arena) build
+/// used by `compact_blob`: when `routed`, leaves are placed at
+/// `leaf_cursor` (the page-aligned leaf arena) instead of bumping
+/// `space_used`, while internal nodes keep bumping `space_used` (the
+/// routing arena). Legacy callers (spillover/merge) pass `routed =
+/// false` + a dummy cursor and behave byte-identically to before. Only
+/// `clone_leaf` consults the cursor; the inner-node arms just forward
+/// it down the recursion.
 fn clone_subtree(
     src: &BlobFrame<'_>,
     dst: &mut BlobFrame<'_>,
     src_off: u32,
     filter_tombstones: bool,
+    routed: bool,
+    leaf_cursor: &mut u32,
 ) -> Result<Option<u32>> {
     let ntype = src
         .ntype_at(src_off)
@@ -379,12 +655,12 @@ fn clone_subtree(
             }
             Ok(Some(off))
         }
-        NodeType::Leaf => clone_leaf(body, dst, filter_tombstones),
-        NodeType::Prefix => clone_prefix(src, body, dst, filter_tombstones),
-        NodeType::Node4 => clone_node4(src, body, dst, filter_tombstones),
-        NodeType::Node16 => clone_node16(src, body, dst, filter_tombstones),
-        NodeType::Node48 => clone_node48(src, body, dst, filter_tombstones),
-        NodeType::Node256 => clone_node256(src, body, dst, filter_tombstones),
+        NodeType::Leaf => clone_leaf(body, dst, filter_tombstones, routed, leaf_cursor),
+        NodeType::Prefix => clone_prefix(src, body, dst, filter_tombstones, routed, leaf_cursor),
+        NodeType::Node4 => clone_node4(src, body, dst, filter_tombstones, routed, leaf_cursor),
+        NodeType::Node16 => clone_node16(src, body, dst, filter_tombstones, routed, leaf_cursor),
+        NodeType::Node48 => clone_node48(src, body, dst, filter_tombstones, routed, leaf_cursor),
+        NodeType::Node256 => clone_node256(src, body, dst, filter_tombstones, routed, leaf_cursor),
         NodeType::Blob => clone_blob_node(body, dst),
     }
 }
@@ -398,6 +674,8 @@ fn clone_leaf(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
+    routed: bool,
+    leaf_cursor: &mut u32,
 ) -> Result<Option<u32>> {
     // `src_body` is the full leaf body (sized by `body_at_offset` from
     // the header's key_len/value_len). Decode only the 16-byte header.
@@ -410,10 +688,20 @@ fn clone_leaf(
         total,
         crate::layout::leaf_body_size(u32::from(src_leaf.key_len), u32::from(src_leaf.value_len),)
     );
-    let out = dst.alloc_leaf(total)?;
-    let dst_off = dst
-        .offset_of_slot(out.slot)
-        .ok_or(Error::node_corrupt("clone_leaf: dst slot offset"))?;
+    // Routed build: place the leaf at the caller's page-aligned leaf
+    // cursor (its final offset, so the parent's `encode_child_off`
+    // back-patch is unchanged) without touching `space_used`. Legacy:
+    // bump `space_used` exactly as before.
+    let dst_off = if routed {
+        let off = *leaf_cursor;
+        dst.alloc_leaf_at(off, total)?;
+        *leaf_cursor += total;
+        off
+    } else {
+        let out = dst.alloc_leaf(total)?;
+        dst.offset_of_slot(out.slot)
+            .ok_or(Error::node_corrupt("clone_leaf: dst slot offset"))?
+    };
     {
         // The freshly-allocated dst leaf body's header is still zero,
         // so address it by byte offset and copy the source body
@@ -433,11 +721,19 @@ fn clone_prefix(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
+    routed: bool,
+    leaf_cursor: &mut u32,
 ) -> Result<Option<u32>> {
     let p = *cast::<Prefix>(src_body);
     let plen = (p.prefix_len as usize).min(PREFIX_MAX_INLINE);
-    let Some(new_child_off) =
-        clone_subtree(src, dst, child_offset(p.child as u16), filter_tombstones)?
+    let Some(new_child_off) = clone_subtree(
+        src,
+        dst,
+        child_offset(p.child as u16),
+        filter_tombstones,
+        routed,
+        leaf_cursor,
+    )?
     else {
         return Ok(None);
     };
@@ -455,14 +751,22 @@ fn clone_node4(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
+    routed: bool,
+    leaf_cursor: &mut u32,
 ) -> Result<Option<u32>> {
     let src_n = *cast::<Node4>(src_body);
     let count = (src_n.count as usize).min(4);
     if filter_tombstones {
         let mut survivors: Vec<(u8, u32)> = Vec::with_capacity(count);
         for i in 0..count {
-            if let Some(new_child) = clone_subtree(src, dst, child_offset(src_n.children[i]), true)?
-            {
+            if let Some(new_child) = clone_subtree(
+                src,
+                dst,
+                child_offset(src_n.children[i]),
+                true,
+                routed,
+                leaf_cursor,
+            )? {
                 survivors.push((src_n.keys[i], new_child));
             }
         }
@@ -470,8 +774,15 @@ fn clone_node4(
     } else {
         let mut new_children = [0u16; 4];
         for (i, child) in new_children.iter_mut().enumerate().take(count) {
-            let cloned = clone_subtree(src, dst, child_offset(src_n.children[i]), false)?
-                .expect("preserve mode never returns None");
+            let cloned = clone_subtree(
+                src,
+                dst,
+                child_offset(src_n.children[i]),
+                false,
+                routed,
+                leaf_cursor,
+            )?
+            .expect("preserve mode never returns None");
             *child = encode_child_off(cloned);
         }
         let out = dst.alloc_node(NodeType::Node4)?;
@@ -492,14 +803,22 @@ fn clone_node16(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
+    routed: bool,
+    leaf_cursor: &mut u32,
 ) -> Result<Option<u32>> {
     let src_n = *cast::<Node16>(src_body);
     let count = (src_n.count as usize).min(16);
     if filter_tombstones {
         let mut survivors: Vec<(u8, u32)> = Vec::with_capacity(count);
         for i in 0..count {
-            if let Some(new_child) = clone_subtree(src, dst, child_offset(src_n.children[i]), true)?
-            {
+            if let Some(new_child) = clone_subtree(
+                src,
+                dst,
+                child_offset(src_n.children[i]),
+                true,
+                routed,
+                leaf_cursor,
+            )? {
                 survivors.push((src_n.keys[i], new_child));
             }
         }
@@ -507,8 +826,15 @@ fn clone_node16(
     } else {
         let mut new_children = [0u16; 16];
         for (i, child) in new_children.iter_mut().enumerate().take(count) {
-            let cloned = clone_subtree(src, dst, child_offset(src_n.children[i]), false)?
-                .expect("preserve mode never returns None");
+            let cloned = clone_subtree(
+                src,
+                dst,
+                child_offset(src_n.children[i]),
+                false,
+                routed,
+                leaf_cursor,
+            )?
+            .expect("preserve mode never returns None");
             *child = encode_child_off(cloned);
         }
         let out = dst.alloc_node(NodeType::Node16)?;
@@ -529,6 +855,8 @@ fn clone_node48(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
+    routed: bool,
+    leaf_cursor: &mut u32,
 ) -> Result<Option<u32>> {
     let src_n = *cast::<Node48>(src_body);
     if filter_tombstones {
@@ -544,9 +872,14 @@ fn clone_node48(
             if ci >= 48 {
                 return Err(Error::node_corrupt("clone_node48: index out of range"));
             }
-            if let Some(new_child) =
-                clone_subtree(src, dst, child_offset(src_n.children[ci]), true)?
-            {
+            if let Some(new_child) = clone_subtree(
+                src,
+                dst,
+                child_offset(src_n.children[ci]),
+                true,
+                routed,
+                leaf_cursor,
+            )? {
                 survivors.push((b as u8, new_child));
             }
         }
@@ -555,8 +888,15 @@ fn clone_node48(
         let mut new_children = [0u16; 48];
         for (i, child) in new_children.iter_mut().enumerate() {
             if src_n.children[i] != 0 {
-                let cloned = clone_subtree(src, dst, child_offset(src_n.children[i]), false)?
-                    .expect("preserve mode never returns None");
+                let cloned = clone_subtree(
+                    src,
+                    dst,
+                    child_offset(src_n.children[i]),
+                    false,
+                    routed,
+                    leaf_cursor,
+                )?
+                .expect("preserve mode never returns None");
                 *child = encode_child_off(cloned);
             }
         }
@@ -578,6 +918,8 @@ fn clone_node256(
     src_body: &[u8],
     dst: &mut BlobFrame<'_>,
     filter_tombstones: bool,
+    routed: bool,
+    leaf_cursor: &mut u32,
 ) -> Result<Option<u32>> {
     let src_n = *cast::<Node256>(src_body);
     if filter_tombstones {
@@ -586,7 +928,9 @@ fn clone_node256(
             if child_enc == 0 {
                 continue;
             }
-            if let Some(new_child) = clone_subtree(src, dst, child_offset(child_enc), true)? {
+            if let Some(new_child) =
+                clone_subtree(src, dst, child_offset(child_enc), true, routed, leaf_cursor)?
+            {
                 survivors.push((b as u8, new_child));
             }
         }
@@ -595,8 +939,15 @@ fn clone_node256(
         let mut new_children = [0u16; 256];
         for (i, child) in new_children.iter_mut().enumerate() {
             if src_n.children[i] != 0 {
-                let cloned = clone_subtree(src, dst, child_offset(src_n.children[i]), false)?
-                    .expect("preserve mode never returns None");
+                let cloned = clone_subtree(
+                    src,
+                    dst,
+                    child_offset(src_n.children[i]),
+                    false,
+                    routed,
+                    leaf_cursor,
+                )?
+                .expect("preserve mode never returns None");
                 *child = encode_child_off(cloned);
             }
         }
@@ -706,5 +1057,46 @@ fn pack_inner_node(dst: &mut BlobFrame<'_>, survivors: &[(u8, u32)]) -> Result<O
             write_struct_at(dst, off, &n)?;
             Ok(Some(off))
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{pack_inner_node, packed_inner_size};
+    use crate::layout::size_of_node;
+    use crate::store::blob_store::AlignedBlobBuf;
+    use crate::store::BlobFrame;
+
+    /// The routing budget is exact only if `packed_inner_size` predicts
+    /// the SAME byte size `pack_inner_node` actually emits for every
+    /// surviving-child count. Bind them directly at each tier boundary
+    /// (including the 1-survivor → `Prefix` inflation, where the emitted
+    /// node is *larger* than the source). Drift here would make pass-0
+    /// under-count and trip `compact_blob`'s overrun guard.
+    #[test]
+    fn packed_inner_size_matches_pack_inner_node() {
+        let mut ab = AlignedBlobBuf::zeroed();
+        for &n in &[1usize, 2, 3, 4, 5, 16, 17, 48, 49, 100, 256] {
+            // Re-init zeroes the frame, so each tier starts clean.
+            let mut frame = BlobFrame::init(ab.as_mut_slice(), [0u8; 16]).unwrap();
+            // `n` survivors with valid in-data child offsets and
+            // distinct, ascending bytes (pack requires byte-sorted).
+            let mut survivors: Vec<(u8, u32)> = Vec::with_capacity(n);
+            for i in 0..n {
+                let out = frame.alloc_leaf(16).unwrap();
+                let off = frame.offset_of_slot(out.slot).unwrap();
+                survivors.push((i as u8, off));
+            }
+            let off = pack_inner_node(&mut frame, &survivors)
+                .unwrap()
+                .expect("non-empty survivors pack to Some");
+            let nt = frame.ntype_at(off).unwrap();
+            assert_eq!(
+                Some(size_of_node(nt)),
+                packed_inner_size(n),
+                "tier mismatch at n={n}: pack emitted {nt:?}",
+            );
+        }
+        assert_eq!(packed_inner_size(0), None);
     }
 }

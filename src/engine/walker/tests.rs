@@ -7,13 +7,17 @@ use super::erase::erase;
 use super::insert::insert;
 use super::lookup::{lookup, lookup_at};
 use super::migrate::{blob_needs_compaction, compact_blob, make_blob_from_node};
-use super::readers::{child_offset, read_prefix};
+use super::readers::{
+    child_offset, read_node16, read_node256, read_node4, read_node48, read_prefix,
+};
 use super::types::LookupResult;
 use super::SearchKey;
 use crate::api::errors::Error;
-use crate::layout::{BlobGuid, BlobNode, NodeType, PAGE_SIZE};
+use crate::layout::{BlobGuid, BlobNode, NodeType, DATA_AREA_START, PAGE_SIZE};
 use crate::store::blob_store::AlignedBlobBuf;
-use crate::store::{decode_child_off, BlobFrame};
+use crate::store::{decode_child_off, page_align_up, BlobFrame};
+use proptest::prelude::*;
+use std::collections::BTreeMap;
 
 /// Decode `header.root_slot` (the encoded root offset) into the root
 /// node body's absolute byte offset.
@@ -1138,6 +1142,304 @@ fn compact_blob_preserves_guid_and_lets_inserts_continue() {
         match lookup(frame.as_ref(), root, &k).unwrap() {
             LookupResult::Found(got) => assert_eq!(got.value, v.as_slice()),
             _ => panic!("post-compact insert {k:?} unreadable"),
+        }
+    }
+}
+
+/// Walk every node reachable from the root and assert the stage-2
+/// routing invariant: a child classifies as internal-vs-leaf purely
+/// from `off < leaf_region_start`, and that classification agrees with
+/// the node's actual type at every reached offset. The routing
+/// geometry must also be well-formed. A no-op for legacy
+/// (non-routed) blobs — `routing_region()` is `None` there.
+fn assert_routing_layout(frame: &BlobFrame<'_>) {
+    let Some(rr) = frame.header().routing_region() else {
+        return;
+    };
+    assert_eq!(
+        rr.off, DATA_AREA_START,
+        "routing region must start at DATA_AREA_START"
+    );
+    assert!(
+        rr.off + rr.len <= rr.leaf_region_start,
+        "routing arena [{:#x},{:#x}) overlaps leaf region {:#x}",
+        rr.off,
+        rr.off + rr.len,
+        rr.leaf_region_start,
+    );
+    assert_eq!(
+        page_align_up(rr.leaf_region_start),
+        rr.leaf_region_start,
+        "leaf_region_start {:#x} not page-aligned",
+        rr.leaf_region_start,
+    );
+
+    let mut stack = vec![root_off(frame)];
+    while let Some(off) = stack.pop() {
+        let nt = ntype_at(frame, off);
+        let classified_internal = off < rr.leaf_region_start;
+        let is_internal = !matches!(nt, NodeType::Leaf);
+        assert_eq!(
+            classified_internal, is_internal,
+            "offset {off:#x} (ntype {nt:?}) misclassified by leaf_region_start {:#x}",
+            rr.leaf_region_start,
+        );
+        match nt {
+            NodeType::Leaf | NodeType::EmptyRoot | NodeType::Blob | NodeType::Invalid => {}
+            NodeType::Prefix => {
+                let p = read_prefix(frame.as_ref(), off).unwrap();
+                stack.push(child_offset(p.child as u16));
+            }
+            NodeType::Node4 => {
+                let n = read_node4(frame.as_ref(), off).unwrap();
+                for i in 0..(n.count as usize).min(4) {
+                    stack.push(child_offset(n.children[i]));
+                }
+            }
+            NodeType::Node16 => {
+                let n = read_node16(frame.as_ref(), off).unwrap();
+                for i in 0..(n.count as usize).min(16) {
+                    stack.push(child_offset(n.children[i]));
+                }
+            }
+            NodeType::Node48 => {
+                let n = read_node48(frame.as_ref(), off).unwrap();
+                for b in 0..256usize {
+                    let idx = n.index[b];
+                    if idx != 0 {
+                        stack.push(child_offset(n.children[idx as usize - 1]));
+                    }
+                }
+            }
+            NodeType::Node256 => {
+                let n = read_node256(frame.as_ref(), off).unwrap();
+                for &c in &n.children {
+                    if c != 0 {
+                        stack.push(child_offset(c));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Stage-2 gate: after compaction, a routing-aware classification
+/// (`off < leaf_region_start`) agrees with the real node types, and a
+/// full-frame descent agrees with a `BTreeMap` oracle for present,
+/// tombstoned, and absent keys.
+///
+/// Written to pass BOTH before and after the routing-aware compactor
+/// lands: against today's legacy compactor every blob reports
+/// `routing_region() == None`, so `assert_routing_layout` is a no-op
+/// and only the oracle agreement is checked (a data-preservation
+/// regression guard); once `compact_blob` produces the routed layout
+/// the invariant assertions begin to fire.
+#[test]
+fn routing_equals_full_descend_and_oracle() {
+    let (mut buf_vec, _) = fresh_blob();
+    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    {
+        let mut frame = BlobFrame::wrap(&mut buf_vec);
+        let mut seq = 1u64;
+        // Group 'q': 60 keys → a Prefix over a Node256; every 7th value
+        // is > 4 KB so some leaves straddle pages.
+        for i in 0..60u8 {
+            let k = vec![b'q', i];
+            let v = if i % 7 == 0 {
+                vec![i; 5000]
+            } else {
+                vec![i, i ^ 0xFF]
+            };
+            put(&mut frame, &k, &v, seq);
+            seq += 1;
+            oracle.insert(k, v);
+        }
+        // Group 'p': 20 keys → a second prefixed inner subtree, so the
+        // root routes two children (forcing more than one internal tier).
+        for i in 0..20u8 {
+            let k = vec![b'p', i];
+            let v = vec![i, 0xAB, i];
+            put(&mut frame, &k, &v, seq);
+            seq += 1;
+            oracle.insert(k, v);
+        }
+        // Tombstone every other 'q' key for the compactor to drop.
+        let root = frame.header().root_slot;
+        for i in (0..60u8).step_by(2) {
+            let k = vec![b'q', i];
+            erase(&mut frame, root, &k).unwrap();
+            oracle.remove(&k);
+        }
+    }
+
+    let mut buf = aligned_from_vec(&buf_vec);
+    compact_blob(&mut buf).unwrap();
+    let frame = BlobFrame::wrap(buf.as_mut_slice());
+
+    // This tree is multi-tier and far under capacity, so the compactor
+    // MUST produce a routed layout — otherwise the invariant walk below
+    // would be a silent no-op and the gate would pass trivially.
+    assert!(
+        frame.header().routing_region().is_some(),
+        "expected a routed layout for a multi-tier, well-under-capacity tree",
+    );
+    assert_routing_layout(&frame);
+
+    let root = frame.header().root_slot;
+    let check = |k: &[u8]| match lookup(frame.as_ref(), root, k).unwrap() {
+        LookupResult::Found(hit) => Some(hit.value.to_vec()),
+        LookupResult::NotFound => None,
+        LookupResult::Crossing(_) => panic!("unexpected crossing for {k:?}"),
+    };
+    for i in 0..60u8 {
+        let k = vec![b'q', i];
+        assert_eq!(check(&k), oracle.get(&k).cloned(), "q[{i}]");
+    }
+    for i in 0..20u8 {
+        let k = vec![b'p', i];
+        assert_eq!(check(&k), oracle.get(&k).cloned(), "p[{i}]");
+    }
+    // Absent keys, including prefix-colliding-but-divergent ones.
+    for k in [&b"q"[..], &b"qq"[..], &b"p"[..], &b"zzz"[..]] {
+        assert_eq!(check(k), None, "absent {k:?}");
+    }
+}
+
+#[test]
+fn compact_all_tombstoned_stays_legacy() {
+    let (mut buf_vec, _) = fresh_blob();
+    {
+        let mut frame = BlobFrame::wrap(&mut buf_vec);
+        for i in 0..20u8 {
+            put(&mut frame, &[b'k', i], &[i], i as u64 + 1);
+        }
+        let root = frame.header().root_slot;
+        for i in 0..20u8 {
+            erase(&mut frame, root, &[b'k', i]).unwrap();
+        }
+    }
+    let mut buf = aligned_from_vec(&buf_vec);
+    compact_blob(&mut buf).unwrap();
+    let frame = BlobFrame::wrap(buf.as_mut_slice());
+    // Empty after compaction → EmptyRoot, no internal nodes → legacy.
+    assert!(frame.header().routing_region().is_none());
+    let root = frame.header().root_slot;
+    for i in 0..20u8 {
+        assert!(matches!(
+            lookup(frame.as_ref(), root, &[b'k', i]).unwrap(),
+            LookupResult::NotFound
+        ));
+    }
+}
+
+#[test]
+fn compact_single_leaf_stays_legacy() {
+    let (mut buf_vec, _) = fresh_blob();
+    {
+        let mut frame = BlobFrame::wrap(&mut buf_vec);
+        put(&mut frame, b"solo", b"value", 1);
+    }
+    let mut buf = aligned_from_vec(&buf_vec);
+    compact_blob(&mut buf).unwrap();
+    let frame = BlobFrame::wrap(buf.as_mut_slice());
+    // A bare-leaf root has zero internal nodes → legacy (routing_len 0).
+    assert!(frame.header().routing_region().is_none());
+    assert_eq!(get(&frame, b"solo").as_deref(), Some(&b"value"[..]));
+}
+
+#[test]
+fn compact_near_full_stays_correct() {
+    // Load the data area heavily; whether the compactor routes or falls
+    // back to legacy (the ≤4 KB page-align gap may not fit), data
+    // integrity — and the invariant when routed — must hold.
+    let (mut buf_vec, _) = fresh_blob();
+    let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    {
+        let mut frame = BlobFrame::wrap(&mut buf_vec);
+        let mut seq = 1u64;
+        for i in 0..4000u32 {
+            let k = format!("k{i:05}").into_bytes();
+            let v = vec![(i & 0xFF) as u8; 200];
+            let root = frame.header().root_slot;
+            match insert(&mut frame, root, &k, &v, seq) {
+                Ok(_) => {
+                    oracle.insert(k, v);
+                }
+                Err(_) => break, // data area full — stop loading
+            }
+            seq += 1;
+        }
+    }
+    let mut buf = aligned_from_vec(&buf_vec);
+    compact_blob(&mut buf).unwrap();
+    let frame = BlobFrame::wrap(buf.as_mut_slice());
+    assert_routing_layout(&frame); // no-op if it fell back to legacy
+    let root = frame.header().root_slot;
+    for (k, v) in &oracle {
+        match lookup(frame.as_ref(), root, k).unwrap() {
+            LookupResult::Found(hit) => assert_eq!(hit.value, v.as_slice()),
+            other => panic!("{k:?} -> {other:?}"),
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(48))]
+
+    /// Random insert/update/delete churn, then compaction, must agree
+    /// with a `BTreeMap` oracle across the entire 2-byte key space — and
+    /// whenever the compactor routes, the offset-classification
+    /// invariant (`assert_routing_layout`) must hold. Fixed-length keys
+    /// from a small alphabet force shared prefixes + inner-node growth
+    /// without tripping the strict-prefix `NotYetImplemented` path.
+    #[test]
+    fn routed_compaction_matches_oracle(
+        ops in proptest::collection::vec((0u8..6, 0u8..6, 0u8..40u8, any::<bool>()), 1..160)
+    ) {
+        let (mut buf_vec, _) = fresh_blob();
+        let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        {
+            let mut frame = BlobFrame::wrap(&mut buf_vec);
+            let mut seq = 1u64;
+            for &(b0, b1, vseed, is_del) in &ops {
+                let k = vec![b0, b1];
+                let root = frame.header().root_slot;
+                if is_del {
+                    let _ = erase(&mut frame, root, &k);
+                    oracle.remove(&k);
+                } else {
+                    // Mostly small; rarely > 4 KB so some routed leaves
+                    // straddle pages.
+                    let v = if vseed == 0 {
+                        vec![0xAB; 5000]
+                    } else {
+                        vec![vseed, b0, b1]
+                    };
+                    if insert(&mut frame, root, &k, &v, seq).is_err() {
+                        break; // data area full from churn — compact what we have
+                    }
+                    oracle.insert(k, v);
+                }
+                seq += 1;
+            }
+        }
+        let mut buf = aligned_from_vec(&buf_vec);
+        compact_blob(&mut buf).unwrap();
+        let frame = BlobFrame::wrap(buf.as_mut_slice());
+
+        assert_routing_layout(&frame);
+
+        let root = frame.header().root_slot;
+        for b0 in 0u8..6 {
+            for b1 in 0u8..6 {
+                let k = vec![b0, b1];
+                let got = match lookup(frame.as_ref(), root, &k).unwrap() {
+                    LookupResult::Found(hit) => Some(hit.value.to_vec()),
+                    LookupResult::NotFound => None,
+                    LookupResult::Crossing(_) => unreachable!("no blob nodes in this test"),
+                };
+                prop_assert_eq!(got, oracle.get(&k).cloned());
+            }
         }
     }
 }

@@ -14,7 +14,9 @@ mod blob_frame;
 pub(crate) mod blob_store;
 mod buffer_manager;
 
-pub(crate) use blob_frame::{decode_child_off, encode_child_off};
+pub(crate) use blob_frame::{
+    decode_child_off, encode_child_off, page_align_up, PAGE_4K, SPILLOVER_RESERVATION,
+};
 pub use blob_frame::{AllocError, BlobFrame, BlobFrameRef, FreeError};
 pub(crate) use blob_store::ColdBlobLookup;
 pub(crate) use buffer_manager::{
