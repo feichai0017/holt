@@ -13,11 +13,13 @@ measurements; no re-derivation needed.
   leaves after it, so a cold read loads the small routing region + **one leaf
   page** (~8–12 KB, or ~4 KB with the routing region resident) and **reuses the
   existing descent**. Full design: `docs/design/cold-read-oracle.md`.
-- **Done:** design + page-read primitive + header fields (stages 0–1).
-- **Next:** **stage 2 — the two-arena compaction build in
-  `src/engine/walker/migrate.rs`** (`clone_subtree` / `clone_leaf`), gated by a
-  `routing == full` invariant test. This is the meaty, durability-critical part;
-  give it a full session.
+- **Done:** design + page-read primitive + header fields + **stage 2 two-arena
+  compaction build** (stages 0–2; stage 2 = `ed997c6`).
+- **Next:** **stage 3 — the cold routed read in `src/engine/walker/lookup.rs`**
+  (`cold_read_routed`), gated by the `routed_get == tree.get` data-integrity
+  test (present / absent / crossing). **Land the mutation-path prerequisite
+  first** (see "Stage 3 prerequisite" below): a post-routed in-place structural
+  mutation must zero `routing_len`, else stage 3 reads stale geometry.
 - **Validation cadence (unchanged):** correctness/compile on **mac (aarch64)**;
   real I/O + benches on **ubuntu (x86)** via rsync (see "Validation" below).
 
@@ -42,20 +44,53 @@ useless when working set >> RAM, and it carries a class of crash/staleness bugs
 (see "cold.idx review" below). The routing region is a **miss-cost** play and is
 crash-safe by construction.
 
-## What's committed (this session)
+## What's committed (cold-read line)
 
 | commit | what it gives you |
 |---|---|
 | `137d5ba` | **Design doc** `docs/design/cold-read-oracle.md` — routing region layout, build, read path, crash/compat, 6-stage plan. |
 | `808a5fa` | **Page-read primitive** `BlobStore::read_blob_range(guid, byte_offset, dst)`. FileBlobStore = positional O_DIRECT/F_NOCACHE `pread` (4 KB-aligned, bypasses the 512 KB io_uring ring); Memory = RAM copy; default = read-whole-and-copy. **Dual-arch validated** (`range_read_test::page_reads_reconstruct_each_blob`: page-reads reconstruct every real blob byte-for-byte; x86 O_DIRECT no EINVAL). Also the `cold_read_page_touch_ceiling` analysis in `cold.rs`. |
 | `12ce05a` | **Stage 1 — header fields (transparent).** `BlobHeader` gains `routing_off/routing_len/leaf_region_start` (u32, at 0xb0/b4/b8, carved from pad; size still 4096; offset asserts extended). `BlobHeader::routing_region() -> Option<RoutingRegion>` (None ⇒ legacy whole-frame). **Safety:** `BlobFrameMut::init` zeroes the whole frame ⇒ every old/not-yet-recompacted blob reads `routing_len==0` ⇒ full-pin fallback; **no manifest bump needed.** Pinned by `header::tests::zeroed_header_is_legacy_layout`. The reader is `#[allow(dead_code)]` until stage 3. |
+| `ed997c6` | **Stage 2 — two-arena compaction build.** `compact_blob` now: pass-0 `routing_budget` sizes the live subtree EXACTLY (via `packed_inner_size`, which mirrors `pack_inner_node`'s tier collapse — a 1-survivor node packs to a 128 B `Prefix`, *larger* than a source `Node4`/`Node16`, so source size would under-count); fixes a page-aligned `leaf_region_start` up front; clones with internals bumping `space_used` (routing arena) and `clone_leaf` drawing from `alloc_leaf_at` (leaf cursor); stamps the header fields. **Back-patch unchanged** (post-order `encode_child_off`). Release-safe overrun guard → legacy rebuild (+`debug_assert!`). Spillover/merge stay legacy; merge demotes a routed parent (`routing_len=0`). Blobs with `< ROUTE_MIN_LEAF_BYTES` (8 KB leaves) stay legacy so the ≤4 KB page-align gap can't dominate `space_used`. Gated by `routing_equals_full_descend_and_oracle` + `routed_compaction_matches_oracle` proptest + degenerate/fallback cases + `packed_inner_size_matches_pack_inner_node`. Full suite + clippy green on aarch64. |
+
+**Stage 2 decisions (beyond the original four):** routing is gated on
+`ROUTE_MIN_LEAF_BYTES = 2 * PAGE_4K` (8 KB) — a tunable. Routed `space_used`
+= legacy + the ≤4 KB page-align gap, so `is_mergeable` over-counts a routed
+child by the gap (conservative/safe) and a tiny blob's compaction would *look*
+like growth; the gate keeps small blobs legacy. `routing_len` is emitted
+honestly (no upper cap — stage 3 owns any full-pin-on-large-routing policy).
+
+(The WAL ring work — the other big effort — is on a **separate branch**
+(`perf/u16-children`) and is unrelated to this cold-read line; don't conflate.)
+
+## Stage 3 prerequisite — mutation-path policy (land before stage 3 trusts the fields)
+
+Stage 2's build is correct in isolation, but a **post-routed in-place
+structural mutation** (an insert that grows an internal node, or appends a
+leaf via `alloc_node`/`alloc_leaf` from `space_used` = top of the leaf arena)
+places a NEW internal node *above* `leaf_region_start`, silently violating the
+`off < leaf_region_start ⟺ internal` invariant. `merge_blob` already demotes
+(zeros `routing_len`); the general writer path in `src/engine/walker/writers.rs`
+(insert / CoW after fork) must do the same: **zero `routing_len` on the first
+structural mutation of a routed frame** (simplest, safe). Until that lands,
+stage 3's reader cannot trust `routing_region()` on a frame that may have been
+mutated since its last compaction. `fork_frame` / snapshot copy bytes verbatim,
+so a forked routed frame inherits a `leaf_region_start` that a later in-place
+mutation would invalidate too — same fix covers it.
 
 (The WAL ring work — the other big effort — is on a **separate branch**
 (`perf/u16-children`) and is unrelated to this cold-read line; don't conflate.)
 
 ## Remaining plan (stages 2–6) with concrete entry points
 
-### Stage 2 — two-arena compaction build  ← **START HERE**
+### Stage 2 — two-arena compaction build  ✅ **DONE (`ed997c6`)**
+
+*Implemented as "measure-then-route" (pass-0 `routing_budget` fixes a
+page-aligned `leaf_region_start` before the clone, so back-patch is unchanged).
+The `install_new_blob` reference below was wrong — fresh-blob creation is
+`make_blob_from_node*` in `migrate.rs` (gated to legacy) and
+`BufferManager::install_new_blob` only installs pre-built bytes. Original plan
+retained below for context.*
 **Files:** `src/engine/walker/migrate.rs` (`clone_subtree`, `clone_leaf`,
 `compact_blob`), `src/engine/walker/spillover.rs` (`install_new_blob`).
 - `clone_subtree` already DFS-walks the source in key order. Make it write into
@@ -78,7 +113,7 @@ crash-safe by construction.
 - Spillover (`install_new_blob`) writes fresh blobs too — apply the same layout
   there, or leave spillover blobs legacy and let the next compaction route them.
 
-### Stage 3 — cold routed read
+### Stage 3 — cold routed read  ← **START HERE** (land the mutation-path prerequisite above first)
 **File:** `src/engine/walker/lookup.rs` — `cold_lookup_or_pin` (currently ~line
 356; the `ColdBlobLookup::Unknown` arm at the non-resident fallback does
 `bm.pin(child_guid)` = the 512 KB read). Add `cold_read_routed`:
@@ -217,10 +252,12 @@ them by construction:
 
 ## Tasks (mirror of the tracker)
 
-- **#18 (in progress):** Cold-read in-blob routing region. Stage 1 done
-  (`12ce05a`); primitive done (`808a5fa`); design (`137d5ba`). **Next: stage 2**
-  two-arena compaction build + `routing==full` test → stage 3 `cold_read_routed`
-  (+ data-integrity gate + cold bench) → **stage 3.5/4 io_uring-to-the-extreme
+- **#18 (in progress):** Cold-read in-blob routing region. Design (`137d5ba`);
+  primitive (`808a5fa`); stage 1 header fields (`12ce05a`); **stage 2 two-arena
+  compaction build + `routing==full` gate (`ed997c6`) done.** **Next: the
+  mutation-path prerequisite (zero `routing_len` on first structural mutation in
+  `writers.rs`), then stage 3 `cold_read_routed`** (+ `routed_get==tree.get`
+  data-integrity gate + cold bench) → **stage 3.5/4 io_uring-to-the-extreme
   cold-read backend** (batched multi-SQE async reads / per-core rings /
   IOPOLL+SQPOLL on Linux; thread-pool backend for macOS+fallback; QD-sweep cold
   bench) → stage 4 resident routing cache → stage 5 remove cold.idx (+ crash-soak)
