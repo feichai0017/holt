@@ -597,7 +597,14 @@ fn routing_geometry(budget: Option<BudgetNode>) -> Option<u32> {
     if b.leaf_bytes < ROUTE_MIN_LEAF_BYTES {
         return None; // too small to amortize the page-alignment gap
     }
-    let lrs = page_align_up(DATA_AREA_START + b.routing_bytes);
+    // The fresh frame's init `EmptyRoot` sentinel sits at DATA_AREA_START,
+    // ahead of the cloned internals, so the routing arena actually ends at
+    // DATA_AREA_START + sentinel + routing_bytes. Account for it here, or a
+    // routing_bytes that lands DATA_AREA_START + routing_bytes exactly on a
+    // page boundary would put `space_used` one sentinel past
+    // leaf_region_start and trip the overrun guard.
+    let routing_end = DATA_AREA_START + size_of_node(NodeType::EmptyRoot) + b.routing_bytes;
+    let lrs = page_align_up(routing_end);
     let fits = u64::from(lrs) + u64::from(b.leaf_bytes) + u64::from(SPILLOVER_RESERVATION)
         <= u64::from(PAGE_SIZE);
     fits.then_some(lrs)
@@ -1062,10 +1069,39 @@ fn pack_inner_node(dst: &mut BlobFrame<'_>, survivors: &[(u8, u32)]) -> Result<O
 
 #[cfg(test)]
 mod budget_tests {
-    use super::{pack_inner_node, packed_inner_size};
-    use crate::layout::size_of_node;
+    use super::{pack_inner_node, packed_inner_size, routing_geometry, BudgetNode};
+    use crate::layout::{size_of_node, NodeType, DATA_AREA_START};
     use crate::store::blob_store::AlignedBlobBuf;
-    use crate::store::BlobFrame;
+    use crate::store::{BlobFrame, PAGE_4K};
+
+    /// `leaf_region_start` must leave room for the fresh frame's init
+    /// `EmptyRoot` sentinel that precedes the cloned internals — even
+    /// when `DATA_AREA_START + routing_bytes` lands exactly on a 4 KB
+    /// boundary. Otherwise the routed clone's `space_used`
+    /// (= DATA_AREA_START + sentinel + routing_bytes) overruns
+    /// `leaf_region_start` by the sentinel and trips the overrun guard.
+    /// Regression for a concurrent-compaction panic.
+    #[test]
+    fn routing_geometry_reserves_the_init_sentinel_on_a_page_boundary() {
+        let sentinel = size_of_node(NodeType::EmptyRoot);
+        // DATA_AREA_START is itself a 4 KB multiple, so any routing_bytes
+        // that is a page multiple lands the arena start on a boundary —
+        // the case that used to overrun.
+        for routing_bytes in [PAGE_4K, 2 * PAGE_4K, 3 * PAGE_4K] {
+            let lrs = routing_geometry(Some(BudgetNode {
+                routing_bytes,
+                leaf_bytes: 16 * PAGE_4K,
+            }))
+            .expect("substantial routed blob");
+            let space_used_after_clone = DATA_AREA_START + sentinel + routing_bytes;
+            assert!(
+                space_used_after_clone <= lrs,
+                "routing_bytes={routing_bytes}: space_used {space_used_after_clone:#x} \
+                 overruns leaf_region_start {lrs:#x}",
+            );
+            assert_eq!(lrs % PAGE_4K, 0, "leaf_region_start must be page-aligned");
+        }
+    }
 
     /// The routing budget is exact only if `packed_inner_size` predicts
     /// the SAME byte size `pack_inner_node` actually emits for every
