@@ -11,6 +11,7 @@
 //!   the store layer.
 
 mod blob_frame;
+mod bloom;
 pub(crate) mod blob_store;
 mod buffer_manager;
 mod routing_cache;
