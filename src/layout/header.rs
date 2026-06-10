@@ -160,7 +160,6 @@ pub struct BlobHeader {
 ///
 /// Stage 1 lands the reader; the cold routed-read path (stage 3,
 /// `cold_read_routed`) is its first production consumer.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoutingRegion {
     /// Byte offset of the contiguous internal-node region within the frame.
@@ -189,7 +188,6 @@ impl BlobHeader {
     /// leaf_region_start)` out of a `PAGE_SIZE` buffer, so an out-of-range
     /// bound here must steer it to the authoritative full-frame pin
     /// rather than panic on an out-of-bounds slice.
-    #[allow(dead_code)] // first consumer is stage 3 (cold_read_routed)
     #[must_use]
     pub fn routing_region(&self) -> Option<RoutingRegion> {
         if self.routing_len == 0 {

@@ -16,7 +16,7 @@
 //! the helpers encode it via `encode_child_off` before storing it as
 //! the body's `u16` — so call sites never touch the encoding.
 
-use std::mem::{offset_of, size_of};
+use std::mem::size_of;
 
 use crate::api::errors::{Error, Result};
 use crate::engine::simd;
@@ -119,21 +119,6 @@ pub(super) fn write_leaf(
         body[16 + key_len..16 + key_len + value_len].copy_from_slice(value);
     }
     Ok(body_off)
-}
-
-/// Overwrite only the `seq` field of a leaf header at byte offset
-/// `off` in place.
-#[allow(dead_code)]
-pub(super) fn write_leaf_seq(frame: &mut BlobFrame<'_>, off: u32, seq: u64) -> Result<()> {
-    let body = frame
-        .body_at_offset_mut(off)
-        .ok_or(Error::node_corrupt("write_leaf_seq: body"))?;
-    if body.len() < size_of::<Leaf>() {
-        return Err(Error::node_corrupt("write_leaf_seq: non-leaf slot"));
-    }
-    let seq_off = offset_of!(Leaf, seq);
-    body[seq_off..seq_off + size_of::<u64>()].copy_from_slice(&seq.to_le_bytes());
-    Ok(())
 }
 
 /// Build a Prefix-node chain spanning `bytes`, ending at child byte
