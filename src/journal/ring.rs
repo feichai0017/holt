@@ -573,11 +573,18 @@ mod tests {
             w.flush().unwrap();
         }
 
-        // 1. Byte-for-byte identical WAL file.
+        // 1. Byte-for-byte identical WAL file, modulo the header's
+        // `created_at` stamp (bytes 16..24): the two files are created
+        // independently, so under a slow enough run (e.g. coverage
+        // instrumentation) their wall-clock seconds can differ. Mask that
+        // one field; the record stream + the rest of the header must match.
+        let mut wal_a = std::fs::read(&path_a).unwrap();
+        let mut wal_b = std::fs::read(&path_b).unwrap();
+        wal_a[16..24].fill(0);
+        wal_b[16..24].fill(0);
         assert_eq!(
-            std::fs::read(&path_a).unwrap(),
-            std::fs::read(&path_b).unwrap(),
-            "ring-produced WAL must be byte-identical to the direct path"
+            wal_a, wal_b,
+            "ring-produced WAL must be byte-identical to the direct path (modulo header created_at)"
         );
 
         // 2. Replays through the real reader to the original inserts, in order.
