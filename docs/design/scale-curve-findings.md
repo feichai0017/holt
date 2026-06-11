@@ -73,23 +73,45 @@ comes from `scripts/ubuntu-validate.sh`.
    curve) — the S3-style rollup fast-forward is unaffected by blob count. Holt's list
    advantage holds at scale.
 
-## The actual fix (v0.4 P0 — substantial, not a constant tweak)
+## Fixes considered — both designed and adversarially refuted (2026-06-11)
 
-The lever is **blob fill efficiency**, not the route cache. Two non-trivial options,
-both correctness-sensitive (spillover + merge touch the structural-mutation path):
+The lever is **blob fill efficiency**, not the route cache. Two options were each given a
+full design + adversarial-refute pass (understand → design → 2 hostile lenses). **Both
+were refuted; neither is worth building as designed.** The reframe at the end is the
+honest takeaway.
 
-- **(a) Pack tighter on spillover.** Tune the picker so post-split blobs land nearer the
-  70% target instead of the 35% floor (the fragmentation comes from how subtrees are
-  peeled). Lower risk (one primitive), but bounded upside — it improves *new* splits, not
-  the already-fragmented steady state.
-- **(b) Sibling consolidation / rebalance primitive.** A new maintenance op that merges
-  adjacent underfilled sibling leaf-blobs (the current parent-child `mergeBlob` does not
-  apply to wide shallow trees). Higher upside (drives steady-state fill toward the band
-  and shrinks depth), higher risk (new structural primitive on the W2D path; needs the
-  full proptest + crash-soak treatment).
+- **(a) Pack tighter on spillover (size the peel to ~50/50) — REJECTED.** A single-edge
+  peel *cannot* produce a balanced split on a path-shaped ART: object-store keys share
+  long prefixes, so a deep spine holds nearly all the data and the fan-out children are
+  each small. There is no single edge near 50% to cut at, so a `live/2` target lands on a
+  small fan-out child (source stays too full) or the spine (source goes too empty) — the
+  "both halves at 50%" proof's premise is false. And it does **nothing** for the existing
+  fragmented corpus (compaction never crosses BlobNode boundaries; already-split blobs are
+  never re-split). It moves only future splits, and not even those reliably.
+- **(b) Sibling-merge primitive — REJECTED (and it would have shipped a silent
+  corruption).** Folding two sibling crossings `{ba→A, bb→B}` into one fresh blob with an
+  internal `Node4{ba→A, bb→B}` **double-consumes the branching byte**: an inner node at
+  depth `d` consumes `key[d]` and the child resumes at `d+1`, so re-keying `ba` at `d+1`
+  compares the wrong key position — every lookup into the merged blob silently returns the
+  wrong value / NotFound (the `make_blob_from_node` template adds *no* re-keying node, by
+  contract). Folding two crossings into one is only valid when they share a *Prefix*, not
+  when they sit under distinct bytes of an inner node. On top of that: the eligible
+  population is small (a settled below-floor blob has spilled → has children → is a
+  *parent*, which `num_ext_blobs==0` excludes — it is not a pairable leaf), and `merges=0`
+  is the `is_mergeable` *space* check rejecting (a 30 % parent can't absorb a 70 % child),
+  not a candidate-seeding gap.
 
-Either way this is a dedicated, design-first effort with adversarial review — not a
-one-line change. The route-cache-sizing idea is **closed as unnecessary** by this data.
+**The reframe (why this is closed, not "deferred"):** the fill problem is a disk-**space**
+cost, not a read-**latency** cost. The shipped cold-read routing region already makes each
+unavoidable cold read cheap (~12 KB vs a 512 KB frame pin), so the read-amp symptom of low
+fill is already substantially paid down. The marginal latency win from a risky new
+structural primitive on the W2D path is the residual read-amp the routing region does not
+already cover — small for point reads. So: **route-cache-sizing closed as unnecessary
+(measured); both fill fixes closed as not-worth-the-risk (designed + refuted).** If the
+disk-space cost itself ever becomes the binding constraint, the prerequisite is a *cheap
+diagnostic first* — instrument the actual post-split residual distribution and the count
+of genuinely-pairable adjacent leaf-siblings on a settled tree — before committing to any
+structural-mutation surgery. Do not build against the assumed numbers.
 
 ## Caveats / next
 
