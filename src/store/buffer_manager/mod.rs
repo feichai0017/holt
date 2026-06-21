@@ -517,7 +517,8 @@ impl BufferManager {
     /// Wrap `store` with a cache of at most `capacity` blobs
     /// (each blob is 512 KB on the heap). A `capacity` of 0 is
     /// clamped to 1. Generic/custom stores do not receive a cold-page
-    /// side cache; file-backed trees use [`Self::new_file`].
+    /// side cache; file-backed trees call [`Self::new_file`] with their
+    /// store-specific allocator.
     #[must_use]
     pub fn new(store: Arc<dyn BlobStore>, capacity: usize) -> Self {
         Self::new_with_budget_and_uninit_allocator(store, CacheBudget::memory(capacity), || {
@@ -527,31 +528,14 @@ impl BufferManager {
         })
     }
 
-    /// Wrap a file-backed store with one unified cache budget. The public
-    /// `capacity` is still expressed in 512 KB blob-frame units; internally
-    /// a bounded slice is reserved for 4 KB cold-read navigation pages and
-    /// the rest becomes resident blob slots.
-    #[must_use]
-    pub(crate) fn new_file(store: Arc<dyn BlobStore>, capacity: usize) -> Self {
-        Self::new_with_budget_and_uninit_allocator(store, CacheBudget::file(capacity), || {
-            // SAFETY: BufferManager's uninitialized allocations are
-            // filled by read_blob or a full-frame copy before read.
-            unsafe { AlignedBlobBuf::uninit() }
-        })
-    }
-
-    /// Construct with a crate-private uninitialized-frame allocator.
+    /// Wrap a file-backed store with one unified cache budget and a
+    /// store-specific uninitialized-frame allocator.
     ///
-    /// File-backed trees use this to preserve Linux fixed-buffer
-    /// allocation without exposing an uninitialized constructor in
-    /// the public BlobStore trait.
+    /// The public `capacity` is expressed in 512 KB blob-frame units.
+    /// Internally, a bounded slice is reserved for 4 KB cold-read
+    /// navigation pages and the rest becomes resident blob slots.
     #[must_use]
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
-    pub(crate) fn new_with_uninit_allocator<F>(
-        store: Arc<dyn BlobStore>,
-        capacity: usize,
-        alloc_uninit: F,
-    ) -> Self
+    pub(crate) fn new_file<F>(store: Arc<dyn BlobStore>, capacity: usize, alloc_uninit: F) -> Self
     where
         F: Fn() -> AlignedBlobBuf + Send + Sync + 'static,
     {

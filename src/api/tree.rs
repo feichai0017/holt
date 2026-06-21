@@ -438,7 +438,7 @@ impl Tree {
                     )?);
                     let store_dyn: Arc<dyn BlobStore> = store.clone();
                     let alloc_store = Arc::clone(&store);
-                    Arc::new(BufferManager::new_with_uninit_allocator(
+                    Arc::new(BufferManager::new_file(
                         store_dyn,
                         cfg.buffer_pool_size,
                         move || {
@@ -451,7 +451,11 @@ impl Tree {
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
                 {
                     let store: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir)?);
-                    Arc::new(BufferManager::new_file(store, cfg.buffer_pool_size))
+                    Arc::new(BufferManager::new_file(store, cfg.buffer_pool_size, || {
+                        // SAFETY: BufferManager initializes every
+                        // returned buffer before reading it.
+                        unsafe { AlignedBlobBuf::uninit() }
+                    }))
                 }
             }
         };

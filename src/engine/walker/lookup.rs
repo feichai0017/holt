@@ -1350,7 +1350,11 @@ mod tests {
         let guid = [0x41; 16];
         let store = Arc::new(RangeCountStore::new(guid));
         let store_dyn: Arc<dyn crate::store::blob_store::BlobStore> = store.clone();
-        let bm = BufferManager::new_file(store_dyn, 128);
+        let bm = BufferManager::new_file(store_dyn, 128, || {
+            // SAFETY: The cold-page reader fills the requested ranges
+            // before the test inspects them.
+            unsafe { AlignedBlobBuf::uninit() }
+        });
 
         let mut scratch = AlignedBlobBuf::zeroed();
         let mut reader = ColdPageReader::new(&bm, guid, scratch.as_mut_slice());
