@@ -411,9 +411,12 @@ where
     let mut child_depth = crossing.child_depth;
     loop {
         // Answer cold from the in-blob routing region (stage 3); any
-        // uncertainty falls back to the authoritative full pin.
+        // uncertainty falls back to the authoritative full pin. A cold
+        // negative is deliberately treated as uncertainty: the routed
+        // path is an accelerator over partial store reads and cached
+        // summaries, not the source of truth for absence.
         match cold_read_routed(bm, child_guid, key, child_depth) {
-            ColdBlobLookup::Unknown => {
+            ColdBlobLookup::Unknown | ColdBlobLookup::NotFound => {
                 let pin = match bm.pin(child_guid) {
                     Ok(pin) => pin,
                     Err(e) if is_blob_store_not_found(&e) && bm.has_delete_fence(child_guid) => {
@@ -438,7 +441,6 @@ where
                 child_guid = next_guid;
                 child_depth = next_depth;
             }
-            ColdBlobLookup::NotFound => return Ok(ColdLookupOrPin::Done(None)),
         }
     }
 }
@@ -451,10 +453,12 @@ where
 ///
 /// A pure accelerator: on ANY uncertainty — the blob isn't
 /// cold-eligible (cached/pending-delete/protected), it's in the legacy
-/// whole-frame layout (`routing_len == 0`), a read fails, or descent
-/// reaches an unexpected node — it returns [`ColdBlobLookup::Unknown`]
-/// and the caller falls back to `bm.pin`, which reads the authoritative
-/// image. So it can never change `get()` semantics; it only avoids I/O.
+/// whole-frame layout (`routing_len == 0`), a read fails, descent
+/// reaches an unexpected node, or the routed path would answer
+/// `NotFound` — it returns [`ColdBlobLookup::Unknown`] and the caller
+/// falls back to `bm.pin`, which reads the authoritative image. This
+/// means cold reads may fast-return positive hits/crossings, but never
+/// make absence visible from partial store state.
 fn cold_read_routed(
     bm: &BufferManager,
     guid: BlobGuid,
@@ -467,7 +471,10 @@ fn cold_read_routed(
     // Descend with the SAME `key` the pin-fallback frame descent uses
     // (the caller only reaches here with a user-style key), so a routed
     // and a full-frame read are byte-for-byte equivalent.
-    routed_read_cached(bm, guid, key, depth).unwrap_or(ColdBlobLookup::Unknown)
+    match routed_read_cached(bm, guid, key, depth) {
+        Ok(ColdBlobLookup::NotFound) | Err(_) => ColdBlobLookup::Unknown,
+        Ok(answer) => answer,
+    }
 }
 
 /// Routed cold read with the stage-4 resident routing cache: read the
@@ -663,10 +670,11 @@ const BLOOM_PROBE_MAX_KEY: usize = 1024;
 
 /// Stage 6: consult the per-blob bloom resident in `scratch`'s routing
 /// region for `key`. Returns `true` ONLY when the bloom proves `key` is
-/// absent from this blob — so the cold read can answer `NotFound`
-/// without the leaf-page read. `false` means "maybe present" (or there
-/// is no usable bloom, or the key is too long to probe): fall through to
-/// the authoritative leaf read.
+/// absent from this blob, letting the routed core skip the leaf-page
+/// read. The production cold-read wrapper treats that local `NotFound`
+/// as uncertainty and pins the full frame before exposing absence to
+/// callers. `false` means "maybe present" (or there is no usable bloom,
+/// or the key is too long to probe): fall through to the leaf read.
 ///
 /// Never a false negative: the filter was built over each leaf's stored
 /// key bytes, and `SearchKey::write_to_slice` reproduces exactly those
@@ -714,7 +722,9 @@ fn descend_routed(
         RoutedStep::Visit(child_off, new_depth) => {
             if child_off >= leaf_region_start {
                 // Stage 6: if the blob's resident bloom proves `key` is
-                // absent, answer NotFound WITHOUT the leaf-page read.
+                // absent, the routed core can avoid the leaf-page read.
+                // The production wrapper maps this local NotFound to
+                // Unknown so only a full-frame pin can publish absence.
                 if bloom_rejects(scratch, key) {
                     return Ok(ColdBlobLookup::NotFound);
                 }
@@ -974,4 +984,98 @@ fn node256_descend<'a>(
     let child_off = child_offset(encoded);
     frame.prefetch_at(child_off);
     descend(frame, child_off, key, depth + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::erase::erase;
+    use super::super::insert::insert;
+    use super::super::migrate::compact_blob;
+    use super::*;
+    use crate::store::blob_store::{BlobStore, MemoryBlobStore};
+    use crate::store::BlobFrame;
+
+    fn routed_blob(guid: BlobGuid) -> AlignedBlobBuf {
+        let mut buf = AlignedBlobBuf::zeroed();
+        BlobFrame::init(buf.as_mut_slice(), guid).unwrap();
+        {
+            let mut frame = BlobFrame::wrap(buf.as_mut_slice());
+            let mut seq = 1u64;
+            for i in 0..60u8 {
+                let value = if i % 7 == 0 {
+                    vec![i; 5000]
+                } else {
+                    vec![i, i ^ 0xFF]
+                };
+                let root = frame.header().root_slot;
+                insert(&mut frame, root, &[b'q', i], &value, seq).unwrap();
+                seq += 1;
+            }
+            for i in 0..20u8 {
+                let root = frame.header().root_slot;
+                insert(&mut frame, root, &[b'p', i], &[i, 0xAB, i], seq).unwrap();
+                seq += 1;
+            }
+            let root = frame.header().root_slot;
+            for i in (0..60u8).step_by(2) {
+                erase(&mut frame, root, &[b'q', i]).unwrap();
+            }
+        }
+        compact_blob(&mut buf).unwrap();
+        assert!(
+            BlobFrame::wrap(buf.as_mut_slice())
+                .header()
+                .routing_region()
+                .is_some(),
+            "test needs a routed blob",
+        );
+        buf
+    }
+
+    #[test]
+    fn production_cold_read_never_publishes_routed_not_found() {
+        let guid = [0x42; 16];
+        let blob = routed_blob(guid);
+        let src = blob.as_slice().to_vec();
+
+        let mut scratch = AlignedBlobBuf::zeroed();
+        let mut read = |off: u64, dst: &mut [u8]| -> Result<()> {
+            let off = off as usize;
+            dst.copy_from_slice(&src[off..off + dst.len()]);
+            Ok(())
+        };
+        assert!(
+            matches!(
+                cold_read_routed_into(
+                    scratch.as_mut_slice(),
+                    &mut read,
+                    SearchKey::exact(b"absent"),
+                    0,
+                )
+                .unwrap(),
+                ColdBlobLookup::NotFound
+            ),
+            "the routed core may prove local absence",
+        );
+
+        let store = Arc::new(MemoryBlobStore::new());
+        store.write_blob(guid, &blob).unwrap();
+        let bm = BufferManager::new(store, 4);
+
+        match cold_read_routed(&bm, guid, SearchKey::exact(&[b'q', 1]), 0) {
+            ColdBlobLookup::Found { value, seq } => {
+                assert_eq!(value, vec![1, 1 ^ 0xFF]);
+                assert_eq!(seq, 2);
+            }
+            other => panic!("present key should stay on the positive cold path: {other:?}"),
+        }
+
+        assert!(
+            matches!(
+                cold_read_routed(&bm, guid, SearchKey::exact(b"absent"), 0),
+                ColdBlobLookup::Unknown
+            ),
+            "production cold reads must fall back to a full pin before reporting absence",
+        );
+    }
 }
