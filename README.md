@@ -92,7 +92,7 @@ holt = "=0.4.1"
 ```
 
 The supported user surface is deliberately small:
-`DB`, `DBAtomicBatch`, `DBView`, `TreeBuilder`, `Tree`, `TreeConfig`, `Storage`, `RangeBuilder`,
+`DB`, `DBAtomicBatch`, `DBView`, `TreeBuilder`, `Tree`, `TreeConfig`, `AccessMode`, `Storage`, `RangeBuilder`,
 `RangeEntry`, `RangeIter`, `KeyRangeBuilder`, `KeyRangeEntry`,
 `KeyRangeIter`, `AtomicBatch`, `Record`, `RecordVersion`,
 `KeyPathBuf`, `KeyPrefixBuf`, `KeyPathError`, `CheckpointConfig`,
@@ -119,10 +119,23 @@ let tree = TreeBuilder::new("/var/lib/myapp/meta.holt")
 // argument becomes informational once `.memory()` flips the
 // mode. Good for tests, sidecar caches, ephemeral session stores.
 let tree = TreeBuilder::new("scratch").memory().open()?;
+
+// Existing-only file-backed mode. WAL records are replayed into
+// memory, but the handle does not change files on disk.
+let reader = TreeBuilder::new("/var/lib/myapp/meta.holt")
+    .read_only()
+    .open()?;
 ```
 
-File-backed trees default to 256 resident 512 KB blobs (128 MiB).
-In-memory trees keep the smaller 64-blob default (32 MiB).
+### File access modes
+
+File-backed trees default to 256 resident 512 KB blobs (128 MiB),
+while in-memory trees keep 64 blobs (32 MiB).
+
+File-backed handles also lock `blobs.dat`. Read-only handles take a
+shared process lock, and read-write handles take an exclusive process
+lock. Conflicting opens fail immediately, and read-only handles reject
+mutations, checkpoints, and compaction with `Error::ReadOnly`.
 
 ### Path-shaped keys
 

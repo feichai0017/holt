@@ -333,10 +333,14 @@ impl Tree {
             Storage::File { dir } => {
                 #[cfg(all(target_os = "linux", feature = "io-uring"))]
                 {
-                    let store = Arc::new(FileBlobStore::open_with_buffer_pool_hint(
-                        dir,
-                        cfg.buffer_pool_size,
-                    )?);
+                    let store = Arc::new(if cfg.is_read_only() {
+                        FileBlobStore::open_read_only_with_buffer_pool_hint(
+                            dir,
+                            cfg.buffer_pool_size,
+                        )?
+                    } else {
+                        FileBlobStore::open_with_buffer_pool_hint(dir, cfg.buffer_pool_size)?
+                    });
                     let store_dyn: Arc<dyn BlobStore> = store.clone();
                     let alloc_store = Arc::clone(&store);
                     Arc::new(BufferManager::new_with_uninit_allocator(
@@ -351,7 +355,11 @@ impl Tree {
                 }
                 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
                 {
-                    let store: Arc<dyn BlobStore> = Arc::new(FileBlobStore::open(dir)?);
+                    let store: Arc<dyn BlobStore> = Arc::new(if cfg.is_read_only() {
+                        FileBlobStore::open_read_only(dir)?
+                    } else {
+                        FileBlobStore::open(dir)?
+                    });
                     Arc::new(BufferManager::new(store, cfg.buffer_pool_size))
                 }
             }
@@ -361,7 +369,7 @@ impl Tree {
 
     fn open_inner(cfg: TreeConfig, bm: Arc<BufferManager>, attach_wal: bool) -> Result<Self> {
         let root_guid = ROOT_BLOB_GUID;
-        ensure_root_blob(&bm, root_guid)?;
+        ensure_root_blob_for_open(&bm, root_guid, !cfg.is_read_only())?;
 
         // File-backed trees keep a WAL alongside the data file.
         // Replay every durable record onto the BM-cached blob
@@ -376,16 +384,17 @@ impl Tree {
                 Some(path) => {
                     let next_seq = if path.exists() {
                         let start = std::time::Instant::now();
-                        let (next_seq, replay_stats) = replay_wal(&path, &bm, |tree_id| {
-                            if tree_id == 0 {
-                                Ok(root_guid)
-                            } else {
-                                Err(Error::ReplaySanityFailed {
-                                    context: "WAL record tree_id does not belong to this Tree",
-                                    record_offset: 0,
-                                })
-                            }
-                        })?;
+                        let (next_seq, replay_stats) =
+                            replay_wal(&path, &bm, !cfg.is_read_only(), |tree_id| {
+                                if tree_id == 0 {
+                                    Ok(root_guid)
+                                } else {
+                                    Err(Error::ReplaySanityFailed {
+                                        context: "WAL record tree_id does not belong to this Tree",
+                                        record_offset: 0,
+                                    })
+                                }
+                            })?;
                         open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                         open_stats.wal_replay_records = replay_stats.records_seen;
                         open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
@@ -396,8 +405,12 @@ impl Tree {
                     } else {
                         1
                     };
-                    let journal = Journal::open_or_create(&path, /*tree_id=*/ 0)?;
-                    (Some(Arc::new(journal)), next_seq)
+                    if cfg.is_read_only() {
+                        (None, next_seq)
+                    } else {
+                        let journal = Journal::open_or_create(&path, /*tree_id=*/ 0)?;
+                        (Some(Arc::new(journal)), next_seq)
+                    }
                 }
             }
         } else {
@@ -412,14 +425,18 @@ impl Tree {
         // Spawn the background checkpointer if opted-in.
         // `Checkpointer::spawn` returns `None` for disabled
         // configs, so the `Option` chain stays clean.
-        let checkpointer = crate::checkpoint::Checkpointer::spawn(
-            Arc::clone(&bm),
-            journal.clone(),
-            Arc::clone(&maintenance_gate),
-            Arc::clone(&commit_gate),
-            cfg.checkpoint.clone(),
-        )
-        .map(Arc::new);
+        let checkpointer = if cfg.is_read_only() {
+            None
+        } else {
+            crate::checkpoint::Checkpointer::spawn(
+                Arc::clone(&bm),
+                journal.clone(),
+                Arc::clone(&maintenance_gate),
+                Arc::clone(&commit_gate),
+                cfg.checkpoint.clone(),
+            )
+            .map(Arc::new)
+        };
 
         Self::from_shared(
             cfg,
@@ -478,6 +495,15 @@ impl Tree {
     fn ensure_live(&self) -> Result<()> {
         if self.dropped.load(Ordering::Acquire) {
             Err(Error::TreeDropped)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        self.ensure_live()?;
+        if self.cfg.is_read_only() {
+            Err(Error::ReadOnly)
         } else {
             Ok(())
         }
@@ -602,7 +628,7 @@ impl Tree {
 
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
-            self.ensure_live()?;
+            self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -707,7 +733,7 @@ impl Tree {
 
         let (outcome, journal_ack) = {
             let _mutation = self.maintenance_gate.enter_shared();
-            self.ensure_live()?;
+            self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoint = self.endpoint_locks.lock_key(key);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -788,7 +814,7 @@ impl Tree {
 
         let journal_ack = {
             let _mutation = self.maintenance_gate.enter_shared();
-            self.ensure_live()?;
+            self.ensure_writable()?;
             let _tree_mutation = self.mutation_gate.enter_shared();
             let _endpoints = self.endpoint_locks.lock_pair(src, dst);
             let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
@@ -933,6 +959,7 @@ impl Tree {
     where
         F: FnOnce(&mut AtomicBatch),
     {
+        self.ensure_writable()?;
         let mut batch = AtomicBatch::default();
         build(&mut batch);
         if batch.pending.is_empty() {
@@ -943,7 +970,7 @@ impl Tree {
 
     pub(crate) fn apply_batch(&self, pending: Vec<BatchOp>) -> Result<bool> {
         let _maintenance = self.maintenance_gate.enter_shared();
-        self.ensure_live()?;
+        self.ensure_writable()?;
         let _tree_mutation = self.mutation_gate.enter_exclusive();
         let count = pending.iter().filter(|op| op.emits_wal()).count() as u64;
         // Reserve a contiguous seq range so each inner op's seq is
@@ -1656,6 +1683,7 @@ impl Tree {
     /// `memory_flush_on_write = false` callers rely on this to make
     /// batched writes survive a crash.
     pub fn checkpoint(&self) -> Result<()> {
+        self.ensure_writable()?;
         Self::checkpoint_shared_parts(
             &self.store,
             self.journal.as_ref(),
@@ -2136,7 +2164,7 @@ impl Tree {
     /// settled if you want to force a tree all the way down after a
     /// heavy churn phase.
     pub fn compact(&self) -> Result<()> {
-        self.ensure_live()?;
+        self.ensure_writable()?;
         if self.store.compaction_candidate_count() == 0 && self.store.merge_candidate_count() == 0 {
             self.seed_maintenance_candidates()?;
         }
@@ -2291,7 +2319,21 @@ impl Tree {
 /// could find an empty dirty set, write nothing to store, then
 /// truncate the WAL — silently losing every replayed record.
 pub(crate) fn ensure_root_blob(bm: &Arc<BufferManager>, root_guid: BlobGuid) -> Result<()> {
+    ensure_root_blob_for_open(bm, root_guid, true)
+}
+
+pub(crate) fn ensure_root_blob_for_open(
+    bm: &Arc<BufferManager>,
+    root_guid: BlobGuid,
+    create_if_missing: bool,
+) -> Result<()> {
     if !bm.has_blob(root_guid)? {
+        if !create_if_missing {
+            return Err(Error::BlobStoreIo(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "read-only tree root blob is missing",
+            )));
+        }
         let mut scratch = bm.alloc_blob_buf_zeroed();
         BlobFrame::init(scratch.as_mut_slice(), root_guid)?;
         bm.write_blob(root_guid, &scratch)?;
@@ -2303,6 +2345,7 @@ pub(crate) fn ensure_root_blob(bm: &Arc<BufferManager>, root_guid: BlobGuid) -> 
 pub(crate) fn replay_wal<F>(
     path: &std::path::Path,
     bm: &Arc<BufferManager>,
+    create_missing_roots: bool,
     mut root_for_tree_id: F,
 ) -> Result<(u64, crate::journal::reader::ReplayStats)>
 where
@@ -2318,7 +2361,7 @@ where
             }
             std::collections::hash_map::Entry::Vacant(entry) => {
                 let guid = root_for_tree_id(tree_id)?;
-                ensure_root_blob(bm, guid)?;
+                ensure_root_blob_for_open(bm, guid, create_missing_roots)?;
                 let pin = bm.pin(guid)?;
                 let (guid, pin) = entry.insert((guid, pin));
                 (*guid, Arc::clone(pin))

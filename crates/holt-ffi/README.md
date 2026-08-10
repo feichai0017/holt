@@ -30,8 +30,15 @@ checks the header-level ABI surface.
 Tree lifecycle:
 
 - `holt_tree_open_with_wal_sync(path, wal_sync, &tree)`
+- `holt_tree_open_read_only(path, &tree)`
 - `holt_tree_open_memory(&tree)`
 - `holt_tree_close(tree)`
+
+`holt_tree_open_read_only` requires an existing persistent tree. It
+replays durable WAL records into memory, holds a shared process lock,
+and does not create, repair, or checkpoint files. More than one
+read-only handle can open the same tree. A read-write handle requires
+an exclusive process lock.
 
 Point operations:
 

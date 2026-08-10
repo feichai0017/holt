@@ -19,6 +19,11 @@
 //!                      open; free slots are rebuilt from holes
 //! ```
 //!
+//! The `blobs.dat` descriptor also carries the store lock for its
+//! full lifetime. Read-write opens take an exclusive lock; read-only
+//! opens take a shared lock. Using the existing data file avoids a
+//! lock-file creation side effect during a read-only open.
+//!
 //! Design rationale:
 //!
 //! - **Single packed file** instead of one-file-per-blob: a buffer
@@ -67,7 +72,6 @@ use std::io::{self, Read, Write};
 #[cfg(not(all(target_os = "linux", feature = "io-uring")))]
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -136,6 +140,7 @@ const MANIFEST_LOG_COMPACT_RATIO: u64 = 4;
 pub struct FileBlobStore {
     data_dir: PathBuf,
     data_file: File,
+    access: FileAccess,
     manifest: RwLock<Manifest>,
     /// Tracks whether `manifest.bin` needs a rewrite. Data-only
     /// overwrites of existing blobs leave this false, avoiding
@@ -169,6 +174,46 @@ pub struct FileBlobStore {
     /// registration.
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     registered_buffers: Option<BlobBufPool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileAccess {
+    ReadWrite,
+    ReadOnly,
+}
+
+impl FileAccess {
+    fn is_read_only(self) -> bool {
+        self == Self::ReadOnly
+    }
+}
+
+fn acquire_store_lock(file: &File, access: FileAccess, path: &Path) -> Result<()> {
+    let operation = if access.is_read_only() {
+        libc::LOCK_SH | libc::LOCK_NB
+    } else {
+        libc::LOCK_EX | libc::LOCK_NB
+    };
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Err(Error::BlobStoreIo(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "Holt store at '{}' is open with an incompatible access mode",
+                    path.display()
+                ),
+            )));
+        }
+        return Err(Error::BlobStoreIo(error));
+    }
 }
 
 #[derive(Debug)]
@@ -228,7 +273,23 @@ impl FileBlobStore {
     /// with `O_CLOEXEC` only (macOS additionally sets `F_NOCACHE`).
     /// Loads the manifest if present; otherwise starts empty.
     pub fn open<P: Into<PathBuf>>(data_dir: P) -> Result<Self> {
-        Self::open_with_registered_buffer_capacity(data_dir, REGISTERED_BUFFER_MAX_SLOTS)
+        Self::open_with_registered_buffer_capacity(
+            data_dir,
+            REGISTERED_BUFFER_MAX_SLOTS,
+            FileAccess::ReadWrite,
+        )
+    }
+
+    /// Open an existing store without changing files on disk.
+    ///
+    /// The returned handle holds a shared process lock. It accepts
+    /// reads and rejects every [`BlobStore`] mutation.
+    pub fn open_read_only<P: Into<PathBuf>>(data_dir: P) -> Result<Self> {
+        Self::open_with_registered_buffer_capacity(
+            data_dir,
+            REGISTERED_BUFFER_MAX_SLOTS,
+            FileAccess::ReadOnly,
+        )
     }
 
     /// Open with a registered-buffer hot-pool hint derived from the
@@ -241,16 +302,28 @@ impl FileBlobStore {
         buffer_pool_size: usize,
     ) -> Result<Self> {
         let slots = registered_buffer_slots(buffer_pool_size);
-        Self::open_with_registered_buffer_capacity(data_dir, slots)
+        Self::open_with_registered_buffer_capacity(data_dir, slots, FileAccess::ReadWrite)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    pub(crate) fn open_read_only_with_buffer_pool_hint<P: Into<PathBuf>>(
+        data_dir: P,
+        buffer_pool_size: usize,
+    ) -> Result<Self> {
+        let slots = registered_buffer_slots(buffer_pool_size);
+        Self::open_with_registered_buffer_capacity(data_dir, slots, FileAccess::ReadOnly)
     }
 
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     fn open_with_registered_buffer_capacity<P: Into<PathBuf>>(
         data_dir: P,
         registered_buffer_slots: usize,
+        access: FileAccess,
     ) -> Result<Self> {
         let data_dir = data_dir.into();
-        std::fs::create_dir_all(&data_dir)?;
+        if !access.is_read_only() {
+            std::fs::create_dir_all(&data_dir)?;
+        }
 
         let data_path = data_dir.join(DATA_FILENAME);
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
@@ -266,12 +339,13 @@ impl FileBlobStore {
                 libc::O_CLOEXEC
             }
         };
-        let data_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(custom_flags)
-            .open(&data_path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(custom_flags);
+        if !access.is_read_only() {
+            options.write(true).create(true);
+        }
+        let data_file = options.open(&data_path)?;
+        acquire_store_lock(&data_file, access, &data_path)?;
 
         // macOS doesn't have O_DIRECT; F_NOCACHE on the fd is the
         // closest equivalent (tells the VFS not to populate the
@@ -281,7 +355,8 @@ impl FileBlobStore {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
+        let manifest =
+            Manifest::load_or_create(&manifest_path, &manifest_log_path, !access.is_read_only())?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
@@ -300,6 +375,7 @@ impl FileBlobStore {
         Ok(Self {
             data_dir,
             data_file,
+            access,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
@@ -317,9 +393,12 @@ impl FileBlobStore {
     fn open_with_registered_buffer_capacity<P: Into<PathBuf>>(
         data_dir: P,
         _registered_buffer_slots: usize,
+        access: FileAccess,
     ) -> Result<Self> {
         let data_dir = data_dir.into();
-        std::fs::create_dir_all(&data_dir)?;
+        if !access.is_read_only() {
+            std::fs::create_dir_all(&data_dir)?;
+        }
 
         let data_path = data_dir.join(DATA_FILENAME);
         let manifest_path = data_dir.join(MANIFEST_FILENAME);
@@ -335,25 +414,28 @@ impl FileBlobStore {
                 libc::O_CLOEXEC
             }
         };
-        let data_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .custom_flags(custom_flags)
-            .open(&data_path)?;
+        let mut options = OpenOptions::new();
+        options.read(true).custom_flags(custom_flags);
+        if !access.is_read_only() {
+            options.write(true).create(true);
+        }
+        let data_file = options.open(&data_path)?;
+        acquire_store_lock(&data_file, access, &data_path)?;
 
         #[cfg(target_os = "macos")]
         unsafe {
             let _ = libc::fcntl(data_file.as_raw_fd(), libc::F_NOCACHE, 1);
         }
 
-        let manifest = Manifest::load_or_create(&manifest_path, &manifest_log_path)?;
+        let manifest =
+            Manifest::load_or_create(&manifest_path, &manifest_log_path, !access.is_read_only())?;
         let file_slots = slots_for_len(data_file.metadata()?.len());
         let preallocated_slots = file_slots.max(manifest.next_slot);
 
         Ok(Self {
             data_dir,
             data_file,
+            access,
             manifest: RwLock::new(manifest),
             manifest_dirty: AtomicBool::new(false),
             data_write_epoch: AtomicU64::new(0),
@@ -390,6 +472,14 @@ impl FileBlobStore {
             ))
         })?;
         Ok(slot * u64::from(PAGE_SIZE))
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.access.is_read_only() {
+            Err(Error::ReadOnly)
+        } else {
+            Ok(())
+        }
     }
 
     fn assign_slot(&self, guid: BlobGuid) -> u64 {
@@ -732,6 +822,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn write_blob(&self, guid: BlobGuid, src: &AlignedBlobBuf) -> Result<()> {
+        self.ensure_writable()?;
         let _io = self.data_io_lock.lock().unwrap();
         let slot = self.assign_slot(guid);
         let offset = slot * u64::from(PAGE_SIZE);
@@ -742,6 +833,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn write_blobs(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        self.ensure_writable()?;
         let _io = self.data_io_lock.lock().unwrap();
         let io = self.prepare_blob_writes(writes)?;
         if io.is_empty() {
@@ -753,6 +845,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn write_blobs_with_data_sync(&self, writes: &[(BlobGuid, &AlignedBlobBuf)]) -> Result<()> {
+        self.ensure_writable()?;
         if writes.is_empty() {
             return Ok(());
         }
@@ -777,6 +870,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn delete_blob(&self, guid: BlobGuid) -> Result<()> {
+        self.ensure_writable()?;
         let mut m = self.manifest.write().unwrap();
         if let Some(slot) = m.slots.remove(&guid) {
             m.pending_free_slots.push(slot);
@@ -792,6 +886,7 @@ impl BlobStore for FileBlobStore {
     }
 
     fn flush(&self) -> Result<()> {
+        self.ensure_writable()?;
         let _io = self.data_io_lock.lock().unwrap();
         // Order matters: data must be on disk before the manifest
         // promotes any new slot. Otherwise a crash could leave the
@@ -815,12 +910,13 @@ impl BlobStore for FileBlobStore {
     }
 
     fn needs_flush(&self) -> bool {
-        self.data_needs_sync().is_some() || self.manifest_dirty.load(Ordering::Acquire)
+        !self.access.is_read_only()
+            && (self.data_needs_sync().is_some() || self.manifest_dirty.load(Ordering::Acquire))
     }
 }
 
 impl Manifest {
-    fn load_or_create(path: &Path, log_path: &Path) -> Result<Self> {
+    fn load_or_create(path: &Path, log_path: &Path, repair_torn_tail: bool) -> Result<Self> {
         let (mut slots, mut next_slot) = match File::open(path) {
             Ok(mut f) => Self::parse_snapshot(&mut f)?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => (HashMap::new(), 0),
@@ -828,7 +924,7 @@ impl Manifest {
         };
 
         let replay = Self::replay_log(log_path, &mut slots, &mut next_slot)?;
-        if replay.valid_bytes < replay.file_bytes {
+        if repair_torn_tail && replay.valid_bytes < replay.file_bytes {
             truncate_manifest_log(log_path, replay.valid_bytes)?;
         }
         let used_slots: Vec<_> = slots.values().copied().collect();

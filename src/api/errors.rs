@@ -101,6 +101,9 @@ pub enum Error {
     },
     /// A named DB tree handle was used after `DB::drop_tree`.
     TreeDropped,
+    /// A mutation or maintenance operation was requested through a
+    /// read-only tree or database handle.
+    ReadOnly,
     /// A scoped [`crate::View`] read tried to access a key or range
     /// prefix outside the subtree captured when the view was opened.
     OutsideViewScope {
@@ -199,6 +202,7 @@ impl std::fmt::Display for Error {
             Self::TreeExists { name } => write!(f, "DB tree already exists: {name}"),
             Self::InvalidTreeName { reason } => write!(f, "invalid DB tree name: {reason}"),
             Self::TreeDropped => write!(f, "DB tree has been dropped"),
+            Self::ReadOnly => write!(f, "tree is read-only"),
             Self::OutsideViewScope {
                 requested_len,
                 scope_len,
@@ -311,6 +315,7 @@ mod tests {
                 "invalid DB tree name: empty",
             ),
             (Error::TreeDropped.to_string(), "DB tree has been dropped"),
+            (Error::ReadOnly.to_string(), "tree is read-only"),
         ];
 
         for (actual, expected) in cases {
@@ -340,5 +345,6 @@ mod tests {
             .source()
             .is_none());
         assert!(Error::TreeDropped.source().is_none());
+        assert!(Error::ReadOnly.source().is_none());
     }
 }

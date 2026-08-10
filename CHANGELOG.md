@@ -13,6 +13,12 @@ fine-grained per-commit history is in `git log`.
 
 - Exposed put and delete batches through `holt_tree_atomic` in the C ABI.
   The wrapper validates every operation before it calls `Tree::atomic`.
+- Added existing-only read-only opens through `AccessMode`,
+  `TreeConfig::read_only`, `TreeBuilder::read_only`, and
+  `holt_tree_open_read_only`. Read-only handles replay the WAL into memory
+  and reject mutations and maintenance.
+- Added shared read and exclusive write process locks for file-backed
+  stores. Conflicting opens fail without waiting.
 
 ## [0.4.1] — 2026-05-27
 

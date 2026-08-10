@@ -15,7 +15,7 @@ use super::atomic::{BatchOp, RecordVersion};
 use super::config::TreeConfig;
 use super::errors::{Error, Result};
 use super::stats::{CheckpointerStats, DBStats, JournalStats, OpenStats};
-use super::tree::{ensure_root_blob, replay_wal, Tree, TreeRuntime};
+use super::tree::{ensure_root_blob, ensure_root_blob_for_open, replay_wal, Tree, TreeRuntime};
 use super::view::View;
 use crate::concurrency::{CommitGate, Gate};
 use crate::engine::RangeEntry;
@@ -92,7 +92,9 @@ impl DB {
                 let next_seq = if path.exists() {
                     let start = std::time::Instant::now();
                     let (next_seq, replay_stats) =
-                        replay_wal(&path, &bm, |tree_id| Ok(root_guid_for_tree_id(tree_id)))?;
+                        replay_wal(&path, &bm, !cfg.is_read_only(), |tree_id| {
+                            Ok(root_guid_for_tree_id(tree_id))
+                        })?;
                     open_stats.wal_replay_micros = start.elapsed().as_micros() as u64;
                     open_stats.wal_replay_records = replay_stats.records_seen;
                     open_stats.wal_torn_tail = replay_stats.torn_tail_at.is_some();
@@ -103,22 +105,30 @@ impl DB {
                 } else {
                     1
                 };
-                let journal = Journal::open_or_create(&path, 0)?;
-                (Some(Arc::new(journal)), next_seq)
+                if cfg.is_read_only() {
+                    (None, next_seq)
+                } else {
+                    let journal = Journal::open_or_create(&path, 0)?;
+                    (Some(Arc::new(journal)), next_seq)
+                }
             }
             None => (None, 1),
         };
 
         let maintenance_gate = Arc::new(Gate::new());
         let commit_gate = Arc::new(CommitGate::new());
-        let checkpointer = crate::checkpoint::Checkpointer::spawn(
-            Arc::clone(&bm),
-            journal.clone(),
-            Arc::clone(&maintenance_gate),
-            Arc::clone(&commit_gate),
-            cfg.checkpoint.clone(),
-        )
-        .map(Arc::new);
+        let checkpointer = if cfg.is_read_only() {
+            None
+        } else {
+            crate::checkpoint::Checkpointer::spawn(
+                Arc::clone(&bm),
+                journal.clone(),
+                Arc::clone(&maintenance_gate),
+                Arc::clone(&commit_gate),
+                cfg.checkpoint.clone(),
+            )
+            .map(Arc::new)
+        };
 
         let db = Self {
             cfg,
@@ -132,8 +142,18 @@ impl DB {
             trees: Arc::new(Mutex::new(HashMap::new())),
             catalog_cache: Arc::new(Mutex::new(HashMap::new())),
         };
-        db.stage_dropped_trees()?;
+        if !db.cfg.is_read_only() {
+            db.stage_dropped_trees()?;
+        }
         Ok(db)
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.cfg.is_read_only() {
+            Err(Error::ReadOnly)
+        } else {
+            Ok(())
+        }
     }
 
     /// Create a named tree inside this DB.
@@ -142,6 +162,7 @@ impl DB {
     /// handle is returned. Re-creating an existing name returns
     /// [`Error::TreeExists`].
     pub fn create_tree(&self, name: &str) -> Result<Tree> {
+        self.ensure_writable()?;
         let name_bytes = validate_tree_name(name)?;
         let _maintenance = self.maintenance_gate.enter_exclusive();
         if self.catalog_entry(name_bytes)?.is_some() {
@@ -241,6 +262,7 @@ impl DB {
     /// this call returns, and a later [`Self::checkpoint`] completes
     /// the physical cleanup.
     pub fn drop_tree(&self, name: &str) -> Result<()> {
+        self.ensure_writable()?;
         let name_bytes = validate_tree_name(name)?;
         let _maintenance = self.maintenance_gate.enter_exclusive();
         let entry = match self.catalog_entry(name_bytes)? {
@@ -281,6 +303,7 @@ impl DB {
     where
         F: FnOnce(&mut DBAtomicBatch),
     {
+        self.ensure_writable()?;
         let mut batch = DBAtomicBatch::default();
         build(&mut batch);
         if batch.pending.is_empty() {
@@ -341,6 +364,7 @@ impl DB {
     /// deletes, and truncates the shared WAL when it is safe. It is
     /// not tied to any one named tree.
     pub fn checkpoint(&self) -> Result<()> {
+        self.ensure_writable()?;
         self.stage_dropped_trees()?;
         Tree::checkpoint_shared_parts(
             &self.store,
@@ -362,6 +386,7 @@ impl DB {
     /// Run one online maintenance pass for the catalog and every
     /// named tree.
     pub fn compact(&self) -> Result<()> {
+        self.ensure_writable()?;
         self.catalog_tree()?.compact()?;
         for name in self.list_trees()? {
             self.open_tree(&name)?.compact()?;
@@ -559,7 +584,7 @@ impl DB {
             return Err(Error::TreeDropped);
         }
         let root_guid = root_guid_for_tree_id(tree_id);
-        ensure_root_blob(&self.store, root_guid)?;
+        ensure_root_blob_for_open(&self.store, root_guid, !self.cfg.is_read_only())?;
         let open = OpenTree {
             root_guid,
             runtime: TreeRuntime::new(),
