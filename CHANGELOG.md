@@ -9,6 +9,11 @@ fine-grained per-commit history is in `git log`.
 
 ## [Unreleased]
 
+### Added
+
+- Exposed put and delete batches through `holt_tree_atomic` in the C ABI.
+  The wrapper validates every operation before it calls `Tree::atomic`.
+
 ## [0.4.1] — 2026-05-27
 
 ### Added
