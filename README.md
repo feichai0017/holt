@@ -95,6 +95,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Read-only handles require an existing file-backed tree:
+
+```rust
+let reader = holt::TreeBuilder::new("/var/lib/app/meta.holt")
+    .read_only()
+    .open()?;
+let value = reader.get(b"objects/bucket-a/images/01.jpg")?;
+```
+
+Holt replays durable WAL records into the reader's memory state without
+changing files. Multiple readers take shared file locks. A writer takes an
+exclusive lock and cannot overlap those readers.
+
+Read-only handles reject mutations, checkpoints, compaction, garbage
+collection, and vacuum.
+
 ## Core API
 
 Point operations:
@@ -190,7 +206,7 @@ a minor release, but minor releases may still break source compatibility
 before 1.0. Pin exact versions for production evaluation:
 
 ```toml
-holt = "=0.8.2"
+holt = "=0.8.3"
 ```
 
 The engine is covered by unit, integration, property, fuzz, soak, and
